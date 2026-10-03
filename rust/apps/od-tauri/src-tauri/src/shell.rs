@@ -28,7 +28,9 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     std::env::set_var("OD_DATA_DIR", &data_dir);
 
     let paths = RuntimePaths::resolve(&data_dir).map_err(|err| err.to_string())?;
-    let daemon = start_daemon(DaemonConfig::with_paths(paths))?;
+    let mut config = DaemonConfig::with_paths(paths);
+    config.web_dist = web_dist();
+    let daemon = start_daemon(config)?;
     let daemon_url = daemon.url().to_string();
 
     app.manage(ShellState {
