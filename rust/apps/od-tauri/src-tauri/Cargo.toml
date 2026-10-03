@@ -1,0 +1,13 @@
+[package]
+name = "od-tauri"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenDesign desktop shell: Tauri v2 app embedding the React UI and the in-process od-daemon"
+
+[lib]
+name = "od_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]

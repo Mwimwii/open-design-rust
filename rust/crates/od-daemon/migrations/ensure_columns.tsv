@@ -1,0 +1,51 @@
+projects	metadata_json	ALTER TABLE projects ADD COLUMN metadata_json TEXT
+projects	custom_instructions	ALTER TABLE projects ADD COLUMN custom_instructions TEXT
+workspace_projects	resource_hub_resource_id	ALTER TABLE workspace_projects ADD COLUMN resource_hub_resource_id TEXT
+workspace_projects	cloud_tombstoned_at	ALTER TABLE workspace_projects ADD COLUMN cloud_tombstoned_at INTEGER
+workspace_projects	metadata_refresh_pending	ALTER TABLE workspace_projects ADD COLUMN metadata_refresh_pending INTEGER NOT NULL DEFAULT 0
+conversations	session_mode	ALTER TABLE conversations ADD COLUMN session_mode TEXT NOT NULL DEFAULT 'design'
+conversations	intent_signals_json	ALTER TABLE conversations ADD COLUMN intent_signals_json TEXT
+messages	agent_id	ALTER TABLE messages ADD COLUMN agent_id TEXT
+messages	agent_name	ALTER TABLE messages ADD COLUMN agent_name TEXT
+messages	run_id	ALTER TABLE messages ADD COLUMN run_id TEXT
+messages	run_status	ALTER TABLE messages ADD COLUMN run_status TEXT
+messages	result_delivery_state	ALTER TABLE messages ADD COLUMN result_delivery_state TEXT
+messages	last_run_event_id	ALTER TABLE messages ADD COLUMN last_run_event_id TEXT
+messages	comment_attachments_json	ALTER TABLE messages ADD COLUMN comment_attachments_json TEXT
+messages	feedback_json	ALTER TABLE messages ADD COLUMN feedback_json TEXT
+messages	pre_turn_file_names_json	ALTER TABLE messages ADD COLUMN pre_turn_file_names_json TEXT
+messages	trace_object_files_json	ALTER TABLE messages ADD COLUMN trace_object_files_json TEXT
+messages	session_mode	ALTER TABLE messages ADD COLUMN session_mode TEXT
+messages	run_context_json	ALTER TABLE messages ADD COLUMN run_context_json TEXT
+messages	task_analytics_json	ALTER TABLE messages ADD COLUMN task_analytics_json TEXT
+messages	applied_plugin_snapshot_json	ALTER TABLE messages ADD COLUMN applied_plugin_snapshot_json TEXT
+messages	telemetry_finalized_at	ALTER TABLE messages ADD COLUMN telemetry_finalized_at INTEGER
+messages	forked_into_json	ALTER TABLE messages ADD COLUMN forked_into_json TEXT
+messages	cancel_origin	ALTER TABLE messages ADD COLUMN cancel_origin TEXT
+routine_runs	error_code	ALTER TABLE routine_runs ADD COLUMN error_code TEXT
+preview_comments	selection_kind	ALTER TABLE preview_comments ADD COLUMN selection_kind TEXT
+preview_comments	member_count	ALTER TABLE preview_comments ADD COLUMN member_count INTEGER
+preview_comments	pod_members_json	ALTER TABLE preview_comments ADD COLUMN pod_members_json TEXT
+preview_comments	style_json	ALTER TABLE preview_comments ADD COLUMN style_json TEXT
+preview_comments	attachments_json	ALTER TABLE preview_comments ADD COLUMN attachments_json TEXT
+preview_comments	slide_index	ALTER TABLE preview_comments ADD COLUMN slide_index INTEGER
+preview_comments	anchor_state	ALTER TABLE preview_comments ADD COLUMN anchor_state TEXT
+preview_comments	anchored_version	ALTER TABLE preview_comments ADD COLUMN anchored_version INTEGER
+preview_comments	author_member_id	ALTER TABLE preview_comments ADD COLUMN author_member_id TEXT
+preview_comments	last_good_position_json	ALTER TABLE preview_comments ADD COLUMN last_good_position_json TEXT
+preview_comments	pin_seq	ALTER TABLE preview_comments ADD COLUMN pin_seq INTEGER
+preview_comments	pin_seq_confirmed	ALTER TABLE preview_comments ADD COLUMN pin_seq_confirmed INTEGER NOT NULL DEFAULT 1
+preview_comments	sort_key	ALTER TABLE preview_comments ADD COLUMN sort_key REAL
+deployments	status	ALTER TABLE deployments ADD COLUMN status TEXT NOT NULL DEFAULT 'ready'
+deployments	status_message	ALTER TABLE deployments ADD COLUMN status_message TEXT
+deployments	reachable_at	ALTER TABLE deployments ADD COLUMN reachable_at INTEGER
+deployments	provider_metadata_json	ALTER TABLE deployments ADD COLUMN provider_metadata_json TEXT
+routines	schedule_json	ALTER TABLE routines ADD COLUMN schedule_json TEXT
+routines	context_json	ALTER TABLE routines ADD COLUMN context_json TEXT
+agent_sessions	stable_prompt_hash	ALTER TABLE agent_sessions ADD COLUMN stable_prompt_hash TEXT
+agent_sessions	stable_prompt_sections	ALTER TABLE agent_sessions ADD COLUMN stable_prompt_sections TEXT
+agent_sessions	model	ALTER TABLE agent_sessions ADD COLUMN model TEXT
+agent_sessions	cwd	ALTER TABLE agent_sessions ADD COLUMN cwd TEXT
+agent_sessions	last_message_id	ALTER TABLE agent_sessions ADD COLUMN last_message_id TEXT
+agent_sessions	last_input_tokens	ALTER TABLE agent_sessions ADD COLUMN last_input_tokens INTEGER
+tabs_state	state_json	ALTER TABLE tabs_state ADD COLUMN state_json TEXT

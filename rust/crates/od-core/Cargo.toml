@@ -1,0 +1,10 @@
+[package]
+name = "od-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared config, paths, and error types for the OpenDesign Rust rewrite"
+
+[dependencies]
+thiserror.workspace = true

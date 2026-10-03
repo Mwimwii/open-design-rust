@@ -1,0 +1,29 @@
+[package]
+name = "od-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenDesign daemon in Rust: axum HTTP API, SQLite storage, MCP server"
+
+[[bin]]
+name = "od-daemon"
+path = "src/bin/od-daemon.rs"
+
+[dependencies]
+od-core.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
