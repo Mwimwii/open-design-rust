@@ -117,6 +117,29 @@ impl Store {
         let conn = self.lock()?;
         Ok(conn.execute(sql, params)?)
     }
+
+    /// Generic read helper for route layers: map every row of `sql` through
+    /// `f` under the same connection lock as [`Self::execute`].
+    pub fn query<T, P, F>(&self, sql: &str, params: P, f: F) -> Result<Vec<T>, StoreError>
+    where
+        P: rusqlite::Params,
+        F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params, f)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Single-row variant of [`Self::query`]; `None` when no row matches.
+    pub fn query_one<T, P, F>(&self, sql: &str, params: P, f: F) -> Result<Option<T>, StoreError>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        let conn = self.lock()?;
+        Ok(conn.query_row(sql, params, f).optional()?)
+    }
 }
 
 fn map_project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRow> {

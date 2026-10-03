@@ -61,7 +61,9 @@ pub fn build_router(state: AppState) -> Router {
             "/api/projects/{id}/text-preview/{*path}",
             get(project_file_text_preview),
         )
-        // Unknown /api paths → JSON 404 instead of the SPA shell.
+        // Unknown /api paths → JSON 404 instead of the SPA shell. Registered
+        // after every concrete route, including the conversation routes.
+        .merge(crate::conversations::router())
         .route(
             "/api/{*rest}",
             get(api_not_found)
@@ -476,7 +478,7 @@ async fn api_auth(State(state): State<AppState>, request: axum::extract::Request
         .into_response()
 }
 
-fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
+pub(crate) fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
     (
         status,
         Json(json!({ "error": { "code": code, "message": message } })),
@@ -484,12 +486,12 @@ fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
-fn store_error_response(err: &StoreError) -> Response {
+pub(crate) fn store_error_response(err: &StoreError) -> Response {
     tracing::error!(error = %err, "storage error");
     api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "storage error")
 }
 
-fn internal_error(message: &str) -> Response {
+pub(crate) fn internal_error(message: &str) -> Response {
     tracing::error!(error = %message, "internal error");
     api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "internal error")
 }

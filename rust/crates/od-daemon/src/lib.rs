@@ -10,6 +10,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod conversations;
 pub mod migrations;
 pub mod project_dir;
 pub mod project_files;
