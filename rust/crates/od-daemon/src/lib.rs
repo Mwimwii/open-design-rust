@@ -11,6 +11,8 @@
 pub mod auth;
 pub mod config;
 pub mod migrations;
+pub mod project_dir;
+pub mod project_files;
 pub mod routes;
 pub mod server;
 pub mod storage;

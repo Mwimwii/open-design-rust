@@ -2,12 +2,13 @@
 //! (`apps/daemon/src/server.ts` + `src/routes/*`), core subset.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{ConnectInfo, Path, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{ConnectInfo, Path, RawQuery, State};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -17,6 +18,10 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::auth;
 use crate::config::DaemonConfig;
+use crate::project_dir::{self, ProjectPathError};
+use crate::project_files::{
+    self, DEFAULT_TEXT_PREVIEW_LIMIT, MAX_TEXT_PREVIEW_LIMIT, MIN_TEXT_PREVIEW_LIMIT,
+};
 use crate::storage::{self, ProjectRow, Store, StoreError};
 
 #[derive(Clone)]
@@ -50,6 +55,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/version", get(version))
         .route("/api/projects", get(list_projects))
         .route("/api/projects/{id}", get(get_project))
+        .route("/api/projects/{id}/files", get(list_project_files))
+        .route("/api/projects/{id}/files/{*path}", get(serve_project_file))
+        .route(
+            "/api/projects/{id}/text-preview/{*path}",
+            get(project_file_text_preview),
+        )
         // Unknown /api paths → JSON 404 instead of the SPA shell.
         .route(
             "/api/{*rest}",
@@ -161,7 +172,7 @@ async fn get_project(State(state): State<AppState>, Path(id): Path<String>) -> R
         return api_error(StatusCode::NOT_FOUND, "PROJECT_NOT_FOUND", "not found");
     };
 
-    let resolved_dir = match resolved_dir(&state.config, &project) {
+    let resolved_dir = match project_dir::resolved_dir(&state.config, &project) {
         Ok(dir) => dir,
         Err(message) => {
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, "PROJECT_DIR_UNRESOLVED", &message);
@@ -175,37 +186,245 @@ async fn get_project(State(state): State<AppState>, Path(id): Path<String>) -> R
     Json(json!({ "project": project_json, "resolvedDir": resolved_dir })).into_response()
 }
 
-/// Managed dir = `<data root>/projects/<id>`; imported projects use their
-/// external `metadata.baseDir`. Port of `resolveProjectDir` (sandbox-mode
-/// allowlist rules are a follow-up, tracked in beads).
-fn resolved_dir(config: &DaemonConfig, project: &ProjectRow) -> Result<String, String> {
-    if let Some(base_dir) = external_base_dir(project) {
-        return Ok(base_dir);
+/// `GET /api/projects/:id/files` — the project's file inventory (parity:
+/// the `files` route in `apps/daemon/src/routes/project/index.ts`).
+async fn list_project_files(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let since = since_filter(query.as_deref());
+    let project = match load_project_for_files(&state, &id).await {
+        Ok(project) => project,
+        Err(response) => return *response,
+    };
+    let base = match project_fs_base(&state, &project) {
+        Ok(base) => base,
+        Err(response) => return *response,
+    };
+    match tokio::task::spawn_blocking(move || project_files::list_files(&base, since)).await {
+        // Transport caches must always revalidate this dynamic inventory.
+        Ok(Ok(files)) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({ "files": files })),
+        )
+            .into_response(),
+        Ok(Err(err)) => api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", &err.to_string()),
+        Err(err) => internal_error(&err.to_string()),
     }
-    if !storage::is_safe_id(&project.id) {
-        return Err(format!("invalid project id: {}", project.id));
-    }
-    Ok(config.paths.projects_dir().join(&project.id).to_string_lossy().into_owned())
 }
 
-/// `metadata.baseDir` is the external workspace root when present. The
-/// TypeScript `usesExternalProjectRoot` additionally consults sandbox
-/// allowlists; in sandbox mode we conservatively stay on the managed root.
-fn external_base_dir(project: &ProjectRow) -> Option<String> {
-    let metadata: Value = serde_json::from_str(project.metadata_json.as_deref()?).ok()?;
-    let base_dir = metadata.get("baseDir")?.as_str()?.trim();
-    if base_dir.is_empty() {
-        return None;
+/// `GET /api/projects/:id/files/*path` — raw file bytes + MIME type.
+async fn serve_project_file(
+    State(state): State<AppState>,
+    Path((id, path)): Path<(String, String)>,
+) -> Response {
+    if project_files::is_project_file_version_path(&path) {
+        return api_error(StatusCode::NOT_FOUND, "FILE_NOT_FOUND", "file not found");
     }
-    let sandbox = matches!(
-        std::env::var("OD_SANDBOX_MODE").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    );
-    if sandbox {
-        // TODO(sandbox): port `isSandboxImportedProjectRootAllowed`.
-        return None;
+    let project = match load_project_for_files(&state, &id).await {
+        Ok(project) => project,
+        Err(response) => return *response,
+    };
+    let base = match project_fs_base(&state, &project) {
+        Ok(base) => base,
+        Err(response) => return *response,
+    };
+    let imported = project_dir::has_external_project_root(&project);
+    let result =
+        tokio::task::spawn_blocking(move || project_files::read_project_file(&base, &path, imported))
+            .await;
+    match result {
+        Ok(Ok((bytes, mime))) => {
+            let content_type = HeaderValue::from_str(&mime)
+                .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+            ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
+        }
+        Ok(Err(err)) => project_path_error_response(err),
+        Err(err) => internal_error(&err.to_string()),
     }
-    Some(base_dir.to_string())
+}
+
+/// `GET /api/projects/:id/text-preview/*path?limit=` — bounded UTF-8 preview
+/// plus file metadata and the powered-preview capability hint.
+async fn project_file_text_preview(
+    State(state): State<AppState>,
+    Path((id, path)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if project_files::is_project_file_version_path(&path) {
+        return api_error(StatusCode::NOT_FOUND, "FILE_NOT_FOUND", "file not found");
+    }
+    let limit = preview_limit(query.as_deref());
+    let project = match load_project_for_files(&state, &id).await {
+        Ok(project) => project,
+        Err(response) => return *response,
+    };
+    let base = match project_fs_base(&state, &project) {
+        Ok(base) => base,
+        Err(response) => return *response,
+    };
+    let imported = project_dir::has_external_project_root(&project);
+    let result = tokio::task::spawn_blocking(move || {
+        project_files::text_preview(&base, &path, imported, limit)
+    })
+    .await;
+    match result {
+        Ok(Ok(preview)) => ([(header::CACHE_CONTROL, "no-store")], Json(preview)).into_response(),
+        Ok(Err(err)) => project_path_error_response(err),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// Parity: `getProject` for the file routes. Every id must survive
+/// `isSafeId` before it is ever used as a path segment (400), then the row
+/// lookup decides 404.
+async fn load_project_for_files(state: &AppState, id: &str) -> Result<ProjectRow, Box<Response>> {
+    if !storage::is_safe_id(id) {
+        return Err(Box::new(api_error(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "invalid project id",
+        )));
+    }
+    let store = state.store.clone();
+    let id = id.to_string();
+    match tokio::task::spawn_blocking(move || store.get_project(&id)).await {
+        Ok(Ok(Some(project))) => Ok(project),
+        Ok(Ok(None)) => Err(Box::new(api_error(
+            StatusCode::NOT_FOUND,
+            "PROJECT_NOT_FOUND",
+            "project not found",
+        ))),
+        Ok(Err(err)) => Err(Box::new(store_error_response(&err))),
+        Err(err) => Err(Box::new(internal_error(&err.to_string()))),
+    }
+}
+
+fn project_fs_base(state: &AppState, project: &ProjectRow) -> Result<PathBuf, Box<Response>> {
+    project_dir::project_fs_base(&state.config, project).map_err(|message| {
+        Box::new(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "PROJECT_DIR_UNRESOLVED",
+            &message,
+        ))
+    })
+}
+
+/// Path-refusal split shared by the read routes: missing → 404, everything
+/// else → 400. Messages never carry absolute paths.
+fn project_path_error_response(err: ProjectPathError) -> Response {
+    match err {
+        ProjectPathError::NotFound => {
+            api_error(StatusCode::NOT_FOUND, "FILE_NOT_FOUND", "file not found")
+        }
+        other => api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", &other.to_string()),
+    }
+}
+
+/// Parity: `Number.isFinite(Number(query.since)) && since > 0`.
+fn since_filter(query: Option<&str>) -> Option<f64> {
+    let value = js_number(&single_query_value(query, "since")?);
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
+/// Parity: `Math.max(1024, Math.min(finite ? Math.floor(limit) : 96 * 1024, 512 * 1024))`.
+fn preview_limit(query: Option<&str>) -> u64 {
+    let requested = match single_query_value(query, "limit") {
+        Some(raw) => {
+            let value = js_number(&raw);
+            if value.is_finite() {
+                value.floor()
+            } else {
+                DEFAULT_TEXT_PREVIEW_LIMIT as f64
+            }
+        }
+        None => DEFAULT_TEXT_PREVIEW_LIMIT as f64,
+    };
+    requested.clamp(MIN_TEXT_PREVIEW_LIMIT as f64, MAX_TEXT_PREVIEW_LIMIT as f64) as u64
+}
+
+/// First (and only) value for `key`, percent-decoded the way Express' query
+/// parser decodes it. A repeated key collapses to `None` because coercing an
+/// array with `Number(...)` yields `NaN` in JavaScript.
+fn single_query_value(query: Option<&str>, key: &str) -> Option<String> {
+    let query = query?;
+    let mut found: Option<String> = None;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        if percent_decode(raw_key) != key {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(percent_decode(raw_value));
+    }
+    found
+}
+
+/// `Number(...)` coercion for query strings: whitespace-trimmed, empty → 0,
+/// anything unparsable → `NaN`.
+fn js_number(raw: &str) -> f64 {
+    let trimmed = raw.trim_matches(char::is_whitespace);
+    if trimmed.is_empty() {
+        return 0.0;
+    }
+    match trimmed.parse::<f64>() {
+        Ok(value) => {
+            let bare = trimmed.trim_start_matches(['+', '-']);
+            if value.is_infinite() && !bare.eq_ignore_ascii_case("infinity") {
+                f64::NAN
+            } else {
+                value
+            }
+        }
+        Err(_) => f64::NAN,
+    }
+}
+
+/// `decodeURIComponent` + `+` → space, matching the Express query parser.
+fn percent_decode(raw: &str) -> String {
+    if !raw.contains('%') && !raw.contains('+') {
+        return raw.to_string();
+    }
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                match (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2])) {
+                    (Some(high), Some(low)) => {
+                        out.push(high * 16 + low);
+                        index += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        index += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| raw.to_string())
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 async fn api_not_found() -> Response {
