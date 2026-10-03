@@ -27,9 +27,11 @@ pub struct DaemonConfig {
 }
 
 impl DaemonConfig {
-    pub fn from_env() -> Result<Self, OdError> {
-        let paths = RuntimePaths::from_env()?;
-        Ok(Self {
+    /// Build from the environment plus an explicit (already resolved) data
+    /// root. Used by the desktop shell, which resolves `OD_DATA_DIR` itself
+    /// per the daemon data directory contract.
+    pub fn with_paths(paths: RuntimePaths) -> Self {
+        Self {
             paths,
             bind_host: nonempty_env("OD_BIND_HOST").unwrap_or_else(|| "127.0.0.1".to_string()),
             port: nonempty_env("OD_PORT")
@@ -38,7 +40,15 @@ impl DaemonConfig {
             api_token: nonempty_env("OD_API_TOKEN"),
             api_auth_disabled: truthy_env("OD_DISABLE_API_AUTH"),
             web_dist: nonempty_env("OD_WEB_DIST_DIR").map(PathBuf::from),
-        })
+        }
+    }
+
+    pub fn from_env() -> Result<Self, OdError> {
+        let paths = RuntimePaths::from_env()?;
+        let mut config = Self::with_paths(paths);
+        // The shell may have pre-set OD_WEB_DIST_DIR; keep env parity here too.
+        config.web_dist = nonempty_env("OD_WEB_DIST_DIR").map(PathBuf::from);
+        Ok(config)
     }
 
     /// The API token only guards when set and auth is not explicitly disabled

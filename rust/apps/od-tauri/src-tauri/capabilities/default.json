@@ -1,0 +1,12 @@
+{
+  "identifier": "main-capability",
+  "description": "Permissions for the main shell window: dialogs, external open, deep links, HTTP to the loopback daemon.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "deep-link:default",
+    "http:default",
+    "opener:default"
+  ]
+}
