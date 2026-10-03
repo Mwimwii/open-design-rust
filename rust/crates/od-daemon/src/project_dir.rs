@@ -18,42 +18,92 @@ use crate::storage::{self, ProjectRow};
 /// `RESERVED_PROJECT_FILE_SEGMENTS`).
 const RESERVED_PROJECT_FILE_SEGMENTS: &[&str] = &[".file-versions", ".live-artifacts"];
 
+/// Parity: `SANDBOX_MODE_ENV`.
+pub const SANDBOX_MODE_ENV: &str = "OD_SANDBOX_MODE";
+
+/// Parity: `SANDBOX_IMPORT_ALLOWED_ROOTS_ENV`.
+pub const SANDBOX_IMPORT_ALLOWED_ROOTS_ENV: &str = "OD_SANDBOX_IMPORT_ALLOWED_ROOTS";
+
+/// Parity: `SANDBOX_IMPORTED_PROJECT_UNAVAILABLE_MESSAGE`.
+pub const SANDBOX_IMPORTED_PROJECT_UNAVAILABLE_MESSAGE: &str = "Imported-folder projects are not available in OD_SANDBOX_MODE unless their root is under OD_SANDBOX_IMPORT_ALLOWED_ROOTS.";
+
+/// Parity: `SANDBOX_IMPORT_ALLOWED_ROOTS_INVALID_MESSAGE` + the ` Got: <root>`
+/// suffix `configuredSandboxImportRoots` appends.
+const SANDBOX_IMPORT_ALLOWED_ROOTS_INVALID_MESSAGE: &str =
+    "OD_SANDBOX_IMPORT_ALLOWED_ROOTS entries must be absolute paths.";
+
+/// Parity: the message `isSandboxModeEnabled` throws for an unrecognized
+/// `OD_SANDBOX_MODE` value (the falsy set joins with a trailing ", " because
+/// its last member is the empty string).
+const SANDBOX_MODE_INVALID_MESSAGE: &str =
+    "OD_SANDBOX_MODE must be one of 1, true, yes, on or 0, false, no, off, ";
+
+/// Why a project directory could not be resolved. Mapped to HTTP responses by
+/// the route layer.
+#[derive(Debug, thiserror::Error)]
+pub enum ProjectDirError {
+    /// Sandbox refusal or a malformed sandbox env value (parity: thrown from
+    /// `isSandboxModeEnabled` / `SandboxImportedProjectError`) → HTTP 400.
+    #[error("{0}")]
+    Rejected(String),
+
+    /// `invalid project id: <id>` from `resolveProjectDir` → HTTP 500
+    /// (`PROJECT_DIR_UNRESOLVED`), the route mapping this crate already uses.
+    #[error("{0}")]
+    Unresolved(String),
+}
+
 /// Managed dir = `<data root>/projects/<id>`; imported projects use their
-/// external `metadata.baseDir`. Port of `resolveProjectDir` (sandbox-mode
-/// allowlist rules are a follow-up, tracked in beads).
-pub fn resolved_dir(config: &DaemonConfig, project: &ProjectRow) -> Result<String, String> {
-    if let Some(base_dir) = external_base_dir(project) {
+/// external `metadata.baseDir`. Port of `resolveProjectDir`: the sandbox
+/// allowlist is consulted before any directory is handed out.
+pub fn resolved_dir(config: &DaemonConfig, project: &ProjectRow) -> Result<String, ProjectDirError> {
+    assert_sandbox_project_root_available(project)?;
+    if let Some(base_dir) = external_base_dir(project)? {
         return Ok(base_dir);
     }
     if !storage::is_safe_id(&project.id) {
-        return Err(format!("invalid project id: {}", project.id));
+        return Err(ProjectDirError::Unresolved(format!(
+            "invalid project id: {}",
+            project.id
+        )));
     }
     Ok(config.paths.projects_dir().join(&project.id).to_string_lossy().into_owned())
 }
 
 /// Filesystem form of [`resolved_dir`] for the project file routes.
-pub fn project_fs_base(config: &DaemonConfig, project: &ProjectRow) -> Result<PathBuf, String> {
+pub fn project_fs_base(
+    config: &DaemonConfig,
+    project: &ProjectRow,
+) -> Result<PathBuf, ProjectDirError> {
     Ok(PathBuf::from(resolved_dir(config, project)?))
 }
 
-/// `metadata.baseDir` is the external workspace root when present. The
-/// TypeScript `usesExternalProjectRoot` additionally consults sandbox
-/// allowlists; in sandbox mode we conservatively stay on the managed root.
-pub fn external_base_dir(project: &ProjectRow) -> Option<String> {
-    let metadata: Value = serde_json::from_str(project.metadata_json.as_deref()?).ok()?;
-    let base_dir = metadata.get("baseDir")?.as_str()?.trim();
-    if base_dir.is_empty() {
-        return None;
+/// `metadata.baseDir` when it names an absolute external root this process may
+/// actually use — parity: `usesExternalProjectRoot` followed by
+/// `path.normalize(metadata.baseDir)`.
+pub fn external_base_dir(project: &ProjectRow) -> Result<Option<String>, ProjectDirError> {
+    let metadata = project_metadata(project);
+    let Some(base_dir) = metadata.as_ref().and_then(|m| m.get("baseDir")).and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let normalized = normalize_path(base_dir);
+    if !Path::new(&normalized).is_absolute() {
+        return Ok(None);
     }
-    let sandbox = matches!(
-        std::env::var("OD_SANDBOX_MODE").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    );
-    if sandbox {
-        // TODO(sandbox): port `isSandboxImportedProjectRootAllowed`.
-        return None;
+    if is_orchestrator_scratch_workspace(metadata.as_ref()) {
+        return Ok(Some(normalized));
     }
-    Some(base_dir.to_string())
+    if !is_sandbox_mode_enabled()? {
+        return Ok(Some(normalized));
+    }
+    if is_sandbox_imported_project_root_allowed(base_dir)? {
+        Ok(Some(normalized))
+    } else {
+        Err(ProjectDirError::Rejected(
+            SANDBOX_IMPORTED_PROJECT_UNAVAILABLE_MESSAGE.to_string(),
+        ))
+    }
 }
 
 /// Whether `metadata.baseDir` names an absolute external workspace root
@@ -61,16 +111,248 @@ pub fn external_base_dir(project: &ProjectRow) -> Option<String> {
 /// off this metadata check alone, independent of the sandbox allowlist that
 /// [`external_base_dir`] consults.
 pub fn has_external_project_root(project: &ProjectRow) -> bool {
-    let Some(raw) = project.metadata_json.as_deref() else {
+    let Some(metadata) = project_metadata(project) else {
         return false;
     };
-    let Ok(metadata) = serde_json::from_str::<Value>(raw) else {
-        return false;
+    has_external_metadata_root(&metadata)
+}
+
+/// Port of `assertSandboxProjectRootAvailable`. Evaluated in the same order as
+/// the TypeScript condition so a malformed `OD_SANDBOX_MODE` still throws for
+/// projects that are not imported folders at all.
+pub fn assert_sandbox_project_root_available(project: &ProjectRow) -> Result<(), ProjectDirError> {
+    if !is_sandbox_mode_enabled()? {
+        return Ok(());
+    }
+    let Some(metadata) = project_metadata(project) else {
+        return Ok(());
     };
+    if !has_external_metadata_root(&metadata) {
+        return Ok(());
+    }
+    if is_orchestrator_scratch_workspace(Some(&metadata)) {
+        return Ok(());
+    }
     let Some(base_dir) = metadata.get("baseDir").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if is_sandbox_imported_project_root_allowed(base_dir)? {
+        return Ok(());
+    }
+    Err(ProjectDirError::Rejected(
+        SANDBOX_IMPORTED_PROJECT_UNAVAILABLE_MESSAGE.to_string(),
+    ))
+}
+
+/// `projects.metadata_json` parsed the way `normalizeProject` does: absent or
+/// unparsable metadata is indistinguishable from none.
+fn project_metadata(project: &ProjectRow) -> Option<Value> {
+    serde_json::from_str(project.metadata_json.as_deref()?).ok()
+}
+
+fn has_external_metadata_root(metadata: &Value) -> bool {
+    metadata
+        .get("baseDir")
+        .and_then(Value::as_str)
+        .is_some_and(|base_dir| Path::new(&normalize_path(base_dir)).is_absolute())
+}
+
+/// Port of `isSandboxModeEnabled`: unset means off, the two documented value
+/// sets are honored, everything else throws.
+pub fn is_sandbox_mode_enabled() -> Result<bool, ProjectDirError> {
+    let Ok(raw) = std::env::var(SANDBOX_MODE_ENV) else {
+        return Ok(false);
+    };
+    let value = raw.trim().to_lowercase();
+    match value.as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" | "" => Ok(false),
+        _ => Err(ProjectDirError::Rejected(
+            SANDBOX_MODE_INVALID_MESSAGE.to_string(),
+        )),
+    }
+}
+
+/// Port of `isSandboxImportedProjectRootAllowed`.
+pub fn is_sandbox_imported_project_root_allowed(
+    project_root: &str,
+) -> Result<bool, ProjectDirError> {
+    if !is_sandbox_mode_enabled()? {
+        return Ok(true);
+    }
+    let candidate = canonicalize_path_for_containment(project_root);
+    Ok(sandbox_import_allowed_root_paths()?
+        .iter()
+        .any(|root| is_path_inside_dir(root, &candidate)))
+}
+
+/// Port of `configuredSandboxImportRoots` + the `canonicalizePathForContainment`
+/// pass `sandboxImportAllowedRoots` maps it through.
+fn sandbox_import_allowed_root_paths() -> Result<Vec<String>, ProjectDirError> {
+    let Ok(raw) = std::env::var(SANDBOX_IMPORT_ALLOWED_ROOTS_ENV) else {
+        return Ok(Vec::new());
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let delimiter = if cfg!(windows) { ';' } else { ':' };
+    let roots: Vec<&str> = raw
+        .split(delimiter)
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    if let Some(relative) = roots
+        .iter()
+        .find(|root| !Path::new(&normalize_path(root)).is_absolute())
+    {
+        return Err(ProjectDirError::Rejected(format!(
+            "{SANDBOX_IMPORT_ALLOWED_ROOTS_INVALID_MESSAGE} Got: {relative}"
+        )));
+    }
+    Ok(roots
+        .into_iter()
+        .map(canonicalize_path_for_containment)
+        .collect())
+}
+
+/// `path.normalize` then `fs.realpathSync.native`, falling back to the
+/// normalized path when the target does not exist yet.
+fn canonicalize_path_for_containment(value: &str) -> String {
+    let normalized = normalize_path(value);
+    match std::fs::canonicalize(&normalized) {
+        Ok(real) => real.to_string_lossy().into_owned(),
+        Err(_) => normalized,
+    }
+}
+
+/// Parity: `isPathInsideDir`.
+fn is_path_inside_dir(root: &str, candidate: &str) -> bool {
+    let relative = path_relative(root, candidate);
+    relative.is_empty() || (!relative.starts_with("..") && !Path::new(&relative).is_absolute())
+}
+
+/// Port of Node's posix `path.relative`: both inputs resolve against the
+/// working directory, normalize, then the answer is the segment walk between
+/// them.
+fn path_relative(from: &str, to: &str) -> String {
+    let from = resolve_path(from);
+    let to = resolve_path(to);
+    if from == to {
+        return String::new();
+    }
+    let from_parts = path_segments(&from);
+    let to_parts = path_segments(&to);
+    let common = from_parts
+        .iter()
+        .zip(to_parts.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts: Vec<&str> = vec![".."; from_parts.len() - common];
+    parts.extend_from_slice(&to_parts[common..]);
+    parts.join("/")
+}
+
+/// Port of Node's posix `path.resolve`: relative inputs resolve against the
+/// working directory and the result is normalized with the trailing separator
+/// dropped (`path.resolve('/a/b/') === '/a/b'`).
+fn resolve_path(value: &str) -> String {
+    let joined = if Path::new(value).is_absolute() {
+        value.to_string()
+    } else {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        format!("{}/{}", cwd.to_string_lossy(), value)
+    };
+    let normalized = normalize_path(&joined);
+    match normalized.strip_suffix('/') {
+        Some("") => "/".to_string(),
+        Some(stripped) => stripped.to_string(),
+        None => normalized,
+    }
+}
+
+fn path_segments(value: &str) -> Vec<&str> {
+    value.split('/').filter(|part| !part.is_empty()).collect()
+}
+
+/// Port of Node's posix `path.normalize`.
+fn normalize_path(value: &str) -> String {
+    if value.is_empty() {
+        return ".".to_string();
+    }
+    let absolute = value.starts_with('/');
+    let trailing = value.ends_with('/');
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in value.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => match segments.last() {
+                Some(last) if *last != ".." => {
+                    segments.pop();
+                }
+                _ if !absolute => segments.push(".."),
+                _ => {}
+            },
+            other => segments.push(other),
+        }
+    }
+    let joined = segments.join("/");
+    if absolute {
+        if joined.is_empty() {
+            return "/".to_string();
+        }
+        return if trailing && !joined.is_empty() {
+            format!("/{joined}/")
+        } else {
+            format!("/{joined}")
+        };
+    }
+    if joined.is_empty() {
+        return if trailing { "./".to_string() } else { ".".to_string() };
+    }
+    if trailing {
+        format!("{joined}/")
+    } else {
+        joined
+    }
+}
+
+/// Port of `isOrchestratorScratchWorkspace`: a parsed
+/// `metadata.orchestratorWorkspace` object whose `kind` is `scratch`.
+fn is_orchestrator_scratch_workspace(metadata: Option<&Value>) -> bool {
+    let Some(value) = metadata.and_then(|m| m.get("orchestratorWorkspace")) else {
         return false;
     };
-    Path::new(base_dir).is_absolute()
+    if value.is_null() {
+        return false;
+    }
+    let Some(record) = value.as_object() else {
+        return false;
+    };
+    const KEYS: [&str; 5] = ["kind", "sourceLabel", "sourceRef", "baseRevision", "writeback"];
+    if record.keys().any(|key| !KEYS.contains(&key.as_str())) {
+        return false;
+    }
+    if string_field(record.get("kind")) != Some("scratch") {
+        return false;
+    }
+    if !record.get("writeback").is_none_or(Value::is_null)
+        && string_field(record.get("writeback")) != Some("external")
+    {
+        return false;
+    }
+    ["sourceLabel", "sourceRef", "baseRevision"]
+        .iter()
+        .all(|key| {
+            record.get(*key).is_none_or(Value::is_null) || string_field(record.get(*key)).is_some()
+        })
+}
+
+/// Parity: `stringField` from `workspace-contract.ts` — trimmed non-empty
+/// strings only.
+fn string_field(value: Option<&Value>) -> Option<&str> {
+    let text = value?.as_str()?;
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 /// Why a project-relative path was refused. Mapped to HTTP responses by the

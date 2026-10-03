@@ -18,7 +18,7 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::auth;
 use crate::config::DaemonConfig;
-use crate::project_dir::{self, ProjectPathError};
+use crate::project_dir::{self, ProjectDirError, ProjectPathError};
 use crate::project_files::{
     self, DEFAULT_TEXT_PREVIEW_LIMIT, MAX_TEXT_PREVIEW_LIMIT, MIN_TEXT_PREVIEW_LIMIT,
 };
@@ -174,9 +174,7 @@ async fn get_project(State(state): State<AppState>, Path(id): Path<String>) -> R
 
     let resolved_dir = match project_dir::resolved_dir(&state.config, &project) {
         Ok(dir) => dir,
-        Err(message) => {
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "PROJECT_DIR_UNRESOLVED", &message);
-        }
+        Err(err) => return project_dir_error_response(err),
     };
     let mut project_json = serde_json::to_value(&project).unwrap_or(Value::Null);
     project_json["workspaceId"] = match workspace_id {
@@ -302,13 +300,23 @@ async fn load_project_for_files(state: &AppState, id: &str) -> Result<ProjectRow
 }
 
 fn project_fs_base(state: &AppState, project: &ProjectRow) -> Result<PathBuf, Box<Response>> {
-    project_dir::project_fs_base(&state.config, project).map_err(|message| {
-        Box::new(api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "PROJECT_DIR_UNRESOLVED",
-            &message,
-        ))
+    project_dir::project_fs_base(&state.config, project).map_err(|err| {
+        Box::new(project_dir_error_response(err))
     })
+}
+
+/// Sandbox refusals are client errors (parity: the TypeScript routes catch
+/// `SandboxImportedProjectError` and answer 400); an unsafe project id is an
+/// unresolved managed root.
+fn project_dir_error_response(err: ProjectDirError) -> Response {
+    match err {
+        ProjectDirError::Rejected(message) => {
+            api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", &message)
+        }
+        ProjectDirError::Unresolved(message) => {
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "PROJECT_DIR_UNRESOLVED", &message)
+        }
+    }
 }
 
 /// Path-refusal split shared by the read routes: missing → 404, everything
