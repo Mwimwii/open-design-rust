@@ -9,6 +9,7 @@
 //! ([`od_core::RuntimePaths`]).
 
 pub mod auth;
+pub mod chat_artifacts;
 pub mod config;
 pub mod conversations;
 pub mod migrations;
@@ -16,6 +17,7 @@ pub mod project_dir;
 pub mod project_files;
 pub mod routes;
 pub mod server;
+pub mod static_resources;
 pub mod storage;
 
 pub use config::DaemonConfig;

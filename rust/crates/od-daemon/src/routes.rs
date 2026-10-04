@@ -62,8 +62,11 @@ pub fn build_router(state: AppState) -> Router {
             get(project_file_text_preview),
         )
         // Unknown /api paths → JSON 404 instead of the SPA shell. Registered
-        // after every concrete route, including the conversation routes.
+        // after every concrete route, including the conversation, static
+        // resource, and chat-artifact routes.
         .merge(crate::conversations::router())
+        .merge(crate::static_resources::router())
+        .merge(crate::chat_artifacts::router())
         .route(
             "/api/{*rest}",
             get(api_not_found)
