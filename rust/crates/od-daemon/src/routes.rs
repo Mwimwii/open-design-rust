@@ -30,6 +30,9 @@ pub struct AppState {
     pub store: Store,
     pub started_at: Instant,
     pub shutting_down: Arc<AtomicBool>,
+    /// In-memory run registry shared by every `/api/runs*` + `/api/chat`
+    /// handler (parity: `design.runs` in `apps/daemon/src/server.ts`).
+    pub runs: crate::runs::Runs,
 }
 
 impl AppState {
@@ -39,6 +42,7 @@ impl AppState {
             store,
             started_at: Instant::now(),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            runs: crate::runs::Runs::default(),
         }
     }
 }
@@ -67,6 +71,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::conversations::router())
         .merge(crate::static_resources::router())
         .merge(crate::chat_artifacts::router())
+        .merge(crate::runs::router())
         .route(
             "/api/{*rest}",
             get(api_not_found)
