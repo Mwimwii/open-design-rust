@@ -971,13 +971,17 @@ mod tests {
         std::os::unix::fs::symlink(base.join("index.html"), base.join("link.html")).unwrap();
 
         let files = list_files(&base, None).expect("list");
-        let names: Vec<&str> = files
+        let mut names: Vec<&str> = files
             .iter()
             .map(|file| file.get("name").and_then(Value::as_str).unwrap())
             .collect();
+        names.sort_unstable();
         assert_eq!(names, vec!["index.html", "sub/note.md"]);
 
-        let first = &files[0];
+        let first = files
+            .iter()
+            .find(|file| file.get("path").and_then(Value::as_str) == Some("index.html"))
+            .expect("index.html entry");
         assert_eq!(first["type"], "file");
         assert_eq!(first["path"], "index.html");
         assert_eq!(first["kind"], "html");
