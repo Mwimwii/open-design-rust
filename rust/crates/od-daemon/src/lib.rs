@@ -12,6 +12,7 @@ pub mod auth;
 pub mod chat_artifacts;
 pub mod config;
 pub mod conversations;
+pub mod mcp;
 pub mod migrations;
 pub mod project_dir;
 pub mod project_files;

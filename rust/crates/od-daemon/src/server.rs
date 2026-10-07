@@ -55,6 +55,11 @@ impl RunningDaemon {
             .await
             .map_err(|source| StartError::Bind { addr: bind_addr, source })?;
         let addr = listener.local_addr().map_err(|source| StartError::LocalAddr { source })?;
+        // Ephemeral binds (`port = 0`) resolve here; the same-origin guard in
+        // `crate::mcp` compares against the real port, not the configured 0.
+        state
+            .resolved_port
+            .store(addr.port(), std::sync::atomic::Ordering::SeqCst);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let join = tokio::spawn(async move {

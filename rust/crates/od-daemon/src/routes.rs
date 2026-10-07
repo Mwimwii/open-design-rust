@@ -3,7 +3,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -30,6 +30,12 @@ pub struct AppState {
     pub store: Store,
     pub started_at: Instant,
     pub shutting_down: Arc<AtomicBool>,
+    /// Port the listener actually bound, stored once the listener is up
+    /// (parity: `resolvedPortRef` in `apps/daemon/src/server.ts`). Seeded from
+    /// `config.port` and overwritten with `addr.port()` in
+    /// `RunningDaemon::start`, so `port = 0` (ephemeral) resolves correctly for
+    /// the same-origin guard in `crate::mcp`.
+    pub resolved_port: Arc<AtomicU16>,
     /// In-memory run registry shared by every `/api/runs*` + `/api/chat`
     /// handler (parity: `design.runs` in `apps/daemon/src/server.ts`).
     pub runs: crate::runs::Runs,
@@ -37,11 +43,13 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: DaemonConfig, store: Store) -> Self {
+        let resolved_port = Arc::new(AtomicU16::new(config.port));
         Self {
             config: Arc::new(config),
             store,
             started_at: Instant::now(),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            resolved_port,
             runs: crate::runs::Runs::default(),
         }
     }
