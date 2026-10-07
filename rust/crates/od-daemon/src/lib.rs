@@ -13,6 +13,7 @@ pub mod chat_artifacts;
 pub mod config;
 pub mod conversations;
 pub mod mcp;
+pub mod mcp_tokens;
 pub mod migrations;
 pub mod project_dir;
 pub mod project_files;

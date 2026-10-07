@@ -190,6 +190,66 @@
 //!   (step 1 covers hex/`Infinity` differences) and formats the number
 //!   with Rust's `Display`, so a JS-exponential value such as `1e21` would
 //!   print in decimal here.
+//!
+//! Step 4 of the MCP routes port (bead `open-design-rust-r2r`): the OAuth
+//! status surface — `GET /api/mcp/oauth/status` (mcp-routes.ts:360) and
+//! `POST /api/mcp/oauth/disconnect` (mcp-routes.ts:381) — plus the token
+//! store behind them, ported in full as [`crate::mcp_tokens`]
+//! (`mcp-tokens.ts:1-258`: sanitizer, atomic write + `chmod`, expiry
+//! skew).
+//!
+//! DOCUMENTED DEVIATIONS (step 4 — OAuth status + disconnect)
+//!
+//! * Error bodies: the step-2 envelope wrap applies again. TypeScript's
+//!   flat `{ error: "cross-origin request rejected" }`,
+//!   `{ error: "serverId is required" }`, and
+//!   `{ error: String(err.message) }` become the crate-wide
+//!   `{ error: { code, message } }` with the message text kept verbatim
+//!   (`FORBIDDEN` / `BAD_REQUEST` / `INTERNAL_ERROR`). The 500s carry
+//!   Rust's `io::Error` Display where Node reports `err.message` — the
+//!   same wording gap step 2 documents for config-store I/O.
+//! * Disconnect body parsing: in Express, `express.json({ limit: '4mb' })`
+//!   (server.ts:3221) runs before this route, so a *malformed* JSON body
+//!   answers 400 **before** `isLocalSameOrigin` ever runs, while a
+//!   missing or non-JSON `Content-Type` is skipped outright — `req.body`
+//!   stays undefined and the route's own guard runs next. This port
+//!   extracts `Result<Json<Value>, JsonRejection>`, which never fails the
+//!   request, and reproduces that split from inside the handler: a parse
+//!   error returns axum's 400 **before** the guard (same status as
+//!   body-parser's `entity.parse.failed`, plain-text body — the step-2
+//!   wording deviation), `MissingJsonContentType` — how axum 0.8.9 names
+//!   both the absent and the non-JSON `Content-Type` case — becomes the
+//!   "no body" path that does run the guard, and every parsed body feeds
+//!   the TS `req.body?.serverId` check. Two shapes take the other side of
+//!   that split here, and both only move *which* rejection answers;
+//!   neither turns a request TypeScript rejects into a 200: an **empty**
+//!   `application/json` body is special-cased by body-parser (`parse`
+//!   returns `{}` for a zero-length body, so the guard runs) but is an
+//!   EOF parse error for serde_json, so it 400s before the guard; and
+//!   body-parser's `strict` mode refuses a **scalar** top-level value
+//!   (`"x"` / `42` / `null`) with a 400 before the guard, while
+//!   serde_json accepts it as a [`Value`] and this handler runs the
+//!   guard. Same-origin status is 400 in every one of those cases either
+//!   way — only cross-origin traffic flips (403 where the guard ran,
+//!   instead of TypeScript's 400; 400 where the body was refused first,
+//!   instead of its 403) and the response wording moves. Axum's default
+//!   2 MB body limit answers 413 where body-parser allows 4 MB (both
+//!   reject before the guard; the boundary differs).
+//! * Status query: `RawQuery` plus `routes::single_query_value` reproduce
+//!   Express query decoding (percent-decoding, `+` → space), and a
+//!   repeated `serverId` key collapses to "missing" the way TypeScript's
+//!   `typeof req.query.serverId === 'string'` refuses an array — the same
+//!   400 follows. The value is trimmed exactly like
+//!   `req.query.serverId.trim()`.
+//! * Registering each path for its one method makes the other method
+//!   answer 405 here where Express falls through to its JSON 404 (and
+//!   auto-answers `OPTIONS`) — the same divergence as every other merged
+//!   router in this crate.
+//! * Not ported yet (next step): `POST /api/mcp/oauth/start`,
+//!   `GET /api/mcp/oauth/callback`, and their support layer —
+//!   `mcp-oauth.ts`, `getPublicBaseUrl`, `renderOAuthResultPage`
+//!   (mcp-routes.ts:230-358). Until they land, the status route can only
+//!   report tokens an earlier build wrote.
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::Ipv6Addr;
@@ -199,7 +259,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -207,7 +268,8 @@ use axum::{Json, Router};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use crate::routes::{api_error, internal_error, AppState};
+use crate::mcp_tokens::{clear_token, get_token};
+use crate::routes::{api_error, internal_error, single_query_value, AppState};
 
 /// The request facts the same-origin guard needs (parity: the `req` + `env`
 /// arguments of `isLocalSameOrigin`, origin-validation.ts:212).
@@ -1204,8 +1266,9 @@ pub fn read_mcp_config(data_dir: &Path) -> std::io::Result<McpConfig> {
 /// with `randomBytes(4).toString('hex')` in `doWrite`. The bytes come from
 /// a `RandomState`-seeded hasher (OS randomness) mixed with pid + time;
 /// not cryptographic, they only need to keep concurrent temp files apart
-/// and writes are serialized per process anyway.
-fn random_tmp_suffix() -> String {
+/// and writes are serialized per process anyway. Shared with the token
+/// store in [`crate::mcp_tokens`], which writes the same shape.
+pub(crate) fn random_tmp_suffix() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hash, Hasher};
     let mut hasher = RandomState::new().build_hasher();
@@ -1262,7 +1325,7 @@ fn templates() -> &'static [Value] {
 /// `routes::build_router` before the `/api/{*rest}` catch-all: the
 /// configuration routes (`GET`/`PUT /api/mcp/servers`, step 2), the
 /// install-info route and the three Codex one-click install routes
-/// (step 3).
+/// (step 3), and the OAuth status + disconnect routes (step 4).
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -1278,6 +1341,8 @@ pub fn router() -> Router<AppState> {
             "/api/mcp/install/codex",
             post(post_install_codex).delete(delete_install_codex),
         )
+        .route("/api/mcp/oauth/status", get(get_oauth_status))
+        .route("/api/mcp/oauth/disconnect", post(post_oauth_disconnect))
 }
 
 /// Parity: the `isLocalSameOrigin(req, getResolvedPort())` prologue of both
@@ -1937,6 +2002,105 @@ async fn delete_install_codex(State(state): State<AppState>, headers: HeaderMap)
             "CODEX_UNINSTALL_FAILED",
             &err.to_string(),
         ),
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// OAuth status surface — parity port of `GET /api/mcp/oauth/status` and
+// `POST /api/mcp/oauth/disconnect` (mcp-routes.ts:360 / 381) over the
+// token store in `crate::mcp_tokens` (`mcp-tokens.ts`).
+// ───────────────────────────────────────────────────────────────────────
+
+/// `GET /api/mcp/oauth/status?serverId=…` (parity: mcp-routes.ts:360) —
+/// `{connected:false}` when no token is stored, otherwise
+/// `{connected:true, expiresAt, scope, savedAt}` with the two optional
+/// fields falling back to `null` (`tok.expiresAt ?? null` /
+/// `tok.scope ?? null`). Storage failure → 500 whose `message` is
+/// `String(err.message)` from the TS route (see DOCUMENTED DEVIATIONS for
+/// the envelope and wording differences).
+async fn get_oauth_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if let Some(response) = local_same_origin_rejection(&state, &headers) {
+        return response;
+    }
+    // `typeof req.query.serverId === 'string' ? req.query.serverId.trim()
+    // : ''` — `single_query_value` already percent-decodes (and refuses a
+    // repeated key, which Express hands the route as an array), so only
+    // the trim and the empty check remain.
+    let server_id = single_query_value(query.as_deref(), "serverId")
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    if server_id.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "serverId is required");
+    }
+    let data_dir = state.config.paths.data_dir().to_path_buf();
+    match tokio::task::spawn_blocking(move || get_token(&data_dir, &server_id)).await {
+        Ok(Ok(None)) => Json(json!({ "connected": false })).into_response(),
+        Ok(Ok(Some(token))) => Json(json!({
+            "connected": true,
+            "expiresAt": token.expires_at,
+            "scope": token.scope,
+            "savedAt": token.saved_at,
+        }))
+        .into_response(),
+        Ok(Err(err)) => {
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &err.to_string())
+        }
+        Err(join) => internal_error(&join.to_string()),
+    }
+}
+
+/// `POST /api/mcp/oauth/disconnect` (parity: mcp-routes.ts:381) — drop the
+/// stored token and answer `{ok:true}`. `clearToken` is a no-op for an
+/// absent id, yet the route still answers 200 (TypeScript does too). The
+/// body arrives as `Result<Json<Value>, JsonRejection>` so this handler —
+/// not the extractor — decides how a parse outcome interacts with the
+/// guard, reproducing Express' middleware-before-route ordering (see
+/// DOCUMENTED DEVIATIONS).
+async fn post_oauth_disconnect(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let payload = match body {
+        Ok(Json(value)) => Some(value),
+        Err(err) => match err {
+            // No / non-JSON Content-Type: `express.json()` skips parsing
+            // and leaves `req.body` undefined — the "no body" path below,
+            // which still runs the guard first.
+            JsonRejection::MissingJsonContentType(_) => None,
+            // Malformed JSON: body-parser would answer 400 before the
+            // guard too — same status here, axum's plain-text body (the
+            // step-2 wording deviation).
+            other => return other.into_response(),
+        },
+    };
+    if let Some(response) = local_same_origin_rejection(&state, &headers) {
+        return response;
+    }
+    // `typeof req.body?.serverId === 'string' ? req.body.serverId.trim()
+    // : ''` → 400 when the result is empty.
+    let server_id = payload
+        .as_ref()
+        .and_then(|value| value.get("serverId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if server_id.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "serverId is required");
+    }
+    let _write = state.mcp_tokens_lock.lock().await;
+    let data_dir = state.config.paths.data_dir().to_path_buf();
+    let server_id = server_id.to_string();
+    match tokio::task::spawn_blocking(move || clear_token(&data_dir, &server_id)).await {
+        Ok(Ok(())) => Json(json!({ "ok": true })).into_response(),
+        Ok(Err(err)) => {
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &err.to_string())
+        }
+        Err(join) => internal_error(&join.to_string()),
     }
 }
 

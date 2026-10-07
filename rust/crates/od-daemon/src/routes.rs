@@ -49,6 +49,12 @@ pub struct AppState {
     /// `apps/daemon/src/mcp-routes.ts:33`). A std mutex: `crate::mcp` only
     /// holds it across synchronous work, never an `.await`.
     pub mcp_install_info_cache: crate::mcp::InstallInfoCacheSlot,
+    /// Serializes writes to `<data-dir>/mcp-tokens.json` (parity: the
+    /// per-dataDir `writeLocks` promise chain in `mcp-tokens.ts:163`). One
+    /// `AppState` = one daemon = one data dir, exactly like
+    /// [`Self::mcp_write_lock`]; the OAuth disconnect route holds it across
+    /// read → modify → write.
+    pub mcp_tokens_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -63,6 +69,7 @@ impl AppState {
             runs: crate::runs::Runs::default(),
             mcp_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             mcp_install_info_cache: Arc::new(std::sync::Mutex::new(None)),
+            mcp_tokens_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -386,7 +393,7 @@ fn preview_limit(query: Option<&str>) -> u64 {
 /// First (and only) value for `key`, percent-decoded the way Express' query
 /// parser decodes it. A repeated key collapses to `None` because coercing an
 /// array with `Number(...)` yields `NaN` in JavaScript.
-fn single_query_value(query: Option<&str>, key: &str) -> Option<String> {
+pub(crate) fn single_query_value(query: Option<&str>, key: &str) -> Option<String> {
     let query = query?;
     let mut found: Option<String> = None;
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {

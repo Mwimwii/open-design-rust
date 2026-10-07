@@ -3,7 +3,9 @@
 //! `apps/daemon/src/mcp-routes.ts:191` / `:205` and the storage layer in
 //! `apps/daemon/src/mcp-config.ts`), plus the step-3 install surface:
 //! `GET /api/mcp/install-info` and the three Codex one-click install routes
-//! (mcp-routes.ts:96-185).
+//! (mcp-routes.ts:96-185), and the step-4 OAuth status surface:
+//! `GET /api/mcp/oauth/status` + `POST /api/mcp/oauth/disconnect`
+//! (mcp-routes.ts:360 / 381) over the token store in `mcp-tokens.ts`.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -115,6 +117,50 @@ async fn delete_codex_install(addr: SocketAddr) -> (String, String) {
         &format!(
             "DELETE /api/mcp/install/codex HTTP/1.1\r\nHost: {addr}\r\n\
              Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await
+}
+
+/// `GET /api/mcp/oauth/status` with a ready-made query string (including
+/// the leading `?`, or empty for "no query at all").
+async fn get_oauth_status(addr: SocketAddr, query: &str, origin: Option<&str>) -> (String, String) {
+    let origin = origin
+        .map(|value| format!("Origin: {value}\r\n"))
+        .unwrap_or_default();
+    send(
+        addr,
+        &format!(
+            "GET /api/mcp/oauth/status{query} HTTP/1.1\r\nHost: {addr}\r\n{origin}Connection: close\r\n\r\n"
+        ),
+    )
+    .await
+}
+
+/// `POST /api/mcp/oauth/disconnect`. `Some(body)` sends a JSON body with
+/// the matching Content-Type (the shape `disconnectMcpOAuth` in the web UI
+/// posts); `None` sends a bare POST with no body and no Content-Type —
+/// `express.json()` skips parsing for that one, so TypeScript's route sees
+/// `req.body === undefined` and answers 400 itself.
+async fn post_oauth_disconnect(
+    addr: SocketAddr,
+    body: Option<&str>,
+    origin: Option<&str>,
+) -> (String, String) {
+    let origin = origin
+        .map(|value| format!("Origin: {value}\r\n"))
+        .unwrap_or_default();
+    let (extra, payload) = match body {
+        Some(body) => (
+            format!("Content-Type: application/json\r\nContent-Length: {}", body.len()),
+            body.to_string(),
+        ),
+        None => ("Content-Length: 0".to_string(), String::new()),
+    };
+    send(
+        addr,
+        &format!(
+            "POST /api/mcp/oauth/disconnect HTTP/1.1\r\nHost: {addr}\r\n{extra}\r\n{origin}Connection: close\r\n\r\n{payload}"
         ),
     )
     .await
@@ -671,5 +717,231 @@ async fn codex_install_routes_answer_with_their_envelope_codes() {
     assert!(message.contains("codex"), "message: {message}");
 
     let _ = std::fs::remove_dir_all(&empty_bin);
+    daemon.shutdown().await;
+}
+
+// ---- step 4: OAuth status + disconnect (mcp-routes.ts:360 / 381) --------
+
+/// `GET /api/mcp/oauth/status?serverId=ghost` with nothing stored → the
+/// compact `{connected:false}`, and a read never creates the token file
+/// (parity: `readTokensFile` only touches disk when the file exists).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oauth_status_says_disconnected_for_an_unknown_id() {
+    let paths = temp_paths("oauth-none");
+    let data_dir = paths.data_dir().to_path_buf();
+    let daemon = RunningDaemon::start(config(paths)).await.expect("start");
+    let addr = daemon.addr();
+
+    let (head, body) = get_oauth_status(addr, "?serverId=ghost", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    assert_eq!(body, r#"{"connected":false}"#, "body: {body}");
+    assert!(
+        !data_dir.join("mcp-tokens.json").exists(),
+        "GET must not create mcp-tokens.json"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// A stored token answers `{connected:true, expiresAt, scope, savedAt}`
+/// byte-identical to the TS `res.json(...)` literal — including the
+/// `?? null` fallbacks — with the id percent-decoded then trimmed the way
+/// `req.query.serverId.trim()` does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oauth_status_reports_expiry_scope_and_saved_at_for_a_stored_token() {
+    let paths = temp_paths("oauth-full");
+    let data_dir = paths.data_dir().to_path_buf();
+    std::fs::write(
+        data_dir.join("mcp-tokens.json"),
+        r#"{
+  "servers": {
+    "github": {
+      "accessToken": "gho_secret",
+      "tokenType": "Bearer",
+      "savedAt": 1700000000000,
+      "scope": "repo read:user",
+      "expiresAt": 1759812345678
+    },
+    "plain": {
+      "accessToken": "t-plain",
+      "tokenType": "Bearer",
+      "savedAt": 1700000000001
+    }
+  }
+}"#,
+    )
+    .expect("seed tokens file");
+    let daemon = RunningDaemon::start(config(paths)).await.expect("start");
+    let addr = daemon.addr();
+
+    // `%20github%20` → decode → trim → `github`.
+    let (head, body) = get_oauth_status(addr, "?serverId=%20github%20", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    assert_eq!(
+        body,
+        r#"{"connected":true,"expiresAt":1759812345678,"scope":"repo read:user","savedAt":1700000000000}"#,
+        "body: {body}"
+    );
+
+    // No expiry / no scope on the record → both fields answer null.
+    let (head, body) = get_oauth_status(addr, "?serverId=plain", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    assert_eq!(
+        body,
+        r#"{"connected":true,"expiresAt":null,"scope":null,"savedAt":1700000000001}"#,
+        "body: {body}"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// Every "no usable serverId" query — absent, empty, whitespace-only, or
+/// repeated (an array in Express, `typeof` ≠ string) — answers the same
+/// 400 envelope with the TS message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oauth_status_requires_a_non_empty_server_id() {
+    let paths = temp_paths("oauth-require");
+    let daemon = RunningDaemon::start(config(paths)).await.expect("start");
+    let addr = daemon.addr();
+
+    for query in ["", "?", "?serverId=", "?serverId=%20%20", "?serverId=a&serverId=b"] {
+        let (head, body) = get_oauth_status(addr, query, None).await;
+        assert!(head.contains("400 Bad Request"), "query {query:?}: {head}");
+        let (code, message) = error_envelope(&body);
+        assert_eq!(code, "BAD_REQUEST", "query {query:?}: {body}");
+        assert_eq!(message, "serverId is required", "query {query:?}: {body}");
+    }
+
+    daemon.shutdown().await;
+}
+
+/// `POST /api/mcp/oauth/disconnect` — the 400s for a missing / empty /
+/// whitespace `serverId` (nothing reaches `clearToken`), then the real
+/// disconnect: `{ok:true}`, the record gone, its neighbour kept in place,
+/// and an absent id answering ok *without* rewriting the file (parity:
+/// `if (!(serverId in file.servers)) return`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oauth_disconnect_clears_the_record_and_validates_the_body() {
+    let paths = temp_paths("oauth-disconnect");
+    let data_dir = paths.data_dir().to_path_buf();
+    let file_path = data_dir.join("mcp-tokens.json");
+    std::fs::write(
+        &file_path,
+        r#"{"servers":{"github":{"accessToken":"gho_secret","tokenType":"Bearer","savedAt":1700000000000,"scope":"repo"},"plain":{"accessToken":"t-plain","tokenType":"Bearer","savedAt":1700000000001}}}"#,
+    )
+    .expect("seed tokens file");
+    let daemon = RunningDaemon::start(config(paths)).await.expect("start");
+    let addr = daemon.addr();
+
+    for body in [None, Some(r#"{"serverId":"   "}"#), Some("{}")] {
+        let (head, response) = post_oauth_disconnect(addr, body, None).await;
+        assert!(head.contains("400 Bad Request"), "body {body:?}: {head}");
+        let (code, message) = error_envelope(&response);
+        assert_eq!(code, "BAD_REQUEST", "body {body:?}: {response}");
+        assert_eq!(message, "serverId is required", "body {body:?}: {response}");
+    }
+    // Validation never cleared anything.
+    let (head, body) = get_oauth_status(addr, "?serverId=github", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    assert!(body.contains(r#""connected":true"#), "still stored: {body}");
+
+    // Disconnect one id → `{ok:true}`, that record gone, the other kept.
+    let (head, body) = post_oauth_disconnect(addr, Some(r#"{"serverId":"github"}"#), None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    assert_eq!(body, r#"{"ok":true}"#, "body: {body}");
+    let on_disk: Value =
+        serde_json::from_str(&std::fs::read_to_string(&file_path).expect("file")).expect("file JSON");
+    let ids: Vec<&str> = on_disk["servers"]
+        .as_object()
+        .expect("servers object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(ids, ["plain"], "github dropped, remaining order kept");
+
+    // An absent id still answers ok — and does not rewrite the file.
+    let before = std::fs::read_to_string(&file_path).expect("text");
+    let (head, body) = post_oauth_disconnect(addr, Some(r#"{"serverId":"ghost"}"#), None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    assert_eq!(body, r#"{"ok":true}"#, "body: {body}");
+    assert_eq!(
+        std::fs::read_to_string(&file_path).expect("text again"),
+        before,
+        "an absent id must not rewrite the file"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// Both routes run the same-origin guard before touching the store: an
+/// evil `Origin` answers the 403 envelope and the seeded record survives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oauth_status_and_disconnect_reject_cross_origin_requests() {
+    let paths = temp_paths("oauth-cross");
+    let data_dir = paths.data_dir().to_path_buf();
+    let file_path = data_dir.join("mcp-tokens.json");
+    std::fs::write(
+        &file_path,
+        r#"{"servers":{"github":{"accessToken":"gho_secret","tokenType":"Bearer","savedAt":1700000000000}}}"#,
+    )
+    .expect("seed tokens file");
+    let seeded = std::fs::read_to_string(&file_path).expect("seed text");
+    let daemon = RunningDaemon::start(config(paths)).await.expect("start");
+    let addr = daemon.addr();
+
+    let (head, body) = get_oauth_status(addr, "?serverId=github", Some("http://evil.example")).await;
+    assert!(head.contains("403 Forbidden"), "status: {head}");
+    let (code, message) = error_envelope(&body);
+    assert_eq!(code, "FORBIDDEN", "body: {body}");
+    assert_eq!(message, "cross-origin request rejected", "body: {body}");
+
+    let (head, body) = post_oauth_disconnect(
+        addr,
+        Some(r#"{"serverId":"github"}"#),
+        Some("http://evil.example"),
+    )
+    .await;
+    assert!(head.contains("403 Forbidden"), "status: {head}");
+    let (code, message) = error_envelope(&body);
+    assert_eq!(code, "FORBIDDEN", "body: {body}");
+    assert_eq!(message, "cross-origin request rejected", "body: {body}");
+    assert_eq!(
+        std::fs::read_to_string(&file_path).expect("file"),
+        seeded,
+        "the guard must run before clearToken"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// The route's rewrite goes through `writeTokensFile`'s best-effort
+/// `chmod 0600` (mcp-tokens.ts:189): bearer tokens become owner-only on
+/// POSIX, matching the store's own contract.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oauth_disconnect_locks_the_token_file_down_to_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let paths = temp_paths("oauth-mode");
+    let data_dir = paths.data_dir().to_path_buf();
+    let file_path = data_dir.join("mcp-tokens.json");
+    std::fs::write(
+        &file_path,
+        r#"{"servers":{"github":{"accessToken":"gho_secret","tokenType":"Bearer","savedAt":1700000000000},"plain":{"accessToken":"t-plain","tokenType":"Bearer","savedAt":1700000000001}}}"#,
+    )
+    .expect("seed tokens file");
+    let daemon = RunningDaemon::start(config(paths)).await.expect("start");
+    let addr = daemon.addr();
+
+    let (head, _) = post_oauth_disconnect(addr, Some(r#"{"serverId":"github"}"#), None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+
+    let mode = std::fs::metadata(&file_path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "bearer tokens are owner-only after the rewrite");
+
     daemon.shutdown().await;
 }
