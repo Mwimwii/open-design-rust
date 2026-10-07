@@ -24,6 +24,10 @@ tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# WHATWG URL parsing/serialization for MCP server URLs (parity: `new URL`
+# in apps/daemon/src/mcp-config.ts). Already in the workspace lockfile via
+# the Tauri shell, so this adds no new crate to the graph.
+url = "2"
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

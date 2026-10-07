@@ -39,6 +39,11 @@ pub struct AppState {
     /// In-memory run registry shared by every `/api/runs*` + `/api/chat`
     /// handler (parity: `design.runs` in `apps/daemon/src/server.ts`).
     pub runs: crate::runs::Runs,
+    /// Serializes writes to `<data-dir>/mcp-config.json` (parity: the
+    /// per-dataDir `writeLocks` promise chain in
+    /// `apps/daemon/src/mcp-config.ts`). One `AppState` = one daemon = one
+    /// data dir, so a single lock here matches TypeScript's per-path lock.
+    pub mcp_write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -51,6 +56,7 @@ impl AppState {
             shutting_down: Arc::new(AtomicBool::new(false)),
             resolved_port,
             runs: crate::runs::Runs::default(),
+            mcp_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -80,6 +86,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::static_resources::router())
         .merge(crate::chat_artifacts::router())
         .merge(crate::runs::router())
+        .merge(crate::mcp::router())
         .route(
             "/api/{*rest}",
             get(api_not_found)
