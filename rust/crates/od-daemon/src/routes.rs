@@ -44,6 +44,11 @@ pub struct AppState {
     /// `apps/daemon/src/mcp-config.ts`). One `AppState` = one daemon = one
     /// data dir, so a single lock here matches TypeScript's per-path lock.
     pub mcp_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// 5s TTL cache for `GET /api/mcp/install-info` (parity: the
+    /// `installInfoCache` closure variable in `registerMcpRoutes`,
+    /// `apps/daemon/src/mcp-routes.ts:33`). A std mutex: `crate::mcp` only
+    /// holds it across synchronous work, never an `.await`.
+    pub mcp_install_info_cache: crate::mcp::InstallInfoCacheSlot,
 }
 
 impl AppState {
@@ -57,6 +62,7 @@ impl AppState {
             resolved_port,
             runs: crate::runs::Runs::default(),
             mcp_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            mcp_install_info_cache: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }

@@ -117,17 +117,92 @@
 //!   `/^[a-z0-9][a-z0-9_-]{0,63}$/i`; JavaScript's case canonicalization
 //!   turns up no non-ASCII acceptors for that pattern, so ASCII checks
 //!   reproduce it (non-ASCII bytes reject).
+//!
+//! Step 3 of the MCP routes port (bead `open-design-rust-r2r`): the install
+//! surface — the pure snippet builder (`mcp-install-info.ts`), `GET
+//! /api/mcp/install-info` with its 5s cache (mcp-routes.ts:13-112), the
+//! `codex mcp add|remove|get` runner (`codex-cli.ts`), and the three
+//! one-click Codex routes (mcp-routes.ts:118-185).
+//!
+//! DOCUMENTED DEVIATIONS (step 3 — install info + Codex install)
+//!
+//! * `cli_path` (TS `OD_BIN`, resolved by `resolveDaemonCliPath`, is
+//!   daemon-paths.ts:19): the Rust rewrite has no `od` CLI port yet. This
+//!   port keeps the env half of that resolver (`OD_DAEMON_CLI_PATH`, then
+//!   `OD_BIN`) and, when neither is set, guesses the sibling `od`
+//!   executable next to `std::env::current_exe()` instead of resolving the
+//!   TypeScript package's `dist/cli.js`. `cli_exists` stays a real `fs`
+//!   probe, so the TS buildHint fires (correctly) when that sibling is
+//!   missing — the normal case here.
+//! * `exec_path` (TS `process.execPath`, the Node runtime) =
+//!   `std::env::current_exe()`, and `node_exists` probes it. Consequence,
+//!   stated honestly: the snippet shape (`command` + `args`) still mirrors
+//!   TypeScript byte-for-byte, but with neither the `od` CLI nor a Node
+//!   launcher in the rewrite it is not runnable yet — `cli_exists` is
+//!   false, so the payload carries the buildHint that says so instead of
+//!   pretending to be ready.
+//! * `platform` maps Rust `std::env::consts::OS` to the TypeScript
+//!   `NodeJS.Platform` strings: `macos → "darwin"`, `windows → "win32"`,
+//!   `linux → "linux"`, else the raw Rust value.
+//! * `electron_as_node` is always false (no Electron host), and
+//!   `is_sidecar_mode` is always false with no inherited sidecar client
+//!   entries in `sidecar_env` (this daemon has no sidecar client), so the
+//!   `--daemon-url` args form is always baked. The
+//!   `OD_MCP_BOOTSTRAP_COMMAND` / `OD_MCP_BOOTSTRAP_ARGS` env merge from
+//!   `computeInstallPayload` (mcp-routes.ts:53-63) IS ported at the call
+//!   site; `managedMcpRegistrationEnv()` and the 5-second
+//!   `isManagedMcpBootstrapEnv` registration-refresh timer
+//!   (mcp-routes.ts:126-140, `mcp-managed-registration.ts`,
+//!   `mcp-bootstrap.ts`) are NOT ported — an explicit out-of-scope
+//!   follow-up. (`parseCodexMcpRegistration` is ported and unit-tested as
+//!   part of `codex-cli.ts`'s surface even though its refresh caller is
+//!   that follow-up.)
+//! * `sidecar_env` is a `BTreeMap`, so merged keys iterate in sorted order
+//!   where a JS object keeps insertion order. With no inherited sidecar
+//!   entries the only observable difference is the relative order of
+//!   `OD_MCP_BOOTSTRAP_ARGS` and `OD_MCP_BOOTSTRAP_COMMAND` when both are
+//!   set: payload content is identical, key order in `env` (and therefore
+//!   in the `--env` argv) differs.
+//! * Error envelopes need no deviation for the three Codex handlers: they
+//!   already answer through TS `sendApiError`, whose body is exactly the
+//!   `{ error: { code, message } }` envelope this crate mandates, so
+//!   status, code, and message match TypeScript. The install-info handler
+//!   has no failure body in TS at all (it cannot fail), and the guard's
+//!   403 keeps the step-2 wrap noted above.
+//! * Codex executable resolution: TS `resolveAgentBin` (through
+//!   `createCodexCliInvocation`) also finds npm's Windows `codex.cmd` shim
+//!   and honors configured per-runtime bin overrides; this port spawns a
+//!   bare `codex` from `PATH` — Windows behavior is a documented deviation
+//!   and there is no configured-bin override. The TS test seam
+//!   `setCodexRunner` is likewise not ported: the pure argv / failure /
+//!   parse helpers are what the unit tests exercise.
+//! * Spawn failures surface Rust's `io::Error` Display (`codex CLI not
+//!   found: No such file or directory (os error 2)`) where Node would
+//!   report `spawn codex ENOENT`; `CodexRunError::NotFound` plays the role
+//!   of `err.code === 'ENOENT'` in `probeCodexInstall`. Non-UTF8 child
+//!   output is decoded lossily, matching Node's `String(buffer)` UTF-8
+//!   substitution.
+//! * The install-info cache lives in `AppState` (daemon-scoped, the same
+//!   lifetime as the TS closure variable) behind a `std::sync::Mutex` that
+//!   is never held across an `.await`, and its TTL is measured on a
+//!   monotonic `Instant` instead of `Date.now()`.
+//! * `webBaseUrl` reuses the guard's `js_number` parse of `OD_WEB_PORT`
+//!   (step 1 covers hex/`Infinity` differences) and formats the number
+//!   with Rust's `Display`, so a JS-exponential value such as `1e21` would
+//!   print in decimal here.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::Ordering;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -1183,13 +1258,26 @@ fn templates() -> &'static [Value] {
 
 // ---- routes (parity: GET/PUT /api/mcp/servers, mcp-routes.ts:191 / 205) --
 
-/// Register the external MCP server configuration routes. Merged in
-/// `routes::build_router` before the `/api/{*rest}` catch-all.
+/// Register the external MCP route surface. Merged in
+/// `routes::build_router` before the `/api/{*rest}` catch-all: the
+/// configuration routes (`GET`/`PUT /api/mcp/servers`, step 2), the
+/// install-info route and the three Codex one-click install routes
+/// (step 3).
 pub fn router() -> Router<AppState> {
-    Router::new().route(
-        "/api/mcp/servers",
-        get(get_servers).put(put_servers),
-    )
+    Router::new()
+        .route(
+            "/api/mcp/servers",
+            get(get_servers).put(put_servers),
+        )
+        .route("/api/mcp/install-info", get(get_install_info))
+        .route(
+            "/api/mcp/install/codex/status",
+            get(get_codex_status),
+        )
+        .route(
+            "/api/mcp/install/codex",
+            post(post_install_codex).delete(delete_install_codex),
+        )
 }
 
 /// Parity: the `isLocalSameOrigin(req, getResolvedPort())` prologue of both
@@ -1269,6 +1357,585 @@ async fn put_servers(
             StatusCode::BAD_REQUEST,
             "BAD_REQUEST",
             &join.to_string(),
+        ),
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Install payload + Codex one-click install — parity port of
+// `mcp-install-info.ts`, `codex-cli.ts`, and the install routes in
+// `mcp-routes.ts:13-185`.
+// ───────────────────────────────────────────────────────────────────────
+
+// ---- payload builder (parity: buildMcpInstallPayload) ------------------
+
+/// Parity: `BuildMcpInstallPayloadInputs` (mcp-install-info.ts:14). Like the
+/// TS module, this is pure: the fs probes, `process.execPath`, and sidecar
+/// detection stay in the caller ([`compute_install_payload`]).
+#[derive(Debug, Clone)]
+pub struct BuildMcpInstallPayloadInputs {
+    /// TS `cliPath` — the `od` CLI entry (see DOCUMENTED DEVIATIONS for how
+    /// this port resolves TS's `OD_BIN`).
+    pub cli_path: String,
+    pub cli_exists: bool,
+    /// TS `execPath` — the runtime running the daemon right now
+    /// (`process.execPath` in TS, `std::env::current_exe()` here).
+    pub exec_path: String,
+    pub node_exists: bool,
+    pub port: u16,
+    /// TS `NodeJS.Platform` spelling — see [`ts_platform`].
+    pub platform: String,
+    pub data_dir: String,
+    pub electron_as_node: bool,
+    /// True when the daemon was bootstrapped as a sidecar and the spawned
+    /// `od mcp` should discover the live URL through its inherited client
+    /// instead of a baked `--daemon-url`. Always false in this port (see
+    /// DOCUMENTED DEVIATIONS).
+    pub is_sidecar_mode: bool,
+    /// TS `sidecarEnv` — opaque entries merged after `OD_DATA_DIR`.
+    pub sidecar_env: BTreeMap<String, String>,
+    /// TS `webBaseUrl` — `None` when the daemon has no known web port.
+    pub web_base_url: Option<String>,
+}
+
+/// Parity: `McpInstallPayload` (mcp-install-info.ts:40). Field order is
+/// load-bearing: it reproduces the TS return literal, so
+/// `serde_json::to_string` writes the same bytes as `JSON.stringify`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpInstallPayload {
+    pub command: String,
+    pub args: Vec<String>,
+    /// String→string map whose insertion order matches the TS object literal
+    /// (`OD_DATA_DIR` first, then `sidecar_env`, then
+    /// `ELECTRON_RUN_AS_NODE`).
+    pub env: Map<String, Value>,
+    pub daemon_url: String,
+    /// Browser-facing studio base URL the daemon is paired with, when known;
+    /// `null` otherwise (serialized explicitly, like the TS `null`).
+    pub web_base_url: Option<String>,
+    pub platform: String,
+    pub cli_exists: bool,
+    pub node_exists: bool,
+    pub build_hint: Option<String>,
+}
+
+/// Parity: `buildMcpInstallPayload` (mcp-install-info.ts:55) — the exact
+/// `{command, args, env, daemonUrl, webBaseUrl, platform, cliExists,
+/// nodeExists, buildHint}` shape.
+///
+/// `OD_DATA_DIR` is pinned to the daemon's resolved data root so a spawned
+/// MCP process writes where the daemon does even when the IDE that launched
+/// it (Antigravity, VS Code, …) does not inherit the packaged app's
+/// environment — parity comment for issue #848 at mcp-install-info.ts:69.
+pub fn build_mcp_install_payload(inputs: BuildMcpInstallPayloadInputs) -> McpInstallPayload {
+    let mut hints: Vec<String> = Vec::new();
+    if !inputs.cli_exists {
+        hints.push(format!(
+            "OpenDesign CLI entry is missing at {}. Rebuild the daemon or packaged app and refresh.",
+            inputs.cli_path
+        ));
+    }
+    if !inputs.node_exists {
+        hints.push(format!(
+            "Node-compatible runtime at {} no longer exists. Reinstall OpenDesign or Node and restart the daemon.",
+            inputs.exec_path
+        ));
+    }
+
+    let mut env = Map::new();
+    env.insert("OD_DATA_DIR".to_string(), Value::String(inputs.data_dir));
+    // A sidecar entry named `OD_DATA_DIR` wins — the TS object spread
+    // overwrites the literal key it was spread after.
+    for (key, value) in inputs.sidecar_env {
+        env.insert(key, Value::String(value));
+    }
+    if inputs.electron_as_node {
+        env.insert("ELECTRON_RUN_AS_NODE".to_string(), Value::String("1".to_string()));
+    }
+
+    let daemon_url = format!("http://127.0.0.1:{}", inputs.port);
+    // Sidecar mode: omit `--daemon-url` so the spawned `od mcp` discovers
+    // the live URL through its inherited client on every spawn, surviving
+    // ephemeral-port restarts. Direct launches have no socket and need the
+    // URL baked (parity comment at mcp-install-info.ts:82).
+    let args = if inputs.is_sidecar_mode {
+        vec![inputs.cli_path, "mcp".to_string()]
+    } else {
+        vec![
+            inputs.cli_path,
+            "mcp".to_string(),
+            "--daemon-url".to_string(),
+            daemon_url.clone(),
+        ]
+    };
+
+    McpInstallPayload {
+        command: inputs.exec_path,
+        args,
+        env,
+        daemon_url,
+        // `typeof webBaseUrl === 'string' && length > 0` (TS keeps the URL,
+        // else null).
+        web_base_url: inputs.web_base_url.filter(|url| !url.is_empty()),
+        platform: inputs.platform,
+        cli_exists: inputs.cli_exists,
+        node_exists: inputs.node_exists,
+        build_hint: (!hints.is_empty()).then(|| hints.join(" ")),
+    }
+}
+
+// ---- call-site inputs (parity: computeInstallPayload, mcp-routes.ts:47) --
+
+/// `OD_DAEMON_CLI_PATH` (daemon-paths.ts:10) — the first env override
+/// `resolveDaemonCliPath` consults before `OD_BIN`.
+const DAEMON_CLI_PATH_ENV: &str = "OD_DAEMON_CLI_PATH";
+
+/// The `od` CLI entry for the payload — parity for the `OD_BIN` value the TS
+/// route reads through `resolveDaemonCliPath()` (daemon-paths.ts:19).
+///
+/// The env half of that resolver is ported verbatim; the package-dist
+/// fallback (`require.resolve('@open-design/daemon/package.json')` →
+/// `dist/cli.js`) has no Rust equivalent, so this guesses the sibling `od`
+/// executable next to the running binary (see DOCUMENTED DEVIATIONS).
+fn resolve_od_bin() -> String {
+    for key in [DAEMON_CLI_PATH_ENV, "OD_BIN"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // `path.resolve(value)`: a relative override joins the cwd.
+            let path = PathBuf::from(trimmed);
+            let resolved = if path.is_absolute() {
+                path
+            } else {
+                match std::env::current_dir() {
+                    Ok(cwd) => cwd.join(&path),
+                    Err(_) => path,
+                }
+            };
+            return resolved.to_string_lossy().into_owned();
+        }
+    }
+    let sibling = if cfg!(windows) { "od.exe" } else { "od" };
+    match std::env::current_exe() {
+        Ok(exe) => exe.with_file_name(sibling).to_string_lossy().into_owned(),
+        Err(_) => sibling.to_string(),
+    }
+}
+
+/// Parity: `platform: process.platform` (mcp-routes.ts:87) — Rust's
+/// `std::env::consts::OS` spelled as the TypeScript `NodeJS.Platform` value.
+fn ts_platform(os: &str) -> &str {
+    match os {
+        "macos" => "darwin",
+        "windows" => "win32",
+        other => other,
+    }
+}
+
+/// Parity: the `webBaseUrl` half of `computeInstallPayload`
+/// (mcp-routes.ts:70-74) — `http://127.0.0.1:<OD_WEB_PORT>` when the raw
+/// value is a finite number `> 0`, else `null`. The parse is the same
+/// [`js_number`] the origin guard uses (see DOCUMENTED DEVIATIONS).
+fn web_base_url(web_port_raw: Option<&str>) -> Option<String> {
+    let value = js_number(web_port_raw?)?;
+    (value > 0.0).then(|| format!("http://127.0.0.1:{value}"))
+}
+
+/// Parity: `computeInstallPayload` (mcp-routes.ts:47-94) — the caller-side
+/// side effects behind the pure builder: `OD_BIN` + fs probes,
+/// `process.execPath`, the bound port and resolved data dir, the
+/// `OD_MCP_BOOTSTRAP_*` env merge, and `webBaseUrl`.
+/// `web_port_raw` is the same raw `OD_WEB_PORT` the route used as its cache
+/// key (`None` = unset, matching TS's `?? null`).
+fn compute_install_payload(state: &AppState, web_port_raw: Option<&str>) -> McpInstallPayload {
+    let cli_path = resolve_od_bin();
+    let cli_exists = Path::new(&cli_path).exists();
+    let exec_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("node"));
+    let node_exists = exec_path.exists();
+    let mut sidecar_env = BTreeMap::new();
+    for key in ["OD_MCP_BOOTSTRAP_COMMAND", "OD_MCP_BOOTSTRAP_ARGS"] {
+        // TS: `env.X != null && env.X.length > 0`.
+        if let Ok(value) = std::env::var(key) {
+            if !value.is_empty() {
+                sidecar_env.insert(key.to_string(), value);
+            }
+        }
+    }
+    build_mcp_install_payload(BuildMcpInstallPayloadInputs {
+        cli_path,
+        cli_exists,
+        exec_path: exec_path.to_string_lossy().into_owned(),
+        node_exists,
+        port: state.resolved_port.load(Ordering::SeqCst),
+        platform: ts_platform(std::env::consts::OS).to_string(),
+        data_dir: state.config.paths.data_dir().to_string_lossy().into_owned(),
+        // No Electron host in this port; no sidecar client either — see the
+        // step-3 DOCUMENTED DEVIATIONS above.
+        electron_as_node: false,
+        is_sidecar_mode: false,
+        sidecar_env,
+        web_base_url: web_base_url(web_port_raw),
+    })
+}
+
+// ---- install-info route (parity: mcp-routes.ts:96-112) -----------------
+
+/// Parity: `INSTALL_INFO_TTL_MS = 5000` (mcp-routes.ts:32).
+const INSTALL_INFO_TTL: Duration = Duration::from_secs(5);
+
+/// Parity: the `installInfoCache` closure variable (mcp-routes.ts:33-37).
+/// It lives in [`crate::routes::AppState`] so it is daemon-scoped exactly
+/// like the `registerMcpRoutes` closure was.
+pub struct InstallInfoCache {
+    /// Monotonic stand-in for TS's `Date.now()` stamp.
+    t: Instant,
+    payload: McpInstallPayload,
+    /// Raw `OD_WEB_PORT` value the entry was computed under (`None` = unset);
+    /// part of the TS cache key.
+    web_port: Option<String>,
+}
+
+/// The shared cache slot `AppState` hands to this module.
+pub type InstallInfoCacheSlot = Arc<std::sync::Mutex<Option<InstallInfoCache>>>;
+
+/// `GET /api/mcp/install-info` (parity: mcp-routes.ts:96-112) — the payload
+/// the Settings → MCP panel renders as copyable snippets, cached for 5s
+/// keyed on the raw `OD_WEB_PORT` value. The guard runs before the cache,
+/// exactly as in TS.
+async fn get_install_info(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = local_same_origin_rejection(&state, &headers) {
+        return response;
+    }
+    let web_port = std::env::var("OD_WEB_PORT").ok();
+    // Held only across synchronous work — no `.await` while locked.
+    let mut cache = state
+        .mcp_install_info_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = cache.as_ref() {
+        if entry.web_port == web_port && entry.t.elapsed() < INSTALL_INFO_TTL {
+            return Json(entry.payload.clone()).into_response();
+        }
+    }
+    let payload = compute_install_payload(&state, web_port.as_deref());
+    *cache = Some(InstallInfoCache {
+        t: Instant::now(),
+        payload: payload.clone(),
+        web_port,
+    });
+    drop(cache);
+    Json(payload).into_response()
+}
+
+// ---- Codex CLI runner (parity: codex-cli.ts) ----------------------------
+
+/// Parity: `CODEX_MCP_NAME = 'open-design'` (mcp-routes.ts:118) — the MCP
+/// server name in `~/.codex/config.toml`.
+const CODEX_MCP_NAME: &str = "open-design";
+
+/// Parity: `defaultCodexRunner`'s 30s `setTimeout` (codex-cli.ts:58).
+const CODEX_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Parity: `CodexRunnerResult` (codex-cli.ts:15). `exit_code` keeps TS's
+/// `code ?? -1` for signal deaths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexRunnerResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// The runner's failure shapes. `NotFound` is this port's stand-in for
+/// Node's `err.code === 'ENOENT'` in `probeCodexInstall`; `Failed` carries
+/// the exact messages TypeScript throws from `installCodexMcp` /
+/// `uninstallCodexMcp`.
+#[derive(Debug, thiserror::Error)]
+pub enum CodexRunError {
+    /// Parity: `new Error('codex CLI timed out after 30s')`.
+    #[error("codex CLI timed out after 30s")]
+    Timeout,
+    /// Spawn failure with `ErrorKind::NotFound` — no `codex` on `PATH`
+    /// (message wording deviates, see DOCUMENTED DEVIATIONS).
+    #[error("codex CLI not found: {0}")]
+    NotFound(String),
+    /// Any other spawn / I/O failure.
+    #[error("failed to run codex CLI: {0}")]
+    Spawn(String),
+    /// Parity: the `new Error(\`codex mcp … failed: ${failureDetail(result)}\`)`
+    /// throws for a non-zero exit.
+    #[error("{0}")]
+    Failed(String),
+}
+
+/// Parity: `CodexInstallStatus` (codex-cli.ts:92).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CodexInstallStatus {
+    /// True when the `codex` CLI was found and is runnable.
+    pub available: bool,
+    /// True when a server with this name is already registered.
+    pub installed: bool,
+}
+
+/// Parity: `CodexInstallSpec` (codex-cli.ts:116).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexInstallSpec {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    /// The payload `env`, iterated in its own (insertion) order when the
+    /// argv is built.
+    pub env: Map<String, Value>,
+}
+
+/// Parity: `defaultCodexRunner.run` (codex-cli.ts:45-78) — spawn `codex`
+/// with stdin ignored and stdout/stderr piped, reject after 30s. The
+/// executable is resolved from `PATH` directly (see DOCUMENTED DEVIATIONS);
+/// `env_overrides` mirrors the runner's `opts.env` merge onto the inherited
+/// environment.
+pub async fn run_codex(
+    args: &[&str],
+    env_overrides: &[(String, String)],
+) -> Result<CodexRunnerResult, CodexRunError> {
+    let mut command = tokio::process::Command::new("codex");
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Parity: `child.kill('SIGKILL')` on timeout — dropping the output
+        // future at the deadline kills the child before we reject.
+        .kill_on_drop(true);
+    for (key, value) in env_overrides {
+        command.env(key, value);
+    }
+    let outcome = tokio::time::timeout(CODEX_TIMEOUT, command.output()).await;
+    let output = match outcome {
+        Err(_elapsed) => return Err(CodexRunError::Timeout),
+        Ok(Err(err)) => {
+            return Err(match err.kind() {
+                std::io::ErrorKind::NotFound => CodexRunError::NotFound(err.to_string()),
+                _ => CodexRunError::Spawn(err.to_string()),
+            });
+        }
+        Ok(Ok(output)) => output,
+    };
+    Ok(CodexRunnerResult {
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+/// Parity: `probeCodexInstall` (codex-cli.ts:103-114) — a spawn failure with
+/// `ENOENT` means "no Codex CLI"; anything else propagates to the route's
+/// `CODEX_PROBE_FAILED` 500.
+pub async fn probe_codex_install(name: &str) -> Result<CodexInstallStatus, CodexRunError> {
+    match run_codex(&["mcp", "get", name], &[]).await {
+        Ok(result) => Ok(CodexInstallStatus {
+            available: true,
+            installed: result.exit_code == 0,
+        }),
+        Err(CodexRunError::NotFound(_)) => Ok(CodexInstallStatus {
+            available: false,
+            installed: false,
+        }),
+        Err(err) => Err(err),
+    }
+}
+
+/// One `env` entry rendered for the `--env K=V` argv pair.
+fn env_entry_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Parity: the argv assembly at the head of `installCodexMcp`
+/// (codex-cli.ts:127-131), exposed as a pure function so the ordering
+/// (`--env` pairs in payload-env order, then `--` + command + args) is
+/// testable without spawning the CLI.
+pub fn codex_mcp_add_argv(spec: &CodexInstallSpec) -> Vec<String> {
+    let mut argv = vec!["mcp".to_string(), "add".to_string(), spec.name.clone()];
+    for (key, value) in &spec.env {
+        argv.push("--env".to_string());
+        argv.push(format!("{key}={}", env_entry_text(value)));
+    }
+    argv.push("--".to_string());
+    argv.push(spec.command.clone());
+    argv.extend(spec.args.iter().cloned());
+    argv
+}
+
+/// Parity: `installCodexMcp` (codex-cli.ts:126-136).
+pub async fn install_codex_mcp(spec: &CodexInstallSpec) -> Result<(), CodexRunError> {
+    let argv = codex_mcp_add_argv(spec);
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let result = run_codex(&args, &[]).await?;
+    if result.exit_code != 0 {
+        return Err(CodexRunError::Failed(format!(
+            "codex mcp add failed: {}",
+            failure_detail(&result)
+        )));
+    }
+    Ok(())
+}
+
+/// Parity: `uninstallCodexMcp` (codex-cli.ts:192-197).
+pub async fn uninstall_codex_mcp(name: &str) -> Result<(), CodexRunError> {
+    let result = run_codex(&["mcp", "remove", name], &[]).await?;
+    if result.exit_code != 0 {
+        return Err(CodexRunError::Failed(format!(
+            "codex mcp remove failed: {}",
+            failure_detail(&result)
+        )));
+    }
+    Ok(())
+}
+
+/// Parity: `failureDetail` (codex-cli.ts:199-201) — trimmed stderr, else
+/// trimmed stdout, else `exit <code>`.
+fn failure_detail(result: &CodexRunnerResult) -> String {
+    let stderr = result.stderr.trim();
+    if !stderr.is_empty() {
+        return stderr.to_string();
+    }
+    let stdout = result.stdout.trim();
+    if !stdout.is_empty() {
+        return stdout.to_string();
+    }
+    format!("exit {}", result.exit_code)
+}
+
+/// Parity: `CodexMcpRegistration` (codex-cli.ts:138).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexMcpRegistration {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: Map<String, Value>,
+}
+
+/// Parity: `parseCodexMcpRegistration` (codex-cli.ts:146-164) — parses
+/// `codex mcp get <name> --json` for a stdio server; `None` for any other
+/// transport or an unrecognized shape. The managed-refresh caller is out of
+/// scope (see DOCUMENTED DEVIATIONS), but the parser is part of this TS
+/// module's surface.
+pub fn parse_codex_mcp_registration(stdout: &str) -> Option<CodexMcpRegistration> {
+    let parsed: Value = serde_json::from_str(stdout).ok()?;
+    // `parsed.transport` on a non-object / missing / null transport is
+    // `undefined`/`null` in JS → `null` here.
+    let transport = parsed.as_object()?.get("transport")?.as_object()?;
+    let command = transport.get("command")?.as_str()?.to_string();
+    // Non-arrays and arrays with a non-string element collapse to `[]`
+    // (the TS `every` guard), unlike a *missing* `args`, which is also `[]`.
+    let args = match transport.get("args") {
+        Some(Value::Array(items)) if items.iter().all(Value::is_string) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
+    // `transport.env != null && typeof transport.env === 'object'`, then
+    // keep only string values. `Object.entries` also walks arrays with index
+    // keys, so array-shaped envs collect `"0"`, `"1"`, … like JS would.
+    let mut env = Map::new();
+    match transport.get("env") {
+        Some(Value::Object(map)) => {
+            for (key, value) in map {
+                if let Some(text) = value.as_str() {
+                    env.insert(key.clone(), Value::String(text.to_string()));
+                }
+            }
+        }
+        Some(Value::Array(items)) => {
+            for (index, value) in items.iter().enumerate() {
+                if let Some(text) = value.as_str() {
+                    env.insert(index.to_string(), Value::String(text.to_string()));
+                }
+            }
+        }
+        _ => {}
+    }
+    Some(CodexMcpRegistration {
+        command,
+        args,
+        env,
+    })
+}
+
+// ---- Codex install routes (parity: mcp-routes.ts:142-185) ---------------
+
+/// `GET /api/mcp/install/codex/status` (parity: mcp-routes.ts:142-152) —
+/// `{available, installed}` for the one-click toggle; runner failures (other
+/// than "no CLI") answer 500 `CODEX_PROBE_FAILED` with `String(err.message)`.
+async fn get_codex_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = local_same_origin_rejection(&state, &headers) {
+        return response;
+    }
+    match probe_codex_install(CODEX_MCP_NAME).await {
+        Ok(status) => Json(status).into_response(),
+        Err(err) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CODEX_PROBE_FAILED",
+            &err.to_string(),
+        ),
+    }
+}
+
+/// `POST /api/mcp/install/codex` (parity: mcp-routes.ts:154-173) — feed the
+/// exact fields the copyable snippet would carry into `codex mcp add`.
+/// An incomplete payload (missing CLI or runtime) refuses first with the
+/// buildHint as the message, matching `payload.buildHint ?? 'install payload
+/// not ready'`.
+async fn post_install_codex(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = local_same_origin_rejection(&state, &headers) {
+        return response;
+    }
+    let web_port = std::env::var("OD_WEB_PORT").ok();
+    let payload = compute_install_payload(&state, web_port.as_deref());
+    if !payload.cli_exists || !payload.node_exists {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INSTALL_INFO_INCOMPLETE",
+            payload
+                .build_hint
+                .as_deref()
+                .unwrap_or("install payload not ready"),
+        );
+    }
+    let spec = CodexInstallSpec {
+        name: CODEX_MCP_NAME.to_string(),
+        command: payload.command.clone(),
+        args: payload.args.clone(),
+        env: payload.env.clone(),
+    };
+    match install_codex_mcp(&spec).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(err) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CODEX_INSTALL_FAILED",
+            &err.to_string(),
+        ),
+    }
+}
+
+/// `DELETE /api/mcp/install/codex` (parity: mcp-routes.ts:175-185) —
+/// `codex mcp remove open-design`; failures answer 500
+/// `CODEX_UNINSTALL_FAILED` with `String(err.message)`.
+async fn delete_install_codex(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = local_same_origin_rejection(&state, &headers) {
+        return response;
+    }
+    match uninstall_codex_mcp(CODEX_MCP_NAME).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(err) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CODEX_UNINSTALL_FAILED",
+            &err.to_string(),
         ),
     }
 }
@@ -2233,5 +2900,314 @@ mod tests {
         // the integration test against the source ids as well).
         let first = list[0].as_object().expect("object");
         assert_eq!(first.keys().next().map(String::as_str), Some("id"));
+    }
+
+    // ---- install payload (parity: buildMcpInstallPayload) -----------------
+
+    /// A payload that is complete on a healthy install — each test tweaks the
+    /// fields it cares about from here.
+    fn payload_inputs() -> BuildMcpInstallPayloadInputs {
+        BuildMcpInstallPayloadInputs {
+            cli_path: "/app/dist/cli.js".to_string(),
+            cli_exists: true,
+            exec_path: "/usr/bin/node".to_string(),
+            node_exists: true,
+            port: 7456,
+            platform: "linux".to_string(),
+            data_dir: "/data/od".to_string(),
+            electron_as_node: false,
+            is_sidecar_mode: false,
+            sidecar_env: BTreeMap::new(),
+            web_base_url: None,
+        }
+    }
+
+    #[test]
+    fn install_payload_serializes_like_the_ts_return_literal() {
+        // The exact text `JSON.stringify(buildMcpInstallPayload(inputs))`
+        // produces, key order included (mcp-install-info.ts:94-110).
+        let payload = build_mcp_install_payload(payload_inputs());
+        assert_eq!(
+            serde_json::to_string(&payload).expect("serialize"),
+            concat!(
+                r#"{"command":"/usr/bin/node","args":["/app/dist/cli.js","mcp","#,
+                r#""--daemon-url","http://127.0.0.1:7456"],"env":{"OD_DATA_DIR":"/data/od"},"#,
+                r#""daemonUrl":"http://127.0.0.1:7456","webBaseUrl":null,"platform":"linux","#,
+                r#""cliExists":true,"nodeExists":true,"buildHint":null}"#,
+            )
+        );
+
+        // Sidecar mode drops `--daemon-url` and carries webBaseUrl through.
+        let inputs = BuildMcpInstallPayloadInputs {
+            is_sidecar_mode: true,
+            web_base_url: Some("http://127.0.0.1:65321".to_string()),
+            ..payload_inputs()
+        };
+        let payload = build_mcp_install_payload(inputs);
+        assert_eq!(
+            serde_json::to_string(&payload).expect("serialize"),
+            concat!(
+                r#"{"command":"/usr/bin/node","args":["/app/dist/cli.js","mcp"],"#,
+                r#""env":{"OD_DATA_DIR":"/data/od"},"daemonUrl":"http://127.0.0.1:7456","#,
+                r#""webBaseUrl":"http://127.0.0.1:65321","platform":"linux","#,
+                r#""cliExists":true,"nodeExists":true,"buildHint":null}"#,
+            )
+        );
+
+        // `webBaseUrl` is null for absent *and* empty strings
+        // (`typeof === 'string' && length > 0`).
+        let payload = build_mcp_install_payload(BuildMcpInstallPayloadInputs {
+            web_base_url: Some(String::new()),
+            ..payload_inputs()
+        });
+        assert_eq!(payload.web_base_url, None);
+        assert!(serde_json::to_string(&payload)
+            .expect("serialize")
+            .contains(r#""webBaseUrl":null"#));
+    }
+
+    #[test]
+    fn build_hint_joins_the_missing_pieces_with_one_space() {
+        // Complete → null (TS `hints.length ? hints.join(' ') : null`).
+        assert_eq!(build_mcp_install_payload(payload_inputs()).build_hint, None);
+
+        // Each hint alone, message text verbatim from mcp-install-info.ts:61
+        // and :66.
+        let payload = build_mcp_install_payload(BuildMcpInstallPayloadInputs {
+            cli_exists: false,
+            ..payload_inputs()
+        });
+        assert_eq!(
+            payload.build_hint.as_deref(),
+            Some(
+                "OpenDesign CLI entry is missing at /app/dist/cli.js. \
+                 Rebuild the daemon or packaged app and refresh."
+            )
+        );
+        let payload = build_mcp_install_payload(BuildMcpInstallPayloadInputs {
+            node_exists: false,
+            ..payload_inputs()
+        });
+        assert_eq!(
+            payload.build_hint.as_deref(),
+            Some(
+                "Node-compatible runtime at /usr/bin/node no longer exists. \
+                 Reinstall OpenDesign or Node and restart the daemon."
+            )
+        );
+
+        // Both → the two hints joined by exactly one space.
+        let payload = build_mcp_install_payload(BuildMcpInstallPayloadInputs {
+            cli_exists: false,
+            node_exists: false,
+            ..payload_inputs()
+        });
+        let hint = payload.build_hint.expect("both hints");
+        assert_eq!(
+            hint.matches(". Rebuild the daemon").count(),
+            1,
+            "hint: {hint}"
+        );
+        assert!(!hint.contains("  "), "single-space join: {hint}");
+        assert!(hint.starts_with("OpenDesign CLI entry is missing at "));
+        assert!(hint.contains(" Node-compatible runtime at /usr/bin/node "));
+        assert!(!payload.cli_exists && !payload.node_exists);
+    }
+
+    #[test]
+    fn env_merges_od_data_dir_then_sidecar_entries_then_electron_flag() {
+        let inputs = BuildMcpInstallPayloadInputs {
+            sidecar_env: BTreeMap::from([
+                ("Z_VAR".to_string(), "z".to_string()),
+                ("OD_DATA_DIR".to_string(), "/other".to_string()),
+                ("A_VAR".to_string(), "a".to_string()),
+            ]),
+            electron_as_node: true,
+            ..payload_inputs()
+        };
+        let payload = build_mcp_install_payload(inputs);
+        // `OD_DATA_DIR` first (a sidecar entry of the same name overwrites
+        // the value but keeps the key's position, like an object spread over
+        // an existing key), the remaining sidecar keys in map order, then
+        // `ELECTRON_RUN_AS_NODE` last.
+        assert_eq!(
+            serde_json::to_string(&payload.env).expect("env"),
+            r#"{"OD_DATA_DIR":"/other","A_VAR":"a","Z_VAR":"z","ELECTRON_RUN_AS_NODE":"1"}"#
+        );
+
+        // Without the Electron flag it never appears.
+        let payload = build_mcp_install_payload(payload_inputs());
+        assert_eq!(
+            serde_json::to_string(&payload.env).expect("env"),
+            r#"{"OD_DATA_DIR":"/data/od"}"#
+        );
+    }
+
+    #[test]
+    fn web_base_url_follows_the_number_semantics_of_od_web_port() {
+        assert_eq!(web_base_url(None), None);
+        assert_eq!(web_base_url(Some("")), None);
+        assert_eq!(
+            web_base_url(Some("65321")),
+            Some("http://127.0.0.1:65321".to_string())
+        );
+        // Whitespace trims (JS `Number(' 65321 ')`), fractional ports print
+        // like JS string interpolation of the number.
+        assert_eq!(
+            web_base_url(Some(" 65321 ")),
+            Some("http://127.0.0.1:65321".to_string())
+        );
+        assert_eq!(
+            web_base_url(Some("8080.5")),
+            Some("http://127.0.0.1:8080.5".to_string())
+        );
+        // Falsy / NaN / non-finite inputs are null in TS. `0x10` is the one
+        // documented divergence (hex parses in JS, not here — see step 1).
+        for raw in ["0", "-1", "abc", "NaN", "Infinity", "-Infinity", "0x10", "8080abc"] {
+            assert_eq!(web_base_url(Some(raw)), None, "raw: {raw}");
+        }
+    }
+
+    #[test]
+    fn platform_maps_rust_os_to_the_node_platform_string() {
+        assert_eq!(ts_platform("linux"), "linux");
+        assert_eq!(ts_platform("macos"), "darwin");
+        assert_eq!(ts_platform("windows"), "win32");
+        // Unknown OS values pass through as-is.
+        assert_eq!(ts_platform("freebsd"), "freebsd");
+    }
+
+    // ---- Codex CLI runner (parity: codex-cli.ts) ---------------------------
+
+    #[test]
+    fn failure_detail_prefers_stderr_then_stdout_then_the_exit_code() {
+        let result = CodexRunnerResult {
+            exit_code: 2,
+            stdout: " out \n".to_string(),
+            stderr: " err \n".to_string(),
+        };
+        assert_eq!(failure_detail(&result), "err");
+        let result = CodexRunnerResult {
+            exit_code: 2,
+            stdout: "out".to_string(),
+            stderr: "   \n".to_string(),
+        };
+        assert_eq!(failure_detail(&result), "out");
+        let result = CodexRunnerResult {
+            exit_code: 127,
+            stdout: String::new(),
+            stderr: "\n".to_string(),
+        };
+        assert_eq!(failure_detail(&result), "exit 127");
+    }
+
+    #[test]
+    fn codex_mcp_add_argv_orders_env_pairs_before_the_command() {
+        let mut env = Map::new();
+        env.insert("OD_DATA_DIR".to_string(), json!("/data/od"));
+        env.insert("ELECTRON_RUN_AS_NODE".to_string(), json!("1"));
+        let spec = CodexInstallSpec {
+            name: "open-design".to_string(),
+            command: "/usr/bin/node".to_string(),
+            args: vec![
+                "/app/cli.js".to_string(),
+                "mcp".to_string(),
+                "--daemon-url".to_string(),
+                "http://127.0.0.1:7456".to_string(),
+            ],
+            env,
+        };
+        assert_eq!(
+            codex_mcp_add_argv(&spec),
+            [
+                "mcp", "add", "open-design",
+                "--env", "OD_DATA_DIR=/data/od",
+                "--env", "ELECTRON_RUN_AS_NODE=1",
+                "--", "/usr/bin/node", "/app/cli.js", "mcp", "--daemon-url",
+                "http://127.0.0.1:7456",
+            ]
+        );
+
+        // An empty env emits no `--env` pairs at all — straight from
+        // `mcp add <name> -- <command> <args…>`.
+        let spec = CodexInstallSpec {
+            name: "open-design".to_string(),
+            command: "od".to_string(),
+            args: vec!["mcp".to_string()],
+            env: Map::new(),
+        };
+        assert_eq!(codex_mcp_add_argv(&spec), ["mcp", "add", "open-design", "--", "od", "mcp"]);
+    }
+
+    #[test]
+    fn parse_codex_mcp_registration_reads_the_stdio_shape() {
+        let parsed = parse_codex_mcp_registration(
+            r#"{"name":"open-design","transport":{"type":"stdio","command":"node","args":["/app/cli.js","mcp"],"env":{"OD_DATA_DIR":"/data","PORT":"7456"}},"status":"ok"}"#,
+        )
+        .expect("stdio registration");
+        assert_eq!(parsed.command, "node");
+        assert_eq!(parsed.args, ["/app/cli.js", "mcp"]);
+        assert_eq!(
+            serde_json::to_string(&parsed.env).expect("env"),
+            r#"{"OD_DATA_DIR":"/data","PORT":"7456"}"#
+        );
+
+        // Missing `args`, and a non-array / partially-non-string `args`
+        // collapse to `[]` (TS `Array.isArray && every`).
+        let parsed =
+            parse_codex_mcp_registration(r#"{"transport":{"command":"node"}}"#).expect("args-free");
+        assert!(parsed.args.is_empty());
+        for raw in [
+            r#"{"transport":{"command":"node","args":"-x"}}"#,
+            r#"{"transport":{"command":"node","args":["ok",42]}}"#,
+            r#"{"transport":{"command":"node","args":{}}}"#,
+        ] {
+            let parsed = parse_codex_mcp_registration(raw).expect("shape still parses");
+            assert!(parsed.args.is_empty(), "args should be []: {raw}");
+        }
+
+        // Non-string env values are dropped; string ones keep their order.
+        let parsed = parse_codex_mcp_registration(
+            r#"{"transport":{"command":"node","env":{"A":1,"B":"two","C":null,"D":true}}}"#,
+        )
+        .expect("env shape");
+        assert_eq!(
+            serde_json::to_string(&parsed.env).expect("env"),
+            r#"{"B":"two"}"#
+        );
+
+        // `Object.entries` walks arrays with index keys, so an array-shaped
+        // env collects `"0"`, `"1"`, … with the non-strings skipped.
+        let parsed =
+            parse_codex_mcp_registration(r#"{"transport":{"command":"n","env":["a",2]}}"#)
+                .expect("array env shape");
+        assert_eq!(serde_json::to_string(&parsed.env).expect("env"), r#"{"0":"a"}"#);
+    }
+
+    #[test]
+    fn parse_codex_mcp_registration_rejects_any_other_shape() {
+        for raw in [
+            "not json",
+            "",
+            "42",
+            "[1]",
+            "\"stdio\"",
+            "null",
+            r#"{"transport":null}"#,
+            r#"{"transport":"stdio"}"#,
+            r#"{"transport":{}}"#,
+            r#"{"transport":{"args":["a"]}}"#,
+            r#"{"transport":{"command":42}}"#,
+            r#"{"transport":{"command":null}}"#,
+            // Top-level command without a transport object is not the shape.
+            r#"{"command":"node","args":["mcp"]}"#,
+            // Truncated payload.
+            r#"{"transport":{"command":"node""#,
+        ] {
+            assert!(
+                parse_codex_mcp_registration(raw).is_none(),
+                "should reject: {raw:?}"
+            );
+        }
     }
 }
