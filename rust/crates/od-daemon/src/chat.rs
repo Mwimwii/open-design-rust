@@ -148,7 +148,9 @@ async fn post_test_connection(
                     },
                 );
             }
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Connection test failed")
+            let body_value = Value::Object(body.clone());
+            let result = crate::connection_test::test_provider_connection(&body_value).await;
+            Json(result).into_response()
         }
         "agent" => {
             let agent_id = body.get("agentId").and_then(Value::as_str).unwrap_or_default().trim();

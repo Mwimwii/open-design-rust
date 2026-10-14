@@ -10,6 +10,7 @@
 
 pub mod auth;
 pub mod chat;
+pub mod connection_test;
 pub mod chat_artifacts;
 pub mod config;
 pub mod conversations;
