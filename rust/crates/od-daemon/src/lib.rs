@@ -12,6 +12,7 @@ pub mod agents;
 pub mod auth;
 pub mod chat;
 pub mod connection_test;
+pub mod detect;
 pub mod critique;
 pub mod chat_artifacts;
 pub mod config;

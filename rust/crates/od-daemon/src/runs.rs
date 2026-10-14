@@ -1557,82 +1557,22 @@ impl Runs {
             self.fail_spawn(run_id, &message);
             return;
         }
-        // Prompt-file adapters need the staged path before argv is final.
-        let prompt_file: Option<String> = if def.prompt_via_file {
-            match stage_prompt_file(run_id, &prompt) {
-                Ok(path) => Some(path),
-                Err(message) => {
-                    self.fail_spawn(run_id, &message);
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        let context = AgentContext {
-            cwd: cwd.clone(),
-            platform: std::env::consts::OS.to_string(),
-            ..AgentContext::default()
-        };
-        let options = BuildOptions {
+        // Capability probing and the spawn itself run off the request path:
+        // probes cost bounded child spawns that must not block the 202.
+        let setup = SpawnSetup {
+            runs: self.clone(),
+            run_id: run_id.to_string(),
+            agent_id,
             model,
             reasoning,
             service_tier,
+            prompt,
+            project_id,
+            cwd,
+            data_dir: data_dir.to_path_buf(),
         };
-        let caps = HashMap::new();
-        let live = agents::LiveModelCache::default();
-        let dirs: Vec<String> = Vec::new();
-        let input = BuildArgsInput {
-            caps: &caps,
-            options: &options,
-            extra_allowed_dirs: &dirs,
-            context: &context,
-            live: &live,
-            live_scope: None,
-            prompt: &prompt,
-            prompt_file_path: prompt_file.as_deref(),
-            image_paths: &[],
-        };
-        let (bin_path, argv) = match spawn::prepare_spawn(def, &input) {
-            Ok(prepared) => prepared,
-            Err(message) => {
-                self.fail_spawn(run_id, &message);
-                return;
-            }
-        };
-        let stdin_piped = def.prompt_via_stdin;
-        let env_extra = spawn::agent_env(
-            data_dir,
-            def,
-            project_id.as_deref(),
-            cwd.as_deref(),
-        );
-        let spawned = match spawn::spawn_child(
-            &bin_path,
-            &argv,
-            cwd.as_deref(),
-            &env_extra,
-            &["OD_API_TOKEN"],
-            stdin_piped,
-        ) {
-            Ok(spawned) => spawned,
-            Err(err) => {
-                self.fail_spawn(run_id, &format!("agent spawn failed: {err}"));
-                return;
-            }
-        };
-        let stdin_bytes = stdin_piped.then(|| spawn::stdin_bytes(def, &prompt));
-        let handle = Arc::new(tokio::sync::Mutex::new(spawned.child));
-        {
-            let mut registry = lock(&self.inner);
-            if let Some(run) = registry.runs.get_mut(run_id) {
-                run.child = Some(Arc::clone(&handle));
-            }
-        }
-        let runs = self.clone();
-        let run_id = run_id.to_string();
         tokio::spawn(async move {
-            pump_child(runs, run_id, handle, stdin_bytes, prompt_file).await;
+            setup_and_spawn(setup).await;
         });
     }
 
@@ -3107,6 +3047,140 @@ async fn prepare_run_create(
 }
 
 /// Parity: the `cwd` a starter would hand the child (`resolveProjectDir`).
+/// Detect, build, and spawn the agent child off the request path.
+/// Detection failures leave the run stranded in `running` (the probes
+/// themselves are best-effort); unresolvable binaries and invalid argv
+/// fail it fast per the `startChatRun` guard parity in `try_spawn`.
+/// Inputs for [`setup_and_spawn`], bundled so the function stays
+/// within the argument-count lint.
+struct SpawnSetup {
+    runs: Runs,
+    run_id: String,
+    agent_id: String,
+    model: Option<String>,
+    reasoning: Option<String>,
+    service_tier: Option<String>,
+    prompt: String,
+    project_id: Option<String>,
+    cwd: Option<String>,
+    data_dir: std::path::PathBuf,
+}
+
+async fn setup_and_spawn(setup: SpawnSetup) {
+    let SpawnSetup {
+        runs,
+        run_id,
+        agent_id,
+        model,
+        reasoning,
+        service_tier,
+        prompt,
+        project_id,
+        cwd,
+        data_dir,
+    } = setup;
+    let def = agents::get_agent_def(&agent_id).expect("def checked above");
+    let detected = crate::detect::detect_agent(def, &HashMap::new()).await;
+    let caps = detected.as_ref().map(|d| d.caps.clone()).unwrap_or_default();
+    let bin_path = match detected {
+        Some(detected) => detected.bin_path,
+        None => match spawn::resolve_bin(def.bin, def.fallback_bins) {
+            Some(path) => path,
+            None => {
+                runs.fail_spawn(
+                    &run_id,
+                    &format!(
+                        "agent binary not found: Agent {:?} (`{}`) is not installed or not on PATH. Install it and refresh the agent list (GET /api/agents) before retrying.",
+                        def.name, def.bin
+                    ),
+                );
+                return;
+            }
+        },
+    };
+    // Prompt-file adapters need the staged path before argv is final.
+    let prompt_file: Option<String> = if def.prompt_via_file {
+        match stage_prompt_file(&run_id, &prompt) {
+            Ok(path) => Some(path),
+            Err(message) => {
+                runs.fail_spawn(&run_id, &message);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let context = AgentContext {
+        cwd: cwd.clone(),
+        platform: std::env::consts::OS.to_string(),
+        ..AgentContext::default()
+    };
+    let options = BuildOptions {
+        model,
+        reasoning,
+        service_tier,
+    };
+    let live = agents::LiveModelCache::default();
+    let dirs: Vec<String> = Vec::new();
+    let input = BuildArgsInput {
+        caps: &caps,
+        options: &options,
+        extra_allowed_dirs: &dirs,
+        context: &context,
+        live: &live,
+        live_scope: None,
+        prompt: &prompt,
+        prompt_file_path: prompt_file.as_deref(),
+        image_paths: &[],
+    };
+    let argv = match (def.build_args)(&input) {
+        Ok(argv) => argv,
+        Err(message) => {
+            runs.fail_spawn(&run_id, &message);
+            return;
+        }
+    };
+    let stdin_piped = def.prompt_via_stdin;
+    let env_extra = spawn::agent_env(
+        &data_dir,
+        def,
+        project_id.as_deref(),
+        cwd.as_deref(),
+    );
+    let spawned = match spawn::spawn_child(
+        &bin_path,
+        &argv,
+        cwd.as_deref(),
+        &env_extra,
+        &["OD_API_TOKEN"],
+        stdin_piped,
+    ) {
+        Ok(spawned) => spawned,
+        Err(err) => {
+            runs.fail_spawn(&run_id, &format!("agent spawn failed: {err}"));
+            return;
+        }
+    };
+    let stdin_bytes = stdin_piped.then(|| spawn::stdin_bytes(def, &prompt));
+    let handle = Arc::new(tokio::sync::Mutex::new(spawned.child));
+    {
+        let mut registry = lock(&runs.inner);
+        if let Some(run) = registry.runs.get_mut(&run_id) {
+            if run.is_terminal() || run.cancel_requested {
+                drop(registry);
+                if let Ok(mut child) = handle.try_lock() {
+                    let _ = child.start_kill();
+                }
+                return;
+            }
+            run.child = Some(Arc::clone(&handle));
+        } else {
+            return;
+        }
+    }
+    pump_child(runs, run_id, handle, stdin_bytes, prompt_file).await;
+}
+
 /// Stage the composed prompt in a temp file for file-prompt adapters
 /// (parity: the daemon-created prompt file behind `promptViaFile`).
 fn stage_prompt_file(run_id: &str, prompt: &str) -> Result<String, String> {
