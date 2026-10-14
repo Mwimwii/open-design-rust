@@ -105,6 +105,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::chat_artifacts::router())
         .merge(crate::runs::router())
         .merge(crate::chat::router())
+        .merge(crate::critique::router())
         .merge(crate::proxy::router())
         .merge(crate::mcp::router())
         .route(
