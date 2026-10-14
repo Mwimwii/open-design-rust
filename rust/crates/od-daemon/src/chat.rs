@@ -27,7 +27,6 @@ pub fn router() -> Router<AppState> {
             get(critique_not_implemented),
         )
         .route("/api/proxy/anthropic/stream", post(proxy_stream_not_implemented))
-        .route("/api/proxy/openai/stream", post(proxy_stream_not_implemented))
         .route("/api/proxy/azure/stream", post(proxy_stream_not_implemented))
         .route("/api/proxy/google/stream", post(proxy_stream_not_implemented))
         .route("/api/proxy/ollama/stream", post(proxy_stream_not_implemented))
