@@ -121,6 +121,16 @@ pub struct AgentDef {
     pub auth_probe: Option<(&'static [&'static str], u64)>,
     /// Parity: `maxPromptArgBytes`.
     pub max_prompt_arg_bytes: Option<usize>,
+    /// Parity: `mcpDiscovery`.
+    pub mcp_discovery: Option<&'static str>,
+    /// Parity: `acpTurnEndCompletesPrompt`.
+    pub acp_turn_end_completes_prompt: bool,
+    /// Parity: `acpStdioMcpRemovedInVersion`.
+    pub acp_stdio_mcp_removed_in_version: Option<&'static str>,
+    /// Parity: `acpMcpEnvFormat`.
+    pub acp_mcp_env_format: Option<&'static str>,
+    /// Parity: `versionProbeTimeoutMs`.
+    pub version_probe_timeout_ms: Option<u64>,
     pub build_args: fn(&BuildArgsInput) -> Result<Vec<String>, String>,
 }
 
@@ -146,6 +156,13 @@ fn shipped_defs() -> Vec<AgentDef> {
         qoder_def(),
         qwen_def(),
         byok_opencode_def(),
+        hermes_def(),
+        kilo_def(),
+        kimi_def(),
+        kiro_def(),
+        trae_cli_def(),
+        vibe_def(),
+        mimo_def(),
     ]
 }
 
@@ -469,6 +486,11 @@ fn claude_def() -> AgentDef {
         first_output_timeout_ms: None,
         auth_probe: Some((&["auth", "status"], 5000)),
         max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
         build_args: |input| {
             let caps = input.caps;
             let mut args = vec![
@@ -575,6 +597,11 @@ fn codebuddy_def() -> AgentDef {
         first_output_timeout_ms: None,
         auth_probe: None,
         max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
         build_args: |input| {
             let caps = input.caps;
             let mut args = vec![
@@ -788,6 +815,11 @@ fn codex_def() -> AgentDef {
         first_output_timeout_ms: None,
         auth_probe: Some((&["login", "status"], 5000)),
         max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
         build_args: |input| {
             let ctx = input.context;
             let needs_danger = codex_needs_danger_full_access(&ctx.platform, &ctx.env);
@@ -1001,6 +1033,11 @@ fn opencode_def() -> AgentDef {
         first_output_timeout_ms: None,
         auth_probe: None,
         max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
         build_args: |input| {
             let mut args = vec!["run".to_string(), "--format".to_string(), "json".to_string()];
             if input.caps.get("skipPermissions") == Some(&true) {
@@ -1118,6 +1155,11 @@ fn cursor_agent_def() -> AgentDef {
         first_output_timeout_ms: None,
         auth_probe: Some((&["status"], 5000)),
         max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
         build_args: |input| {
             let mut args = vec![
                 "--print".to_string(),
@@ -1177,6 +1219,11 @@ fn copilot_def() -> AgentDef {
         first_output_timeout_ms: None,
         auth_probe: None,
         max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
         build_args: |input| {
             let mut args = vec![
                 "--allow-all-tools".to_string(),
@@ -1253,6 +1300,11 @@ fn aider_def() -> AgentDef {
         first_output_timeout_ms: None,
         auth_probe: None,
         max_prompt_arg_bytes: Some(30_000),
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
         build_args: |input| {
             let mut args = vec![
                 "--yes-always".to_string(),
@@ -1307,6 +1359,11 @@ fn amp_def() -> AgentDef {
         first_output_timeout_ms: None,
         auth_probe: None,
         max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
         build_args: |input| {
             let mut args = vec![
                 "-x".to_string(),
@@ -1360,6 +1417,11 @@ fn atomcode_def() -> AgentDef {
         first_output_timeout_ms: None,
         auth_probe: None,
         max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
         build_args: |input| {
             let Some(path) = input.prompt_file_path.filter(|p| !p.is_empty()) else {
                 return Err("atomcode requires runtimeContext.promptFilePath".to_string());
@@ -1416,6 +1478,11 @@ fn devin_def() -> AgentDef {
         first_output_timeout_ms: None,
         auth_probe: None,
         max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
         build_args: |_input| {
             Ok(vec![
                 "--permission-mode".to_string(),
@@ -1464,6 +1531,11 @@ fn qoder_def() -> AgentDef {
         first_output_timeout_ms: None,
         auth_probe: None,
         max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
         build_args: |input| {
             let mut args = vec![
                 "-p".to_string(),
@@ -1525,6 +1597,11 @@ fn qwen_def() -> AgentDef {
         first_output_timeout_ms: None,
         auth_probe: None,
         max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
         build_args: |input| {
             let mut args = vec!["--yolo".to_string()];
             if let Some(model) = input.options.model.as_deref().filter(|m| *m != "default") {
@@ -1577,6 +1654,11 @@ fn byok_opencode_def() -> AgentDef {
         first_output_timeout_ms: None,
         auth_probe: None,
         max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
         build_args: |input| {
             let mut args = vec!["run".to_string(), "--format".to_string(), "json".to_string()];
             if let Some(cwd) = input.context.cwd.as_deref().filter(|c| !c.is_empty()) {
@@ -1589,6 +1671,167 @@ fn byok_opencode_def() -> AgentDef {
             if let Some(model) = opencode_byok_model_id(input.options.model.as_deref()) {
                 args.push("-m".to_string());
                 args.push(model);
+            }
+            Ok(args)
+        },
+    }
+}
+
+
+// ---- ACP adapters batch ---------------------------------------------------
+// Parity sources: runtimes/defs/hermes.ts, kilo.ts, kimi.ts, kiro.ts,
+// trae-cli.ts, vibe.ts, mimo.ts. `fetchModels` (live ACP probing) belongs
+// to the spawn/detection bead; fallback catalogs and argv are ported here.
+
+macro_rules! acp_def {
+    (
+        $id:expr, $name:expr, $bin:expr, $models:expr, $argv:expr,
+        $mcp_injection:expr, $mcp_discovery:expr, $turn_end:expr,
+        $stdio_removed:expr, $probe_timeout:expr, $parser:expr
+    ) => {
+        AgentDef {
+            id: $id,
+            name: $name,
+            bin: $bin,
+            fallback_bins: &[],
+            version_args: &["--version"],
+            stream_format: "acp-json-rpc",
+            event_parser: $parser,
+            fallback_models: $models,
+            reasoning_options: Vec::new(),
+            prompt_via_stdin: false,
+            prompt_via_file: false,
+            prompt_input_format: None,
+            supports_image_paths: false,
+            supports_custom_model: None,
+            external_mcp_injection: $mcp_injection,
+            install_url: None,
+            docs_url: None,
+            help_args: &[],
+            capability_flags: &[],
+            resumes_session_via_cli: false,
+            captures_session_id_from_stream: false,
+            default_model_env_var: None,
+            inactivity_timeout_ms: None,
+            first_output_timeout_ms: None,
+            auth_probe: None,
+            max_prompt_arg_bytes: None,
+            mcp_discovery: $mcp_discovery,
+            acp_turn_end_completes_prompt: $turn_end,
+            acp_stdio_mcp_removed_in_version: $stdio_removed,
+            acp_mcp_env_format: None,
+            version_probe_timeout_ms: $probe_timeout,
+            build_args: |_input| Ok($argv.iter().map(|s| s.to_string()).collect()),
+        }
+    };
+}
+
+/// Parity: `hermesAgentDef` (`runtimes/defs/hermes.ts:5`).
+fn hermes_def() -> AgentDef {
+    acp_def!(
+        "hermes", "Hermes", "hermes",
+        vec![
+            default_model_option(),
+            ModelOption::simple("grok-4.3", "grok-4.3 (xAI · default)"),
+            ModelOption::simple("grok-4.20-reasoning", "grok-4.20-reasoning (xAI · deep)"),
+            ModelOption::simple("grok-4.20-0309-non-reasoning", "grok-4.20-non-reasoning (xAI · fast)"),
+            ModelOption::simple("grok-4.20-multi-agent-0309", "grok-4.20-multi-agent (xAI · orchestration)"),
+            ModelOption::simple("openai-codex:gpt-5.5", "gpt-5.5 (openai-codex:gpt-5.5)"),
+            ModelOption::simple("openai-codex:gpt-5.4", "gpt-5.4 (openai-codex:gpt-5.4)"),
+            ModelOption::simple("openai-codex:gpt-5.4-mini", "gpt-5.4-mini (openai-codex:gpt-5.4-mini)"),
+        ],
+        &["acp", "--accept-hooks"],
+        Some("acp-merge"), Some("mature-acp"), false, None, None, None
+    )
+}
+
+/// Parity: `kiloAgentDef` (`runtimes/defs/kilo.ts:5`).
+fn kilo_def() -> AgentDef {
+    acp_def!(
+        "kilo", "Kilo", "kilo", vec![default_model_option()], &["acp"],
+        Some("acp-merge"), None, false, None, None, None
+    )
+}
+
+/// Parity: `kimiAgentDef` (`runtimes/defs/kimi.ts:5`).
+fn kimi_def() -> AgentDef {
+    acp_def!(
+        "kimi", "Kimi CLI", "kimi",
+        vec![
+            default_model_option(),
+            ModelOption::simple("kimi-k2-turbo-preview", "kimi-k2-turbo-preview"),
+            ModelOption::simple("moonshot-v1-8k", "moonshot-v1-8k"),
+            ModelOption::simple("moonshot-v1-32k", "moonshot-v1-32k"),
+        ],
+        &["acp"],
+        Some("acp-merge"), Some("mature-acp"), false, Some("0.37.0"), None, None
+    )
+}
+
+/// Parity: `kiroAgentDef` (`runtimes/defs/kiro.ts:5`).
+fn kiro_def() -> AgentDef {
+    acp_def!(
+        "kiro", "Kiro CLI", "kiro-cli", vec![default_model_option()], &["acp"],
+        Some("acp-merge"), None, true, None, None, None
+    )
+}
+
+/// Parity: `traeCliAgentDef` (`runtimes/defs/trae-cli.ts:5`).
+fn trae_cli_def() -> AgentDef {
+    acp_def!(
+        "trae-cli", "Trae CLI", "traecli", vec![default_model_option()],
+        &["acp", "serve", "--yolo"],
+        Some("acp-merge"), Some("mature-acp"), false, None, Some(10_000), None
+    )
+}
+
+/// Parity: `vibeAgentDef` (`runtimes/defs/vibe.ts:5`).
+fn vibe_def() -> AgentDef {
+    acp_def!(
+        "vibe", "Mistral Vibe CLI", "vibe-acp", vec![default_model_option()], &[] as &[&str],
+        Some("acp-merge"), None, false, None, None, None
+    )
+}
+
+/// Parity: `mimoAgentDef` (`runtimes/defs/mimo.ts:5`).
+fn mimo_def() -> AgentDef {
+    AgentDef {
+        id: "mimo",
+        name: "MiMo Code",
+        bin: "mimo",
+        fallback_bins: &[],
+        version_args: &["--version"],
+        stream_format: "json-event-stream",
+        event_parser: Some("opencode"),
+        fallback_models: vec![default_model_option()],
+        reasoning_options: Vec::new(),
+        prompt_via_stdin: true,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: None,
+        external_mcp_injection: Some("mimo-env-content"),
+        install_url: None,
+        docs_url: None,
+        help_args: &[],
+        capability_flags: &[],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: false,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        auth_probe: None,
+        max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
+        build_args: |input| {
+            let mut args = vec!["run".to_string(), "--format".to_string(), "json".to_string()];
+            if let Some(model) = input.options.model.as_deref().filter(|m| *m != "default") {
+                args.push("--model".to_string());
+                args.push(model.to_string());
             }
             Ok(args)
         },
