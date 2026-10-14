@@ -88,6 +88,7 @@ async fn post_provider_models(
             "protocol must be one of anthropic|openai|azure|google|ollama|senseaudio|aihubmix|bedrock",
         );
     }
+    let body_value = Value::Object(body.clone());
     let base_url = body.get("baseUrl").and_then(Value::as_str).unwrap_or_default().trim();
     let api_key = body.get("apiKey").and_then(Value::as_str).unwrap_or_default().trim();
     let api_key_required = protocol != "aihubmix" && protocol != "bedrock";
@@ -102,10 +103,8 @@ async fn post_provider_models(
             },
         );
     }
-    // Porting the full model catalogue fetch is still pending; failing with
-    // 500 keeps the malformed-request contract above honest rather than
-    // silently returning an empty list.
-    api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Provider model discovery failed")
+    let result = crate::provider_models::list_provider_models(&body_value).await;
+    Json(result).into_response()
 }
 
 async fn post_test_connection(
