@@ -1481,7 +1481,7 @@ impl Runs {
 
     /// Parity: `startChatRun`'s observable outcome without an agent runtime:
     /// the run goes `running` and publishes its `start` frame.
-    fn start(&self, run_id: &str, cwd: Option<String>) {
+    fn start(&self, run_id: &str, cwd: Option<String>, data_dir: &std::path::Path) {
         {
             let mut registry = lock(&self.inner);
             let Some(run) = registry.runs.get_mut(run_id) else {
@@ -1518,7 +1518,7 @@ impl Runs {
                 lock(&feed).push(frame.as_bytes());
             }
         }
-        self.try_spawn(run_id, cwd);
+        self.try_spawn(run_id, cwd, data_dir);
     }
 
     /// Attempt to spawn the agent child for a freshly started run. Runs
@@ -1527,7 +1527,7 @@ impl Runs {
     /// prompt fails the run instead of stranding it in `running` forever.
     /// Capability probes are not ported yet, so `buildArgs` sees an empty
     /// capability map (documented deviation).
-    fn try_spawn(&self, run_id: &str, cwd: Option<String>) {
+    fn try_spawn(&self, run_id: &str, cwd: Option<String>, data_dir: &std::path::Path) {
         let (agent_id, model, reasoning, service_tier, prompt, project_id) = {
             let registry = lock(&self.inner);
             let Some(run) = registry.runs.get(run_id) else {
@@ -1601,11 +1601,20 @@ impl Runs {
             }
         };
         let stdin_piped = def.prompt_via_stdin;
-        let mut env_extra = HashMap::new();
-        if let Some(project_id) = project_id.as_deref() {
-            env_extra.insert("OD_PROJECT_ID".to_string(), project_id.to_string());
-        }
-        let spawned = match spawn::spawn_child(&bin_path, &argv, cwd.as_deref(), &env_extra, stdin_piped) {
+        let env_extra = spawn::agent_env(
+            data_dir,
+            def,
+            project_id.as_deref(),
+            cwd.as_deref(),
+        );
+        let spawned = match spawn::spawn_child(
+            &bin_path,
+            &argv,
+            cwd.as_deref(),
+            &env_extra,
+            &["OD_API_TOKEN"],
+            stdin_piped,
+        ) {
             Ok(spawned) => spawned,
             Err(err) => {
                 self.fail_spawn(run_id, &format!("agent spawn failed: {err}"));
@@ -3217,7 +3226,11 @@ async fn create_run(
         };
         state
             .runs
-            .start(&prepared.run_id, project_cwd(&state, &run));
+            .start(
+                &prepared.run_id,
+                project_cwd(&state, &run),
+                state.config.paths.data_dir(),
+            );
     }
     (StatusCode::ACCEPTED, Json(prepared.body)).into_response()
 }
@@ -3245,7 +3258,11 @@ async fn create_chat(
         });
         state
             .runs
-            .start(&prepared.run_id, project_cwd(&state, &run));
+            .start(
+                &prepared.run_id,
+                project_cwd(&state, &run),
+                state.config.paths.data_dir(),
+            );
     }
     response
 }

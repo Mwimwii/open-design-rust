@@ -121,12 +121,14 @@ pub struct SpawnedChild {
 
 /// Spawn `bin_path` with `argv` in `cwd` (parity: `spawnAgentChild`).
 /// Stdout/stderr are piped; stdin is piped when `stdin_piped` so the
-/// caller can write the prompt bytes and close.
+/// caller can write the prompt bytes and close. `env_remove` names
+/// inherited variables to strip (case-insensitive).
 pub fn spawn_child(
     bin_path: &Path,
     argv: &[String],
     cwd: Option<&str>,
     env_extra: &HashMap<String, String>,
+    env_remove: &[&str],
     stdin_piped: bool,
 ) -> std::io::Result<SpawnedChild> {
     let mut command = tokio::process::Command::new(bin_path);
@@ -142,6 +144,11 @@ pub fn spawn_child(
         command.current_dir(cwd);
     }
     command.envs(env_extra);
+    for name in env_remove {
+        command.env_remove(name);
+        // Windows inherits case-insensitively; cover the lowercase twin too.
+        command.env_remove(name.to_lowercase());
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -168,6 +175,37 @@ pub fn classify_exit(status: std::process::ExitStatus) -> Result<i32, String> {
         }
     }
     Err("terminated by signal".to_string())
+}
+
+/// Daemon-owned environment layered over the inherited process env
+/// (parity: the portable subset of `createAgentRuntimeEnv` +
+/// `createOpenDesignToolEnv` in `apps/daemon/src/server.ts`):
+/// `OD_DATA_DIR` (the data-root truth source agents must inherit),
+/// the def's static `env` entries, and the run-scoped project identity.
+/// Deferred until the backing pieces exist in Rust: `OD_DAEMON_URL` /
+/// `OD_TOOL_TOKEN` (no token broker yet), `OD_NODE_BIN` / `OD_BIN` (no `od`
+/// CLI port), sandbox/proxy env, workspace scope, and MCP server injection.
+pub fn agent_env(
+    data_dir: &Path,
+    def: &crate::agents::AgentDef,
+    project_id: Option<&str>,
+    project_dir: Option<&str>,
+) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    env.insert(
+        "OD_DATA_DIR".to_string(),
+        data_dir.to_string_lossy().into_owned(),
+    );
+    for (key, value) in def.env {
+        env.insert(key.to_string(), value.to_string());
+    }
+    if let Some(project_id) = project_id.filter(|id| !id.is_empty()) {
+        env.insert("OD_PROJECT_ID".to_string(), project_id.to_string());
+    }
+    if let Some(project_dir) = project_dir.filter(|dir| !dir.is_empty()) {
+        env.insert("OD_PROJECT_DIR".to_string(), project_dir.to_string());
+    }
+    env
 }
 
 /// Convenience wrapper: build argv through the def and resolve the binary
@@ -239,6 +277,30 @@ mod tests {
             prompt_transport(get_agent_def("aider").expect("def")),
             PromptTransport::Argv
         );
+    }
+
+    #[test]
+    fn agent_env_carries_data_dir_def_env_and_project_identity() {
+        use std::path::Path;
+        let def = get_agent_def("reasonix").expect("reasonix def");
+        let env = agent_env(
+            Path::new("/data/od"),
+            def,
+            Some("p1"),
+            Some("/work/p1"),
+        );
+        assert_eq!(env.get("OD_DATA_DIR").map(String::as_str), Some("/data/od"));
+        assert_eq!(env.get("OD_PROJECT_ID").map(String::as_str), Some("p1"));
+        assert_eq!(env.get("OD_PROJECT_DIR").map(String::as_str), Some("/work/p1"));
+        assert!(
+            env.get("REASONIX_ACP_SYSTEM_APPEND")
+                .map(|v| v.contains("OpenDesign integration"))
+                .unwrap_or(false),
+            "def env entries must be forwarded"
+        );
+        let bare = agent_env(Path::new("/data/od"), def, None, None);
+        assert!(!bare.contains_key("OD_PROJECT_ID"));
+        assert!(!bare.contains_key("OD_PROJECT_DIR"));
     }
 
     #[test]
