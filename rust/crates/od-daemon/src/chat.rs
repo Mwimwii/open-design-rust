@@ -26,8 +26,9 @@ pub fn router() -> Router<AppState> {
             "/api/projects/{projectId}/critique/{runId}/artifact",
             get(critique_not_implemented),
         )
-        .route("/api/proxy/ollama/stream", post(proxy_stream_not_implemented))
-        .route("/api/proxy/{provider}/stream", post(proxy_stream_not_implemented))
+        .route("/api/proxy/senseaudio/stream", post(proxy_stream_not_implemented))
+        .route("/api/proxy/aihubmix/stream", post(proxy_stream_not_implemented))
+        .route("/api/proxy/{provider}/stream", post(proxy_unknown_provider))
 }
 
 async fn post_feedback(
@@ -160,6 +161,14 @@ async fn post_test_connection(
 }
 
 
+
+async fn proxy_unknown_provider() -> Response {
+    api_error(
+        StatusCode::NOT_FOUND,
+        "NOT_FOUND",
+        "unknown proxy provider",
+    )
+}
 
 async fn proxy_stream_not_implemented() -> Response {
     api_error(

@@ -1,4 +1,4 @@
-//! BYOK chat proxy streaming — Rust parity for the OpenAI, Anthropic, Azure, and Google routes.
+//! BYOK chat proxy streaming — Rust parity for the OpenAI, Anthropic, Azure, Google, and Ollama routes.
 
 
 use axum::response::sse::{Event, Sse};
@@ -17,6 +17,7 @@ pub fn router() -> axum::routing::Router<AppState> {
         .route("/api/proxy/anthropic/stream", post(anthropic_proxy))
         .route("/api/proxy/azure/stream", post(azure_proxy))
         .route("/api/proxy/google/stream", post(google_proxy))
+        .route("/api/proxy/ollama/stream", post(ollama_proxy))
 }
 
 async fn openai_proxy(axum::Json(body): axum::Json<Value>) -> axum::response::Response {
@@ -799,4 +800,135 @@ fn extract_gemini_block(data: &Value) -> Option<String> {
         return Some(format!("Gemini stopped the response ({}){}.", reason, tail));
     }
     None
+}
+
+async fn ollama_proxy(axum::Json(body): axum::Json<Value>) -> axum::response::Response {
+    let body = body.as_object().cloned().unwrap_or_default();
+    let api_key = body.get("apiKey").and_then(Value::as_str).unwrap_or_default().trim().to_string();
+    let model = body.get("model").and_then(Value::as_str).unwrap_or_default().trim().to_string();
+    if api_key.is_empty() || model.is_empty() {
+        return api_error(axum::http::StatusCode::BAD_REQUEST, "BAD_REQUEST", "apiKey and model are required");
+    }
+    let base_url = body
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("https://ollama.com")
+        .to_string();
+    let system_prompt = body.get("systemPrompt").and_then(Value::as_str).map(str::to_string);
+    let messages = body.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+    let max_tokens = body.get("maxTokens").and_then(Value::as_i64).filter(|v| *v > 0);
+
+    let mut payload_messages = messages;
+    if let Some(sp) = system_prompt {
+        if !sp.is_empty() {
+            payload_messages.insert(0, json!({"role":"system","content":sp}));
+        }
+    }
+
+    let clean = base_url.trim_end_matches('/').to_string();
+    let clean = clean.strip_suffix("/api").unwrap_or(&clean).trim_end_matches('/').to_string();
+    let url = format!("{}/api/chat", clean);
+
+    let mut payload = json!({
+        "model": model,
+        "messages": payload_messages,
+        "stream": true
+    });
+    if let Some(n) = max_tokens {
+        payload["options"] = json!({"num_predict": n});
+    }
+
+    let (tx, rx) = mpsc::channel::<Result<Event, Box<dyn std::error::Error + Send + Sync>>>(32);
+
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        if tx
+            .send(Ok(Event::default().event("start").data(json!({"model": model}).to_string())))
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let resp = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", api_key))
+            .json(&payload)
+            .send()
+            .await;
+
+        let response = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(Ok(Event::default().event("error").data(json!({"message": e.to_string()}).to_string()))).await;
+                let _ = tx.send(Ok(Event::default().event("end").data("{}"))).await;
+                return;
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            let retryable = status.as_u16() == 429 || status.as_u16() >= 500;
+            let _ = tx
+                .send(Ok(Event::default().event("error").data(json!({"message": format!("Upstream error: {}", status), "details": text, "retryable": retryable}).to_string())))
+                .await;
+            let _ = tx.send(Ok(Event::default().event("end").data("{}"))).await;
+            return;
+        }
+
+        // Ollama streams newline-delimited JSON objects, not SSE frames.
+        let mut buffer = String::new();
+        let mut ended = false;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some(pos) = buffer.find('\n') {
+                        let line = buffer[..pos].trim().to_string();
+                        buffer.drain(..pos + 1);
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let val: Value = match serde_json::from_str(&line) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        if val.get("done").and_then(Value::as_bool) == Some(true) {
+                            let _ = tx.send(Ok(Event::default().event("end").data("{}"))).await;
+                            ended = true;
+                            break;
+                        }
+                        if let Some(content) = val.get("message").and_then(|m| m.get("content")).and_then(Value::as_str) {
+                            if !content.is_empty() {
+                                let _ = tx.send(Ok(Event::default().event("delta").data(json!({"content": content}).to_string()))).await;
+                            }
+                        }
+                    }
+                    if ended {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Ok(Event::default().event("error").data(json!({"message": e.to_string()}).to_string()))).await;
+                    let _ = tx.send(Ok(Event::default().event("end").data("{}"))).await;
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        if !ended {
+            let _ = tx.send(Ok(Event::default().event("end").data("{}"))).await;
+        }
+    });
+
+    let stream = ReceiverStream::new(rx);
+    Sse::new(stream).into_response()
 }
