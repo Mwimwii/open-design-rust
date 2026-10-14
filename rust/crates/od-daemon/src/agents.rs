@@ -77,6 +77,8 @@ pub struct BuildArgsInput<'a> {
     pub options: &'a BuildOptions,
     pub extra_allowed_dirs: &'a [String],
     pub context: &'a AgentContext,
+    pub live: &'a LiveModelCache,
+    pub live_scope: Option<&'a str>,
 }
 
 /// Parity: `RuntimeAgentDef` (`runtimes/types.ts:145`) — static subset.
@@ -120,7 +122,7 @@ impl AgentDef {
 }
 
 fn shipped_defs() -> Vec<AgentDef> {
-    vec![claude_def(), codebuddy_def()]
+    vec![claude_def(), codebuddy_def(), codex_def(), opencode_def()]
 }
 
 static REGISTRY: OnceLock<Vec<AgentDef>> = OnceLock::new();
@@ -598,7 +600,16 @@ fn codebuddy_def() -> AgentDef {
 mod tests {
     use super::*;
 
-    fn input(caps: HashMap<String, bool>, options: BuildOptions) -> (HashMap<String, bool>, BuildOptions, Vec<String>, AgentContext) {
+    fn input(
+        caps: HashMap<String, bool>,
+        options: BuildOptions,
+    ) -> (
+        HashMap<String, bool>,
+        BuildOptions,
+        Vec<String>,
+        AgentContext,
+        LiveModelCache,
+    ) {
         (
             caps,
             options,
@@ -607,20 +618,32 @@ mod tests {
                 platform: "linux".to_string(),
                 ..AgentContext::default()
             },
+            LiveModelCache::default(),
         )
+    }
+
+    fn args_input<'a>(
+        caps: &'a HashMap<String, bool>,
+        options: &'a BuildOptions,
+        dirs: &'a [String],
+        context: &'a AgentContext,
+        live: &'a LiveModelCache,
+    ) -> BuildArgsInput<'a> {
+        BuildArgsInput {
+            caps,
+            options,
+            extra_allowed_dirs: dirs,
+            context,
+            live,
+            live_scope: None,
+        }
     }
 
     #[test]
     fn claude_build_args_gate_on_capabilities() {
         let def = get_agent_def("claude").expect("claude def");
-        let (caps, options, dirs, ctx) = input(HashMap::new(), BuildOptions::default());
-        let args = (def.build_args)(&BuildArgsInput {
-            caps: &caps,
-            options: &options,
-            extra_allowed_dirs: &dirs,
-            context: &ctx,
-        })
-        .expect("args");
+        let (caps, options, dirs, ctx, live) = input(HashMap::new(), BuildOptions::default());
+        let args = (def.build_args)(&args_input(&caps, &options, &dirs, &ctx, &live)).expect("args");
         assert_eq!(
             args,
             vec![
@@ -637,20 +660,14 @@ mod tests {
         let mut caps = HashMap::new();
         caps.insert("partialMessages".to_string(), true);
         caps.insert("thinkingDisplay".to_string(), true);
-        let (caps, options, dirs, ctx) = input(
+        let (caps, options, dirs, ctx, live) = input(
             caps,
             BuildOptions {
                 model: Some("claude-sonnet-5".to_string()),
                 ..BuildOptions::default()
             },
         );
-        let args = (def.build_args)(&BuildArgsInput {
-            caps: &caps,
-            options: &options,
-            extra_allowed_dirs: &dirs,
-            context: &ctx,
-        })
-        .expect("args");
+        let args = (def.build_args)(&args_input(&caps, &options, &dirs, &ctx, &live)).expect("args");
         assert!(args.contains(&"--include-partial-messages".to_string()));
         assert!(args.contains(&"--thinking-display".to_string()));
         assert!(args.contains(&"--model".to_string()));
@@ -659,20 +676,14 @@ mod tests {
     #[test]
     fn codebuddy_default_reasoning_omits_effort_flag() {
         let def = get_agent_def("codebuddy").expect("codebuddy def");
-        let (caps, options, dirs, ctx) = input(
+        let (caps, options, dirs, ctx, live) = input(
             HashMap::new(),
             BuildOptions {
                 reasoning: Some("default".to_string()),
                 ..BuildOptions::default()
             },
         );
-        let args = (def.build_args)(&BuildArgsInput {
-            caps: &caps,
-            options: &options,
-            extra_allowed_dirs: &dirs,
-            context: &ctx,
-        })
-        .expect("args");
+        let args = (def.build_args)(&args_input(&caps, &options, &dirs, &ctx, &live)).expect("args");
         assert!(!args.contains(&"--effort".to_string()));
     }
 
@@ -695,5 +706,415 @@ mod tests {
         );
         let models = parse_line_separated_models("a\n# comment\n\na\nb\n");
         assert_eq!(models.len(), 3);
+    }
+}
+// ---- codex (parity: runtimes/defs/codex.ts, exec-json transport) ----------
+// The app-server transport override (`withCodexTransport`) belongs to the
+// spawn bead: it needs version probing + launch resolution.
+
+/// Parity: `CODEX_SHELL_ENVIRONMENT_INCLUDE_KEYS` (codex.ts:131).
+const CODEX_SHELL_ENV_INCLUDE_KEYS: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP",
+    "LANG", "LC_ALL", "TERM", "COLORTERM", "SYSTEMROOT", "COMSPEC",
+    "PATHEXT", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE",
+    "HOMEPATH", "ELECTRON_RUN_AS_NODE", "OD_BIN", "OD_HYPERFRAMES_BIN",
+    "OD_NODE_BIN", "OD_DAEMON_URL", "OD_TOOL_TOKEN", "OD_DATA_DIR",
+    "OD_PROJECT_ID", "OD_PROJECT_DIR", "OD_WORKSPACE_ID",
+    "OD_WORKSPACE_MEMBER_ID", "OD_TASK_INPUT_DIR",
+];
+
+/// Parity: `codexOpenDesignShellEnvironmentArgs` (codex.ts:173).
+pub fn codex_shell_environment_args() -> Vec<String> {
+    let include_only = CODEX_SHELL_ENV_INCLUDE_KEYS
+        .iter()
+        .map(|key| format!("\"{key}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    vec![
+        "-c".to_string(),
+        "allow_login_shell=false".to_string(),
+        "-c".to_string(),
+        "shell_environment_policy.inherit=\"all\"".to_string(),
+        "-c".to_string(),
+        "shell_environment_policy.ignore_default_excludes=true".to_string(),
+        "-c".to_string(),
+        format!("shell_environment_policy.include_only=[{include_only}]"),
+    ]
+}
+
+/// Parity: `codexReasoningSummaryArgs` (codex.ts:216).
+pub fn codex_reasoning_summary_args() -> Vec<String> {
+    vec!["-c".to_string(), "model_reasoning_summary=\"detailed\"".to_string()]
+}
+
+/// Parity: `codexUpdatePlanToolArgs` (codex.ts:248).
+pub fn codex_update_plan_tool_args() -> Vec<String> {
+    vec!["-c".to_string(), "tools.update_plan.enabled=true".to_string()]
+}
+
+/// Parity: `codexNeedsDangerFullAccessSandbox` (codex.ts:250).
+pub fn codex_needs_danger_full_access(platform: &str, env: &HashMap<String, String>) -> bool {
+    if env.get("OD_CODEX_SANDBOX").map(|v| v.trim()) == Some("danger-full-access") {
+        return true;
+    }
+    if platform == "win32" {
+        return true;
+    }
+    env.get("WSL_DISTRO_NAME").map(|v| !v.trim().is_empty()).unwrap_or(false)
+}
+
+fn codex_fallback_models() -> Vec<ModelOption> {
+    let priority = ModelOption::simple("priority", "Fast");
+    let mut gpt_5_5 = ModelOption::simple("gpt-5.5", "gpt-5.5");
+    gpt_5_5.service_tier_options = vec![priority];
+    vec![
+        default_model_option(),
+        gpt_5_5,
+        ModelOption::simple("gpt-5.4", "gpt-5.4"),
+        ModelOption::simple("gpt-5.4-mini", "gpt-5.4-mini"),
+        ModelOption::simple("gpt-5.3-codex", "gpt-5.3-codex"),
+        ModelOption::simple("gpt-5.1", "gpt-5.1"),
+        ModelOption::simple("gpt-5.1-codex-mini", "gpt-5.1-codex-mini"),
+        ModelOption::simple("gpt-5-codex", "gpt-5-codex"),
+        ModelOption::simple("gpt-5", "gpt-5"),
+        ModelOption::simple("o3", "o3"),
+        ModelOption::simple("o4-mini", "o4-mini"),
+    ]
+}
+
+/// Parity: `parseCodexDebugModels` (codex.ts:60).
+pub fn parse_codex_debug_models(stdout: &str) -> Option<Vec<ModelOption>> {
+    let parsed: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let models = if let Some(arr) = parsed.as_array() {
+        arr.clone()
+    } else {
+        parsed.get("models")?.as_array()?.clone()
+    };
+    let mut out = vec![default_model_option()];
+    let mut seen = HashSet::new();
+    seen.insert("default".to_string());
+    for raw in &models {
+        let obj = raw.as_object()?;
+        if obj.get("visibility").and_then(|v| v.as_str()) == Some("hidden") {
+            continue;
+        }
+        let id = obj
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                obj.get("id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() || !seen.insert(id.clone()) {
+            continue;
+        }
+        let label = obj
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                obj.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or(&id)
+            .to_string();
+        out.push(ModelOption::simple(&id, &label));
+    }
+    if out.len() > 1 { Some(out) } else { None }
+}
+
+/// Parity: `codexAgentDef` (`runtimes/defs/codex.ts:256`).
+fn codex_def() -> AgentDef {
+    AgentDef {
+        id: "codex",
+        name: "Codex CLI",
+        bin: "codex",
+        fallback_bins: &[],
+        version_args: &["--version"],
+        stream_format: "json-event-stream",
+        event_parser: Some("codex"),
+        fallback_models: codex_fallback_models(),
+        reasoning_options: ["default", "none", "minimal", "low", "medium", "high", "xhigh"]
+            .iter()
+            .map(|id| ModelOption::simple(id, match *id {
+                "default" => "Default",
+                "none" => "None",
+                "minimal" => "Minimal",
+                "low" => "Low",
+                "medium" => "Medium",
+                "high" => "High",
+                "xhigh" => "XHigh",
+                _ => id,
+            }))
+            .collect(),
+        prompt_via_stdin: true,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: None,
+        external_mcp_injection: None,
+        install_url: None,
+        docs_url: None,
+        help_args: &[],
+        capability_flags: &[],
+        resumes_session_via_cli: true,
+        captures_session_id_from_stream: true,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        build_args: |input| {
+            let ctx = input.context;
+            let needs_danger = codex_needs_danger_full_access(&ctx.platform, &ctx.env);
+            let resume = ctx.resume_session_id.as_deref().filter(|s| !s.is_empty());
+            let sandbox_args: Vec<String> = if needs_danger {
+                if resume.is_some() {
+                    vec!["-c".to_string(), "sandbox_mode=\"danger-full-access\"".to_string()]
+                } else {
+                    vec!["--sandbox".to_string(), "danger-full-access".to_string()]
+                }
+            } else if resume.is_some() {
+                vec![
+                    "-c".to_string(),
+                    "sandbox_mode=\"workspace-write\"".to_string(),
+                    "-c".to_string(),
+                    "sandbox_workspace_write.network_access=true".to_string(),
+                ]
+            } else {
+                vec![
+                    "--sandbox".to_string(),
+                    "workspace-write".to_string(),
+                    "-c".to_string(),
+                    "sandbox_workspace_write.network_access=true".to_string(),
+                ]
+            };
+            let mut args = if resume.is_some() {
+                vec![
+                    "exec".to_string(),
+                    "resume".to_string(),
+                    "--json".to_string(),
+                    "--skip-git-repo-check".to_string(),
+                ]
+            } else {
+                vec![
+                    "exec".to_string(),
+                    "--json".to_string(),
+                    "--skip-git-repo-check".to_string(),
+                ]
+            };
+            args.extend(sandbox_args);
+            if ctx.disable_plugins || ctx.codex_disable_plugins_env {
+                args.push("--disable".to_string());
+                args.push("plugins".to_string());
+            }
+            args.extend(codex_shell_environment_args());
+            args.extend(codex_reasoning_summary_args());
+            args.extend(codex_update_plan_tool_args());
+            if resume.is_none() {
+                if let Some(cwd) = ctx.cwd.as_deref().filter(|c| !c.is_empty()) {
+                    args.push("-C".to_string());
+                    args.push(cwd.to_string());
+                }
+                for dir in non_empty_dirs(input.extra_allowed_dirs) {
+                    args.push("--add-dir".to_string());
+                    args.push(dir.clone());
+                }
+            }
+            if let Some(model) = input.options.model.as_deref().filter(|m| *m != "default") {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
+            if let Some(reasoning) = input.options.reasoning.as_deref().filter(|r| *r != "default") {
+                let effort = clamp_codex_reasoning(input.options.model.as_deref(), Some(reasoning))
+                    .unwrap_or_else(|| reasoning.to_string());
+                args.push("-c".to_string());
+                args.push(format!("model_reasoning_effort=\"{effort}\""));
+            }
+            if let Some(tier) = input.options.service_tier.as_deref().filter(|t| *t != "default") {
+                args.push("-c".to_string());
+                args.push(format!("service_tier=\"{tier}\""));
+            }
+            if let Some(resume) = resume {
+                args.push(resume.to_string());
+            }
+            Ok(args)
+        },
+    }
+}
+
+// ---- opencode (parity: runtimes/defs/opencode.ts) --------------------------
+
+fn opencode_fallback_models() -> Vec<ModelOption> {
+    vec![
+        default_model_option(),
+        ModelOption::simple("anthropic/claude-sonnet-4-5", "anthropic/claude-sonnet-4-5"),
+        ModelOption::simple("openai/gpt-5.6-sol", "openai/gpt-5.6-sol"),
+        ModelOption::simple("openai/gpt-5.6-terra", "openai/gpt-5.6-terra"),
+        ModelOption::simple("openai/gpt-5.6-luna", "openai/gpt-5.6-luna"),
+        ModelOption::simple("openai/gpt-5", "openai/gpt-5"),
+        ModelOption::simple("google/gemini-2.5-pro", "google/gemini-2.5-pro"),
+    ]
+}
+
+fn is_valid_opencode_variant_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+fn is_opencode_model_id(id: &str) -> bool {
+    let Some((provider, model)) = id.split_once('/') else {
+        return false;
+    };
+    if provider.is_empty() || model.is_empty() {
+        return false;
+    }
+    let part_ok = |part: &str| {
+        let mut chars = part.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphanumeric() => {}
+            _ => return false,
+        }
+        part.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    // provider half allows `[A-Za-z0-9._-]*` after the first char; model half
+    // additionally allows `/`, `:`, `@`.
+    if !part_ok(provider) {
+        return false;
+    }
+    let mut chars = model.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    model.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ':' | '@')
+    })
+}
+
+/// Parity: `parseOpenCodeModels` (opencode.ts:72). Only verbose metadata can
+/// advertise reasoning variants; plain ids are accepted as a fallback.
+pub fn parse_opencode_models(stdout: &str) -> Option<Vec<ModelOption>> {
+    let lines: Vec<&str> = stdout.lines().collect();
+    let mut models = vec![default_model_option()];
+    let mut seen = HashSet::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let id = lines[index].trim();
+        if !is_opencode_model_id(id) || !seen.insert(id.to_string()) {
+            index += 1;
+            continue;
+        }
+        // Optional verbose metadata object starting on the next line.
+        let mut variant_ids: Vec<String> = Vec::new();
+        if lines.get(index + 1).map(|l| l.trim_start().starts_with('{')).unwrap_or(false) {
+            let mut buffer = String::new();
+            let mut end = index;
+            for (offset, line) in lines.iter().enumerate().skip(index + 1) {
+                buffer.push_str(line);
+                buffer.push('\n');
+                if !line.trim_end().ends_with('}') {
+                    continue;
+                }
+                if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&buffer) {
+                    if let Some(serde_json::Value::Object(variants)) = map.get("variants") {
+                        variant_ids = variants
+                            .keys()
+                            .filter(|v| is_valid_opencode_variant_id(v))
+                            .cloned()
+                            .collect();
+                    }
+                    end = offset;
+                    break;
+                }
+            }
+            index = index.max(end);
+        }
+        let mut option = ModelOption::simple(id, id);
+        if !variant_ids.is_empty() {
+            let mut reasoning = vec![ModelOption::simple("default", "Default")];
+            for variant in &variant_ids {
+                reasoning.push(ModelOption::simple(variant, variant));
+            }
+            option.reasoning_options = reasoning;
+        }
+        models.push(option);
+        index += 1;
+    }
+    if models.len() > 1 { Some(models) } else { None }
+}
+
+/// Parity: `opencodeAgentDef` (`runtimes/defs/opencode.ts:125`).
+fn opencode_def() -> AgentDef {
+    AgentDef {
+        id: "opencode",
+        name: "OpenCode",
+        bin: "opencode-cli",
+        fallback_bins: &["opencode"],
+        version_args: &["--version"],
+        stream_format: "json-event-stream",
+        event_parser: Some("opencode"),
+        fallback_models: opencode_fallback_models(),
+        reasoning_options: Vec::new(),
+        prompt_via_stdin: true,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: None,
+        external_mcp_injection: Some("opencode-env-content"),
+        install_url: None,
+        docs_url: None,
+        help_args: &["run", "--help"],
+        capability_flags: &[("--dangerously-skip-permissions", "skipPermissions")],
+        resumes_session_via_cli: true,
+        captures_session_id_from_stream: true,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        build_args: |input| {
+            let mut args = vec!["run".to_string(), "--format".to_string(), "json".to_string()];
+            if input.caps.get("skipPermissions") == Some(&true) {
+                args.push("--dangerously-skip-permissions".to_string());
+            }
+            if let Some(cwd) = input.context.cwd.as_deref().filter(|c| !c.is_empty()) {
+                args.push("--dir".to_string());
+                args.push(cwd.to_string());
+            }
+            if let Some(resume) = input.context.resume_session_id.as_deref().filter(|s| !s.is_empty()) {
+                args.push("-s".to_string());
+                args.push(resume.to_string());
+            }
+            if let Some(model) = input.options.model.as_deref().filter(|m| *m != "default") {
+                args.push("-m".to_string());
+                args.push(model.to_string());
+            }
+            if let (Some(model), Some(variant)) = (
+                input.options.model.as_deref(),
+                input.options.reasoning.as_deref(),
+            ) {
+                if model != "default" && variant != "default" {
+                    let known = input.live.get("opencode", input.live_scope).iter().any(|m| {
+                        m.id == model
+                            && m.reasoning_options.iter().any(|o| o.id == variant)
+                    });
+                    if known {
+                        args.push("--variant".to_string());
+                        args.push(variant.to_string());
+                    }
+                }
+            }
+            Ok(args)
+        },
     }
 }
