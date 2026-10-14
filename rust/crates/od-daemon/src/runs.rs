@@ -44,8 +44,10 @@ use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 use tower_http::services::fs::AsyncReadBody;
 
+use crate::agents::{self, AgentContext, BuildArgsInput, BuildOptions};
 use crate::project_dir::{self, ProjectDirError};
 use crate::project_files;
+use crate::spawn;
 use crate::routes::{api_error, internal_error, store_error_response, AppState};
 use crate::storage::{self, ProjectRow, Store, StoreError};
 
@@ -865,6 +867,11 @@ struct Run {
     tool_bundle: Value,
     browser_use: Option<Value>,
     session_mode: Option<String>,
+    model: Option<String>,
+    reasoning: Option<String>,
+    service_tier: Option<String>,
+    prompt: Option<String>,
+    child: Option<Arc<tokio::sync::Mutex<tokio::process::Child>>>,
     context: Option<Value>,
     external_plugin_analytics: Option<Value>,
     client_type: Option<String>,
@@ -929,6 +936,12 @@ impl Run {
             },
             session_mode: nonempty_string(Some(meta), "sessionMode")
                 .filter(|value| matches!(value.as_str(), "chat" | "design" | "plan")),
+            model: nonempty_string(Some(meta), "model"),
+            reasoning: nonempty_string(Some(meta), "reasoning"),
+            service_tier: nonempty_string(Some(meta), "serviceTier"),
+            prompt: nonempty_string(Some(meta), "prompt")
+                .or_else(|| nonempty_string(Some(meta), "message")),
+            child: None,
             context: match meta.get("context") {
                 Some(value @ Value::Object(_)) => Some(value.clone()),
                 _ => None,
@@ -1125,6 +1138,75 @@ impl Runs {
         record
     }
 
+    /// Append an event from outside the registry lock (child pumps).
+    fn push_external_event(&self, run_id: &str, event: &str, data: Value) {
+        let mut registry = lock(&self.inner);
+        let Some(run) = registry.runs.get_mut(run_id) else {
+            return;
+        };
+        if run.is_terminal() {
+            return;
+        }
+        let record = self.push_event(run, event, data);
+        let frame = sse_frame(Some(record.id), &record.event, &record.data);
+        for feed in run.subscribers.values() {
+            lock(feed).push(frame.as_bytes());
+        }
+    }
+
+    /// Record a spawn-time failure and finish the run as failed (parity:
+    /// the daemon failing a run when the agent binary is missing).
+    /// A missing binary answers AGENT_UNAVAILABLE (retryable, mirroring the
+    /// TypeScript `startChatRun` guard); every other spawn failure answers
+    /// SPAWN_FAILED.
+    fn fail_spawn(&self, run_id: &str, message: &str) {
+        let mut registry = lock(&self.inner);
+        let Some(run) = registry.runs.get_mut(run_id) else {
+            return;
+        };
+        if run.is_terminal() {
+            return;
+        }
+        let unavailable = message.starts_with("agent binary not found");
+        run.error = Some(message.to_string());
+        run.error_code = Some(if unavailable { "AGENT_UNAVAILABLE" } else { "SPAWN_FAILED" }.to_string());
+        run.retryable = Some(unavailable);
+        drop(registry);
+        self.finish(run_id, "failed", None, None);
+    }
+
+    /// Finish a run as failed with error detail attached (parity: the
+    /// failure classification that feeds `failureCategory`/`failureDetail`
+    /// on the status projection).
+    fn finish_with_failure(
+        &self,
+        run_id: &str,
+        code: Option<i64>,
+        signal: Option<&str>,
+        detail: &str,
+    ) {
+        let detail = detail.trim();
+        {
+            let mut registry = lock(&self.inner);
+            let Some(run) = registry.runs.get_mut(run_id) else {
+                return;
+            };
+            if run.is_terminal() {
+                return;
+            }
+            run.error = Some(if detail.is_empty() {
+                "agent run failed".to_string()
+            } else {
+                detail.chars().take(2000).collect()
+            });
+            run.error_code = Some("AGENT_FAILED".to_string());
+            run.failure_category = Some("agent_error".to_string());
+            run.failure_detail = run.error.clone();
+            run.retryable = Some(false);
+        }
+        self.finish(run_id, "failed", code, signal);
+    }
+
     /// Parity: `finish` → `commitFinish` (single terminal choke point).
     fn finish(&self, run_id: &str, status: &str, code: Option<i64>, signal: Option<&str>) {
         let mut registry = lock(&self.inner);
@@ -1175,7 +1257,13 @@ impl Runs {
         run.cancel_origin = Some(origin.to_string());
         run.updated_at = now_ms();
         run.stdin_open = false;
+        let child = run.child.clone();
         drop(registry);
+        if let Some(handle) = child {
+            if let Ok(mut child) = handle.try_lock() {
+                let _ = child.start_kill();
+            }
+        }
         // Parity: `commitFinish` sends `end` to every live client before
         // `sse.end()`, so `finish` (not this path) owns subscriber teardown.
         self.finish(run_id, "canceled", None, Some("SIGTERM"));
@@ -1430,6 +1518,113 @@ impl Runs {
                 lock(&feed).push(frame.as_bytes());
             }
         }
+        self.try_spawn(run_id, cwd);
+    }
+
+    /// Attempt to spawn the agent child for a freshly started run. Runs
+    /// whose agent has no ported def keep the previous no-executor
+    /// behavior; an unresolvable binary, invalid argv, or over-budget
+    /// prompt fails the run instead of stranding it in `running` forever.
+    /// Capability probes are not ported yet, so `buildArgs` sees an empty
+    /// capability map (documented deviation).
+    fn try_spawn(&self, run_id: &str, cwd: Option<String>) {
+        let (agent_id, model, reasoning, service_tier, prompt, project_id) = {
+            let registry = lock(&self.inner);
+            let Some(run) = registry.runs.get(run_id) else {
+                return;
+            };
+            if run.is_terminal() || run.cancel_requested {
+                return;
+            }
+            let Some(agent_id) = run.agent_id.clone().filter(|id| !id.is_empty()) else {
+                return;
+            };
+            // No ported def (e.g. a local-profile id): keep no-executor behavior.
+            if agents::get_agent_def(&agent_id).is_none() {
+                return;
+            }
+            (
+                agent_id,
+                run.model.clone(),
+                run.reasoning.clone(),
+                run.service_tier.clone(),
+                run.prompt.clone().unwrap_or_default(),
+                run.project_id.clone(),
+            )
+        };
+        let def = agents::get_agent_def(&agent_id).expect("def checked above");
+        if let Err(message) = spawn::check_prompt_budget(def, prompt.len()) {
+            self.fail_spawn(run_id, &message);
+            return;
+        }
+        // Prompt-file adapters need the staged path before argv is final.
+        let prompt_file: Option<String> = if def.prompt_via_file {
+            match stage_prompt_file(run_id, &prompt) {
+                Ok(path) => Some(path),
+                Err(message) => {
+                    self.fail_spawn(run_id, &message);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let context = AgentContext {
+            cwd: cwd.clone(),
+            platform: std::env::consts::OS.to_string(),
+            ..AgentContext::default()
+        };
+        let options = BuildOptions {
+            model,
+            reasoning,
+            service_tier,
+        };
+        let caps = HashMap::new();
+        let live = agents::LiveModelCache::default();
+        let dirs: Vec<String> = Vec::new();
+        let input = BuildArgsInput {
+            caps: &caps,
+            options: &options,
+            extra_allowed_dirs: &dirs,
+            context: &context,
+            live: &live,
+            live_scope: None,
+            prompt: &prompt,
+            prompt_file_path: prompt_file.as_deref(),
+            image_paths: &[],
+        };
+        let (bin_path, argv) = match spawn::prepare_spawn(def, &input) {
+            Ok(prepared) => prepared,
+            Err(message) => {
+                self.fail_spawn(run_id, &message);
+                return;
+            }
+        };
+        let stdin_piped = def.prompt_via_stdin;
+        let mut env_extra = HashMap::new();
+        if let Some(project_id) = project_id.as_deref() {
+            env_extra.insert("OD_PROJECT_ID".to_string(), project_id.to_string());
+        }
+        let spawned = match spawn::spawn_child(&bin_path, &argv, cwd.as_deref(), &env_extra, stdin_piped) {
+            Ok(spawned) => spawned,
+            Err(err) => {
+                self.fail_spawn(run_id, &format!("agent spawn failed: {err}"));
+                return;
+            }
+        };
+        let stdin_bytes = stdin_piped.then(|| spawn::stdin_bytes(def, &prompt));
+        let handle = Arc::new(tokio::sync::Mutex::new(spawned.child));
+        {
+            let mut registry = lock(&self.inner);
+            if let Some(run) = registry.runs.get_mut(run_id) {
+                run.child = Some(Arc::clone(&handle));
+            }
+        }
+        let runs = self.clone();
+        let run_id = run_id.to_string();
+        tokio::spawn(async move {
+            pump_child(runs, run_id, handle, stdin_bytes, prompt_file).await;
+        });
     }
 
     /// Replay events after `cursor`, then keep streaming live frames until the
@@ -2903,6 +3098,98 @@ async fn prepare_run_create(
 }
 
 /// Parity: the `cwd` a starter would hand the child (`resolveProjectDir`).
+/// Stage the composed prompt in a temp file for file-prompt adapters
+/// (parity: the daemon-created prompt file behind `promptViaFile`).
+fn stage_prompt_file(run_id: &str, prompt: &str) -> Result<String, String> {
+    let path = std::env::temp_dir().join(format!("od-prompt-{run_id}.txt"));
+    std::fs::write(&path, prompt)
+        .map_err(|err| format!("failed to stage prompt file: {err}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Drive a spawned child to completion: deliver stdin, stream stdout lines
+/// as `stdout` events (raw interim shape until the protocol adapters in
+/// the `lhe` bead map them), drain stderr, then finish the run from the
+/// exit status. Cancellation wins races via `finish`'s terminal guard.
+async fn pump_child(
+    runs: Runs,
+    run_id: String,
+    handle: Arc<tokio::sync::Mutex<tokio::process::Child>>,
+    stdin_bytes: Option<Vec<u8>>,
+    prompt_file: Option<String>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    if let Some(bytes) = stdin_bytes {
+        let mut stdin = {
+            let mut child = handle.lock().await;
+            child.stdin.take()
+        };
+        if let Some(ref mut stdin) = stdin {
+            let _ = stdin.write_all(&bytes).await;
+            let _ = stdin.shutdown().await;
+        }
+    }
+    let (stdout, stderr) = {
+        let mut child = handle.lock().await;
+        (child.stdout.take(), child.stderr.take())
+    };
+    let runs_for_out = runs.clone();
+    let out_id = run_id.clone();
+    let out_task = tokio::spawn(async move {
+        if let Some(stdout) = stdout {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                runs_for_out.push_external_event(
+                    &out_id,
+                    "stdout",
+                    serde_json::json!({ "runId": out_id, "text": line }),
+                );
+            }
+        }
+    });
+    let err_task = tokio::spawn(async move {
+        let mut tail = Vec::new();
+        if let Some(stderr) = stderr {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tail.push(line);
+                while tail.join("\n").len() > 4096 {
+                    tail.remove(0);
+                }
+            }
+        }
+        tail.join("\n")
+    });
+    let status = {
+        let mut child = handle.lock().await;
+        child.wait().await
+    };
+    let _ = out_task.await;
+    let stderr_tail = err_task.await.unwrap_or_default();
+    if let Some(path) = prompt_file {
+        let _ = std::fs::remove_file(path);
+    }
+    match status {
+        Ok(status) => match spawn::classify_exit(status) {
+            Ok(0) => runs.finish(&run_id, "succeeded", Some(0), None),
+            Ok(code) => {
+                runs.finish_with_failure(
+                    &run_id,
+                    Some(code as i64),
+                    None,
+                    format!("agent exited with code {code}: {stderr_tail}").trim_end_matches([':', ' ']),
+                );
+            }
+            Err(signal) => {
+                runs.finish_with_failure(&run_id, None, Some(signal.as_str()), &stderr_tail);
+            }
+        },
+        Err(err) => {
+            runs.finish_with_failure(&run_id, None, None, &format!("failed waiting on agent: {err}"));
+        }
+    }
+}
+
 fn project_cwd(state: &AppState, run: &Run) -> Option<String> {
     let project_id = run.project_id.as_deref()?;
     let project = state.store.get_project(project_id).ok()??;

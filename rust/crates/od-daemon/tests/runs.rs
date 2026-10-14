@@ -533,13 +533,28 @@ async fn list_runs_filters_projects_status_and_awaiting_input() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list["runs"].as_array().expect("array").len(), 1);
 
+    // Parity: no `claude` binary on PATH, so run_a fails fast with
+    // AGENT_UNAVAILABLE instead of stranding in `running`.
+    let (status, body) = get(&fixture.router, &format!("/api/runs/{run_a}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], json!("failed"));
+    assert_eq!(body["errorCode"], json!("AGENT_UNAVAILABLE"));
+
     let (status, list) = get(&fixture.router, "/api/runs?status=running").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(list["runs"].as_array().expect("array").len(), 2);
+    assert_eq!(list["runs"].as_array().expect("array").len(), 1);
+
+    // Parity: `status=active` is the "not terminal yet" pseudo-status.
+    // run_b is still running here; run_a already failed fast.
+    let (status, list) = get(&fixture.router, "/api/runs?status=active").await;
+    assert_eq!(status, StatusCode::OK);
+    let runs = list["runs"].as_array().expect("array");
+    assert_eq!(runs.len(), 1, "{list}");
+    assert_eq!(runs[0]["id"], json!(run_b));
 
     let (status, body) = post(
         &fixture.router,
-        &format!("/api/runs/{run_a}/cancel"),
+        &format!("/api/runs/{run_b}/cancel"),
         json!({}),
     )
     .await;
@@ -549,14 +564,11 @@ async fn list_runs_filters_projects_status_and_awaiting_input() {
     assert_eq!(status, StatusCode::OK);
     let runs = list["runs"].as_array().expect("array");
     assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0]["id"], json!(run_a));
+    assert_eq!(runs[0]["id"], json!(run_b));
 
-    // Parity: `status=active` is the "not terminal yet" pseudo-status.
     let (status, list) = get(&fixture.router, "/api/runs?status=active").await;
     assert_eq!(status, StatusCode::OK);
-    let runs = list["runs"].as_array().expect("array");
-    assert_eq!(runs.len(), 1, "{list}");
-    assert_eq!(runs[0]["id"], json!(run_b));
+    assert_eq!(list["runs"].as_array().expect("array").len(), 0, "{list}");
 
     let (status, list) = get(&fixture.router, "/api/runs?status=queued").await;
     assert_eq!(status, StatusCode::OK);
@@ -871,17 +883,19 @@ async fn steer_run_lifecycle_verdicts_and_message_persistence() {
         "text is required and must be a non-empty string"
     );
 
+    // Parity: no `claude` binary on PATH, so the run already failed
+    // fast — steering a finished run is refused as closed.
     let (status, body) = post(
         &fixture.router,
         &format!("/api/runs/{claude}/steer"),
         json!({"text": "  keep going  "}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["ok"], json!(true));
-    assert_eq!(body["delivered"], json!(true));
-    assert_eq!(body["run"]["status"], json!("running"));
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(code_of(&body), "RUN_STEERING_CLOSED");
+    assert_eq!(body["error"]["details"]["refusal"], json!("run_terminal"));
 
+    // A refused steer leaves no trace.
     let texts: Vec<String> = fixture
         .store
         .query(
@@ -890,9 +904,10 @@ async fn steer_run_lifecycle_verdicts_and_message_persistence() {
             |row| row.get(0),
         )
         .expect("messages");
-    assert!(texts.iter().any(|text| text == "keep going"), "{texts:?}");
+    assert!(!texts.iter().any(|text| text == "keep going"), "{texts:?}");
 
-    // An agent that never keeps stdin open is refused before the turn state.
+    // Steer verdicts check support before turn state, so codex is
+    // refused as unsupported even though its run already failed fast.
     let (status, body) = post(
         &fixture.router,
         "/api/runs",
@@ -941,7 +956,10 @@ async fn steer_run_lifecycle_verdicts_and_message_persistence() {
         "run already finished; send the message as a new turn"
     );
 
-    // A refused steer leaves no trace, a delivered one is journaled.
+    // Refused steers leave no trace and no steering frame is emitted;
+    // the failed run still closes its event log with `end`. Delivered-steer
+    // coverage (live child, journaled message) lives in tests/spawn.rs,
+    // which owns its process env and can shim an agent binary on PATH.
     let texts: Vec<String> = fixture
         .store
         .query(
@@ -952,10 +970,11 @@ async fn steer_run_lifecycle_verdicts_and_message_persistence() {
         .expect("messages");
     assert!(!texts.iter().any(|text| text == "too late"), "{texts:?}");
     assert!(!texts.iter().any(|text| text == "hello"), "{texts:?}");
+    assert!(!texts.iter().any(|text| text == "keep going"), "{texts:?}");
 
     let (status, events) = sse(&fixture.router, &format!("/api/runs/{claude}/events")).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(events.contains("event: steering_message"), "{events}");
+    assert!(!events.contains("event: steering_message"), "{events}");
     assert!(events.contains("event: end"), "{events}");
 }
 

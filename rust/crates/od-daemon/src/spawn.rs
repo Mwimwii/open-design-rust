@@ -178,7 +178,12 @@ pub fn prepare_spawn(
     input: &BuildArgsInput,
 ) -> Result<(PathBuf, Vec<String>), String> {
     let bin_path = resolve_bin(def.bin, def.fallback_bins)
-        .ok_or_else(|| format!("agent binary not found: {}", def.bin))?;
+        .ok_or_else(|| {
+            format!(
+                "agent binary not found: Agent \"{}\" (`{}`) is not installed or not on PATH. Install it and refresh the agent list (GET /api/agents) before retrying.",
+                def.name, def.bin
+            )
+        })?;
     let argv = (def.build_args)(input)?;
     Ok((bin_path, argv))
 }
