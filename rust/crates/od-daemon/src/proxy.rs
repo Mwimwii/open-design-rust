@@ -1,4 +1,4 @@
-//! BYOK chat proxy streaming — Rust parity for the OpenAI, Anthropic, and Azure routes.
+//! BYOK chat proxy streaming — Rust parity for the OpenAI, Anthropic, Azure, and Google routes.
 
 
 use axum::response::sse::{Event, Sse};
@@ -16,6 +16,7 @@ pub fn router() -> axum::routing::Router<AppState> {
         .route("/api/proxy/openai/stream", post(openai_proxy))
         .route("/api/proxy/anthropic/stream", post(anthropic_proxy))
         .route("/api/proxy/azure/stream", post(azure_proxy))
+        .route("/api/proxy/google/stream", post(google_proxy))
 }
 
 async fn openai_proxy(axum::Json(body): axum::Json<Value>) -> axum::response::Response {
@@ -575,4 +576,227 @@ fn extract_stream_error(data: &Value) -> Option<String> {
         return Some(m.to_string());
     }
     Some(err.to_string())
+}
+
+async fn google_proxy(axum::Json(body): axum::Json<Value>) -> axum::response::Response {
+    let body = body.as_object().cloned().unwrap_or_default();
+    let api_key = body.get("apiKey").and_then(Value::as_str).unwrap_or_default().trim().to_string();
+    let model = body.get("model").and_then(Value::as_str).unwrap_or_default().trim().to_string();
+    if api_key.is_empty() || model.is_empty() {
+        return api_error(axum::http::StatusCode::BAD_REQUEST, "BAD_REQUEST", "apiKey and model are required");
+    }
+    let base_url = body
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("https://generativelanguage.googleapis.com")
+        .to_string();
+    let system_prompt = body.get("systemPrompt").and_then(Value::as_str).map(str::to_string);
+    let messages = body.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+    let max_tokens = body
+        .get("maxTokens")
+        .and_then(Value::as_i64)
+        .filter(|v| *v > 0)
+        .unwrap_or(8192);
+
+    let contents: Vec<Value> = messages
+        .iter()
+        .map(|m| {
+            let role = if m.get("role").and_then(Value::as_str) == Some("assistant") {
+                "model"
+            } else {
+                "user"
+            };
+            let text = m.get("content").and_then(Value::as_str).unwrap_or_default();
+            json!({"role": role, "parts": [{"text": text}]})
+        })
+        .collect();
+    let mut payload = json!({
+        "contents": contents,
+        "generationConfig": {"maxOutputTokens": max_tokens}
+    });
+    if let Some(sp) = system_prompt {
+        if !sp.is_empty() {
+            payload["systemInstruction"] = json!({"parts": [{"text": sp}]});
+        }
+    }
+
+    let stripped = strip_google_base(&base_url);
+    let url = format!(
+        "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+        stripped.trim_end_matches('/'),
+        urlencoding(&model)
+    );
+
+    let (tx, rx) = mpsc::channel::<Result<Event, Box<dyn std::error::Error + Send + Sync>>>(32);
+
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        if tx
+            .send(Ok(Event::default().event("start").data(json!({"model": model}).to_string())))
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let resp = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("x-goog-api-key", api_key)
+            .json(&payload)
+            .send()
+            .await;
+
+        let response = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(Ok(Event::default().event("error").data(json!({"message": e.to_string()}).to_string()))).await;
+                let _ = tx.send(Ok(Event::default().event("end").data("{}"))).await;
+                return;
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            let retryable = status.as_u16() == 429 || status.as_u16() >= 500;
+            let _ = tx
+                .send(Ok(Event::default().event("error").data(json!({"message": format!("Upstream error: {}", status), "details": text, "retryable": retryable}).to_string())))
+                .await;
+            let _ = tx.send(Ok(Event::default().event("end").data("{}"))).await;
+            return;
+        }
+
+        let mut buffer = String::new();
+        let mut ended = false;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some(pos) = buffer.find("\n\n") {
+                        let frame = buffer[..pos].to_string();
+                        buffer.drain(..pos + 2);
+                        for line in frame.lines() {
+                            let line = line.trim();
+                            if let Some(data) = line.strip_prefix("data:") {
+                                let data = data.trim();
+                                if data.is_empty() {
+                                    continue;
+                                }
+                                let val: Value = match serde_json::from_str(data) {
+                                    Ok(v) => v,
+                                    Err(_) => continue,
+                                };
+                                if let Some(msg) = extract_stream_error(&val) {
+                                    let _ = tx.send(Ok(Event::default().event("error").data(json!({"message": format!("Gemini error: {}", msg)}).to_string()))).await;
+                                    let _ = tx.send(Ok(Event::default().event("end").data("{}"))).await;
+                                    ended = true;
+                                    break;
+                                }
+                                if let Some(delta) = extract_gemini_text(&val) {
+                                    if !delta.is_empty() {
+                                        let _ = tx.send(Ok(Event::default().event("delta").data(json!({"content": delta}).to_string()))).await;
+                                    }
+                                }
+                                if let Some(block) = extract_gemini_block(&val) {
+                                    let _ = tx.send(Ok(Event::default().event("error").data(json!({"message": block}).to_string()))).await;
+                                    let _ = tx.send(Ok(Event::default().event("end").data("{}"))).await;
+                                    ended = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if ended {
+                            break;
+                        }
+                    }
+                    if ended {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Ok(Event::default().event("error").data(json!({"message": e.to_string()}).to_string()))).await;
+                    let _ = tx.send(Ok(Event::default().event("end").data("{}"))).await;
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        if !ended {
+            let _ = tx.send(Ok(Event::default().event("end").data("{}"))).await;
+        }
+    });
+
+    let stream = ReceiverStream::new(rx);
+    Sse::new(stream).into_response()
+}
+
+fn strip_google_base(base_url: &str) -> String {
+    let Ok(u) = url::Url::parse(base_url) else {
+        return base_url.trim_end_matches('/').to_string();
+    };
+    let origin = format!("{}://{}", u.scheme(), u.host_str().unwrap_or(""));
+    let mut path = u.path().trim_end_matches('/').to_string();
+    for suffix in ["/v1beta", "/v1"] {
+        if let Some(stripped) = path.strip_suffix(suffix) {
+            path = stripped.to_string();
+            break;
+        }
+    }
+    // strip trailing /vNbeta forms
+    if path.is_empty() {
+        return origin;
+    }
+    format!("{}{}", origin, path.trim_end_matches('/'))
+}
+
+fn extract_gemini_text(data: &Value) -> Option<String> {
+    let candidates = data.get("candidates")?.as_array()?;
+    let parts = candidates.first()?.get("content")?.get("parts")?.as_array()?;
+    let mut out = String::new();
+    for part in parts {
+        if let Some(t) = part.get("text").and_then(Value::as_str) {
+            out.push_str(t);
+        }
+    }
+    Some(out)
+}
+
+static BENIGN_GEMINI_FINISH_REASONS: &[&str] = &["", "STOP", "MAX_TOKENS", "FINISH_REASON_UNSPECIFIED"];
+
+fn extract_gemini_block(data: &Value) -> Option<String> {
+    if let Some(feedback) = data.get("promptFeedback") {
+        if let Some(reason) = feedback.get("blockReason").and_then(Value::as_str) {
+            if !reason.is_empty() {
+                let tail = feedback
+                    .get("blockReasonMessage")
+                    .and_then(Value::as_str)
+                    .filter(|m| !m.is_empty())
+                    .map(|m| format!(" — {}", m))
+                    .unwrap_or_default();
+                return Some(format!("Gemini blocked the prompt ({}){}.", reason, tail));
+            }
+        }
+    }
+    let candidates = data.get("candidates")?.as_array()?;
+    for candidate in candidates {
+        let reason = candidate.get("finishReason").and_then(Value::as_str).unwrap_or("");
+        if BENIGN_GEMINI_FINISH_REASONS.contains(&reason) {
+            continue;
+        }
+        let tail = candidate
+            .get("finishMessage")
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+            .map(|m| format!(" — {}", m))
+            .unwrap_or_default();
+        return Some(format!("Gemini stopped the response ({}){}.", reason, tail));
+    }
+    None
 }

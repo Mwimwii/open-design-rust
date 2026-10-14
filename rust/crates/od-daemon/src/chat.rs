@@ -26,7 +26,6 @@ pub fn router() -> Router<AppState> {
             "/api/projects/{projectId}/critique/{runId}/artifact",
             get(critique_not_implemented),
         )
-        .route("/api/proxy/google/stream", post(proxy_stream_not_implemented))
         .route("/api/proxy/ollama/stream", post(proxy_stream_not_implemented))
         .route("/api/proxy/{provider}/stream", post(proxy_stream_not_implemented))
 }
