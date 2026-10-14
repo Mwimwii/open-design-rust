@@ -999,6 +999,10 @@ impl Runs {
         lock(&self.inner).runs.get(id).cloned()
     }
 
+    pub fn run_project_id(&self, id: &str) -> Option<String> {
+        self.get(id).and_then(|run| run.project_id.clone())
+    }
+
     fn list(
         &self,
         project_id: Option<&str>,

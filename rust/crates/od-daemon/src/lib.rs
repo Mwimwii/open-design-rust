@@ -9,6 +9,7 @@
 //! ([`od_core::RuntimePaths`]).
 
 pub mod auth;
+pub mod chat;
 pub mod chat_artifacts;
 pub mod config;
 pub mod conversations;
