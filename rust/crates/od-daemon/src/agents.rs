@@ -111,6 +111,8 @@ pub struct AgentDef {
     pub default_model_env_var: Option<&'static str>,
     pub inactivity_timeout_ms: Option<u64>,
     pub first_output_timeout_ms: Option<u64>,
+    /// Parity: `authProbe` — (argv, timeout_ms).
+    pub auth_probe: Option<(&'static [&'static str], u64)>,
     pub build_args: fn(&BuildArgsInput) -> Result<Vec<String>, String>,
 }
 
@@ -122,7 +124,14 @@ impl AgentDef {
 }
 
 fn shipped_defs() -> Vec<AgentDef> {
-    vec![claude_def(), codebuddy_def(), codex_def(), opencode_def()]
+    vec![
+        claude_def(),
+        codebuddy_def(),
+        codex_def(),
+        opencode_def(),
+        cursor_agent_def(),
+        copilot_def(),
+    ]
 }
 
 static REGISTRY: OnceLock<Vec<AgentDef>> = OnceLock::new();
@@ -443,6 +452,7 @@ fn claude_def() -> AgentDef {
         default_model_env_var: None,
         inactivity_timeout_ms: None,
         first_output_timeout_ms: None,
+        auth_probe: Some((&["auth", "status"], 5000)),
         build_args: |input| {
             let caps = input.caps;
             let mut args = vec![
@@ -547,6 +557,7 @@ fn codebuddy_def() -> AgentDef {
         default_model_env_var: None,
         inactivity_timeout_ms: None,
         first_output_timeout_ms: None,
+        auth_probe: None,
         build_args: |input| {
             let caps = input.caps;
             let mut args = vec![
@@ -758,6 +769,7 @@ fn codex_def() -> AgentDef {
         default_model_env_var: None,
         inactivity_timeout_ms: None,
         first_output_timeout_ms: None,
+        auth_probe: Some((&["login", "status"], 5000)),
         build_args: |input| {
             let ctx = input.context;
             let needs_danger = codex_needs_danger_full_access(&ctx.platform, &ctx.env);
@@ -969,6 +981,7 @@ fn opencode_def() -> AgentDef {
         default_model_env_var: None,
         inactivity_timeout_ms: None,
         first_output_timeout_ms: None,
+        auth_probe: None,
         build_args: |input| {
             let mut args = vec!["run".to_string(), "--format".to_string(), "json".to_string()];
             if input.caps.get("skipPermissions") == Some(&true) {
@@ -1000,6 +1013,162 @@ fn opencode_def() -> AgentDef {
                         args.push(variant.to_string());
                     }
                 }
+            }
+            Ok(args)
+        },
+    }
+}
+
+
+// ---- cursor-agent (parity: runtimes/defs/cursor-agent.ts) -----------------
+
+/// Parity: `parseCursorAgentModels` (cursor-agent.ts:7).
+pub fn parse_cursor_agent_models(stdout: &str) -> Option<Vec<ModelOption>> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() || trimmed.to_lowercase().contains("no models available") {
+        return None;
+    }
+    let mut out = vec![default_model_option()];
+    let mut seen = HashSet::new();
+    seen.insert("default".to_string());
+    for line in trimmed.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let lower = line.to_lowercase();
+        if lower == "available models" || lower == "models" {
+            continue;
+        }
+        let (id, label) = match line.find(" - ") {
+            Some(pos) => (line[..pos].trim(), line[pos + 3..].trim()),
+            None => (line, line),
+        };
+        if id.is_empty() || !is_model_id_token(id) || !seen.insert(id.to_string()) {
+            continue;
+        }
+        let label = if label.is_empty() { id } else { label };
+        out.push(ModelOption::simple(id, label));
+    }
+    if out.len() > 1 { Some(out) } else { None }
+}
+
+fn is_model_id_token(id: &str) -> bool {
+    let mut chars = id.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    id.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | ':' | '@' | '-')
+    })
+}
+
+/// Parity: `cursorAgentDef` (`runtimes/defs/cursor-agent.ts:33`).
+fn cursor_agent_def() -> AgentDef {
+    AgentDef {
+        id: "cursor-agent",
+        name: "Cursor Agent",
+        bin: "cursor-agent",
+        fallback_bins: &[],
+        version_args: &["--version"],
+        stream_format: "json-event-stream",
+        event_parser: Some("cursor-agent"),
+        fallback_models: vec![
+            default_model_option(),
+            ModelOption::simple("auto", "auto"),
+            ModelOption::simple("sonnet-4", "sonnet-4"),
+            ModelOption::simple("sonnet-4-thinking", "sonnet-4-thinking"),
+            ModelOption::simple("gpt-5", "gpt-5"),
+        ],
+        reasoning_options: Vec::new(),
+        prompt_via_stdin: true,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: None,
+        external_mcp_injection: None,
+        install_url: None,
+        docs_url: None,
+        help_args: &["--help"],
+        capability_flags: &[("--trust", "trust")],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: false,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        auth_probe: Some((&["status"], 5000)),
+        build_args: |input| {
+            let mut args = vec![
+                "--print".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--stream-partial-output".to_string(),
+                "--force".to_string(),
+            ];
+            if input.caps.get("trust") == Some(&true) {
+                args.push("--trust".to_string());
+            }
+            if let Some(cwd) = input.context.cwd.as_deref().filter(|c| !c.is_empty()) {
+                args.push("--workspace".to_string());
+                args.push(cwd.to_string());
+            }
+            if let Some(model) = input.options.model.as_deref().filter(|m| *m != "default") {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
+            Ok(args)
+        },
+    }
+}
+
+// ---- copilot (parity: runtimes/defs/copilot.ts) ----------------------------
+
+/// Parity: `copilotAgentDef` (`runtimes/defs/copilot.ts:13`).
+fn copilot_def() -> AgentDef {
+    AgentDef {
+        id: "copilot",
+        name: "GitHub Copilot CLI",
+        bin: "copilot",
+        fallback_bins: &[],
+        version_args: &["--version"],
+        stream_format: "copilot-stream-json",
+        event_parser: None,
+        fallback_models: vec![
+            default_model_option(),
+            ModelOption::simple("claude-sonnet-4.6", "Claude Sonnet 4.6"),
+            ModelOption::simple("gpt-5.2", "GPT-5.2"),
+        ],
+        reasoning_options: Vec::new(),
+        prompt_via_stdin: true,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: None,
+        external_mcp_injection: None,
+        install_url: None,
+        docs_url: None,
+        help_args: &[],
+        capability_flags: &[],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: false,
+        default_model_env_var: None,
+        inactivity_timeout_ms: Some(30 * 60 * 1000),
+        first_output_timeout_ms: None,
+        auth_probe: None,
+        build_args: |input| {
+            let mut args = vec![
+                "--allow-all-tools".to_string(),
+                "--output-format".to_string(),
+                "json".to_string(),
+            ];
+            if let Some(model) = input.options.model.as_deref().filter(|m| *m != "default") {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
+            for dir in non_empty_dirs(input.extra_allowed_dirs) {
+                args.push("--add-dir".to_string());
+                args.push(dir.clone());
             }
             Ok(args)
         },
