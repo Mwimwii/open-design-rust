@@ -3282,6 +3282,44 @@ fn mcp_env_config_content(
     Some((key.to_string(), content))
 }
 
+/// Map one parsed lane event onto the run's SSE feed.
+fn push_lane_event(runs: &Runs, run_id: &str, event: crate::protocol::StreamEvent) {
+    use crate::protocol::StreamEvent;
+    let name = match &event {
+        StreamEvent::Status { .. } => "status",
+        StreamEvent::ThinkingDelta { .. } => "thinking_delta",
+        StreamEvent::TextDelta { .. } => "text_delta",
+        StreamEvent::ToolUse { .. } => "tool_use",
+        StreamEvent::ToolResult { .. } => "tool_result",
+        StreamEvent::Usage { .. } => "usage",
+        StreamEvent::Raw { .. } => "raw",
+        StreamEvent::TurnEnd { .. } => "turn_end",
+        StreamEvent::ThinkingStart => "thinking_start",
+        StreamEvent::ThinkingTokens { .. } => "thinking_tokens",
+        StreamEvent::ToolInputDelta { .. } => "tool_input_delta",
+        StreamEvent::RequestUsage { .. } => "request_usage",
+        StreamEvent::Error { .. } => "error",
+    };
+    let mut data = event.to_json();
+    if let serde_json::Value::Object(ref mut map) = data {
+        map.insert("runId".to_string(), serde_json::json!(run_id));
+    }
+    runs.push_external_event(run_id, name, data);
+}
+
+fn push_lane_events(
+    runs: &Runs,
+    run_id: &str,
+    parser: &mut crate::protocol::ClaudeParser,
+    line: &str,
+) {
+    let mut events = Vec::new();
+    parser.feed(&format!("{line}\n"), &mut |event| events.push(event));
+    for event in events {
+        push_lane_event(runs, run_id, event);
+    }
+}
+
 /// Stage the composed prompt in a temp file for file-prompt adapters
 /// (parity: the daemon-created prompt file behind `promptViaFile`).
 fn stage_prompt_file(run_id: &str, prompt: &str) -> Result<String, String> {
@@ -3321,7 +3359,20 @@ async fn pump_child(
     let runs_for_out = runs.clone();
     let out_id = run_id.clone();
     let out_task = tokio::spawn(async move {
-        if stream_format == "copilot-stream-json" {
+        if stream_format == "claude-stream-json" {
+            // Claude Code's stream-json wire maps onto UI-lane events;
+            // anything else on a line is a bounded raw event.
+            if let Some(stdout) = stdout {
+                let mut parser = crate::protocol::ClaudeParser::new();
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    push_lane_events(&runs_for_out, &out_id, &mut parser, &line);
+                }
+                parser.flush(&mut |event| {
+                    push_lane_event(&runs_for_out, &out_id, event);
+                });
+            }
+        } else if stream_format == "copilot-stream-json" {
             if let Some(stdout) = stdout {
                 // Copilot's JSONL wire maps onto UI-lane events; anything
                 // else on a line is a bounded raw event.
@@ -3331,22 +3382,7 @@ async fn pump_child(
                     let mut events = Vec::new();
                     parser.feed(&format!("{line}\n"), &mut |event| events.push(event));
                     for event in events {
-                        let name = match &event {
-                            crate::protocol::StreamEvent::Status { .. } => "status",
-                            crate::protocol::StreamEvent::ThinkingDelta { .. } => {
-                                "thinking_delta"
-                            }
-                            crate::protocol::StreamEvent::TextDelta { .. } => "text_delta",
-                            crate::protocol::StreamEvent::ToolUse { .. } => "tool_use",
-                            crate::protocol::StreamEvent::ToolResult { .. } => "tool_result",
-                            crate::protocol::StreamEvent::Usage { .. } => "usage",
-                            crate::protocol::StreamEvent::Raw { .. } => "raw",
-                        };
-                        let mut data = event.to_json();
-                        if let serde_json::Value::Object(ref mut map) = data {
-                            map.insert("runId".to_string(), serde_json::json!(out_id));
-                        }
-                        runs_for_out.push_external_event(&out_id, name, data);
+                        push_lane_event(&runs_for_out, &out_id, event);
                     }
                 }
                 let mut tail = Vec::new();

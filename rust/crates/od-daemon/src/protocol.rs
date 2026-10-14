@@ -26,6 +26,12 @@ pub enum StreamEvent {
     ToolResult { tool_use_id: Option<String>, content: String, is_error: bool },
     Usage { usage: Value, stop_reason: String, duration_ms: Option<i64> },
     Raw { line: String, truncated_original_bytes: Option<usize> },
+    TurnEnd { stop_reason: String },
+    ThinkingStart,
+    ThinkingTokens { tokens: f64 },
+    ToolInputDelta { id: String, name: String, delta: String },
+    RequestUsage { request_id: String, usage: Value },
+    Error { message: String, code: Option<String> },
 }
 
 impl StreamEvent {
@@ -69,6 +75,31 @@ impl StreamEvent {
                 "usage": usage,
                 "stopReason": stop_reason,
                 "durationMs": duration_ms,
+            }),
+            StreamEvent::TurnEnd { stop_reason } => json!({
+                "type": "turn_end",
+                "stopReason": stop_reason,
+            }),
+            StreamEvent::ThinkingStart => json!({ "type": "thinking_start" }),
+            StreamEvent::ThinkingTokens { tokens } => json!({
+                "type": "thinking_tokens",
+                "tokens": tokens,
+            }),
+            StreamEvent::ToolInputDelta { id, name, delta } => json!({
+                "type": "tool_input_delta",
+                "id": id,
+                "name": name,
+                "delta": delta,
+            }),
+            StreamEvent::RequestUsage { request_id, usage } => json!({
+                "type": "request_usage",
+                "requestId": request_id,
+                "usage": usage,
+            }),
+            StreamEvent::Error { message, code } => json!({
+                "type": "error",
+                "message": message,
+                "code": code,
             }),
             StreamEvent::Raw {
                 line,
@@ -340,6 +371,743 @@ mod tests {
             } => {
                 assert!(line.len() <= RAW_LINE_BUDGET_BYTES);
                 assert_eq!(truncated_original_bytes, Some(big.len()));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+/// Claude Code `--output-format stream-json --verbose` JSONL parser
+/// (parity: `createClaudeStreamHandler` in
+/// `apps/daemon/src/runtimes/claude-stream.ts`, core lane mapping).
+///
+/// Documented deviations (sub-layers not ported): the role-marker guard
+/// (text passes through unfiltered), child-evidence collectors, the
+/// tool-input path scanner (`tool_input_target`/`tool_input_progress`
+/// frames are not emitted), task-form snapshots, question forms, and the
+/// artifact-echo dedup (text passes through unfiltered). Event lanes and
+/// emission order match TypeScript.
+#[derive(Debug, Default)]
+pub struct ClaudeParser {
+    buffer: String,
+    blocks: std::collections::HashMap<String, BlockState>,
+    current_message_id: Option<String>,
+    text_streamed: std::collections::HashSet<String>,
+    thinking_streamed: std::collections::HashSet<String>,
+    current_message_streamed_text: bool,
+    current_message_streamed_thinking: bool,
+    emitted_tool_use_ids: std::collections::HashSet<String>,
+    turn_end_emitted_for: std::collections::HashSet<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BlockState {
+    block_type: Option<String>,
+    name: Option<String>,
+    id: Option<String>,
+    input: String,
+    input_value: Option<Value>,
+}
+
+impl ClaudeParser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn feed(&mut self, chunk: &str, on_event: &mut dyn FnMut(StreamEvent)) {
+        self.buffer.push_str(chunk);
+        while let Some(pos) = self.buffer.find('\n') {
+            let line = self.buffer[..pos].trim().to_string();
+            self.buffer.drain(..pos + 1);
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Value>(&line) {
+                Ok(value) => self.handle_object(&value, on_event),
+                Err(_) => on_event(bound_raw_line(&line)),
+            }
+        }
+    }
+
+    pub fn flush(&mut self, on_event: &mut dyn FnMut(StreamEvent)) {
+        let rest = std::mem::take(&mut self.buffer).trim().to_string();
+        if rest.is_empty() {
+            return;
+        }
+        match serde_json::from_str::<Value>(&rest) {
+            Ok(value) => self.handle_object(&value, on_event),
+            Err(_) => on_event(bound_raw_line(&rest)),
+        }
+    }
+
+    fn block_key(&self, index: &Value) -> String {
+        let id = self.current_message_id.as_deref().unwrap_or("anon");
+        match index {
+            Value::Number(n) => format!("{id}:{n}"),
+            Value::String(s) => format!("{id}:{s}"),
+            _ => format!("{id}:?"),
+        }
+    }
+
+    fn emit_turn_end_once(
+        &mut self,
+        message_id: Option<String>,
+        stop_reason: &str,
+        parent_tool_use_id: Option<&str>,
+        on_event: &mut dyn FnMut(StreamEvent),
+    ) {
+        if parent_tool_use_id
+            .map(|id| !id.trim().is_empty())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if let Some(id) = message_id.clone() {
+            if !self.turn_end_emitted_for.insert(id) {
+                return;
+            }
+        }
+        on_event(StreamEvent::TurnEnd {
+            stop_reason: stop_reason.to_string(),
+        });
+    }
+
+    fn emit_tool_use(
+        &self,
+        id: Option<&str>,
+        name: Option<&str>,
+        input: Value,
+        on_event: &mut dyn FnMut(StreamEvent),
+    ) {
+        on_event(StreamEvent::ToolUse {
+            id: id.map(str::to_string),
+            name: name.map(str::to_string),
+            input,
+        });
+    }
+
+    fn wrapper_tool_use_input(&self, block: &serde_json::Map<String, Value>) -> Value {
+        if let Some(id) = block.get("id").and_then(Value::as_str) {
+            for state in self.blocks.values() {
+                if state.block_type.as_deref() == Some("tool_use")
+                    && state.id.as_deref() == Some(id)
+                    && !state.input.trim().is_empty()
+                {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&state.input) {
+                        return parsed;
+                    }
+                    break;
+                }
+            }
+        }
+        block.get("input").cloned().unwrap_or(Value::Null)
+    }
+
+    fn handle_object(&mut self, obj: &Value, on_event: &mut dyn FnMut(StreamEvent)) {
+        let obj = match obj.as_object() {
+            Some(obj) => obj,
+            None => return,
+        };
+        let obj_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
+        let parent_tool_use_id = obj
+            .get("parent_tool_use_id")
+            .and_then(Value::as_str);
+
+        if obj_type == "system" {
+            match obj.get("subtype").and_then(Value::as_str).unwrap_or("") {
+                "init" => {
+                    on_event(StreamEvent::Status {
+                        label: "initializing".to_string(),
+                        model: obj
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    });
+                    return;
+                }
+                "status" => {
+                    on_event(StreamEvent::Status {
+                        label: obj
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("working")
+                            .to_string(),
+                        model: None,
+                    });
+                    return;
+                }
+                "thinking_tokens" => {
+                    if let Some(tokens) = obj.get("estimated_tokens").and_then(Value::as_f64) {
+                        if tokens.is_finite() && tokens > 0.0 {
+                            on_event(StreamEvent::ThinkingTokens { tokens });
+                        }
+                    }
+                    return;
+                }
+                _ => return,
+            }
+        }
+
+        if obj_type == "stream_event" {
+            if let Some(event) = obj.get("event") {
+                self.handle_stream_event(event, parent_tool_use_id, on_event);
+            }
+            return;
+        }
+
+        if obj_type == "assistant" {
+            let Some(message) = obj.get("message").and_then(Value::as_object) else {
+                return;
+            };
+            let empty = Vec::new();
+            let content = message
+                .get("content")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty);
+            let explicit_id = message
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let text_id = explicit_id.clone().or_else(|| {
+                if self.current_message_streamed_text {
+                    self.current_message_id.clone()
+                } else {
+                    None
+                }
+            });
+            let thinking_id = explicit_id.clone().or_else(|| {
+                if self.current_message_streamed_thinking {
+                    self.current_message_id.clone()
+                } else {
+                    None
+                }
+            });
+            if let Some(id) = explicit_id.clone() {
+                self.current_message_id = Some(id);
+            }
+            if let Some(id) = explicit_id.clone() {
+                if let Some(usage) = message.get("usage").and_then(Value::as_object) {
+                    let mut record = serde_json::Map::new();
+                    let mut seen = false;
+                    for key in [
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_creation_input_tokens",
+                        "cache_read_input_tokens",
+                    ] {
+                        if let Some(n) = usage.get(key).and_then(Value::as_f64) {
+                            if n.is_finite() {
+                                record.insert(key.to_string(), Value::from(n));
+                                seen = true;
+                            }
+                        }
+                    }
+                    if seen {
+                        on_event(StreamEvent::RequestUsage {
+                            request_id: id,
+                            usage: Value::Object(record),
+                        });
+                    }
+                }
+            }
+            let text_done = text_id
+                .as_ref()
+                .map(|id| self.text_streamed.contains(id))
+                .unwrap_or(false);
+            let thinking_done = thinking_id
+                .as_ref()
+                .map(|id| self.thinking_streamed.contains(id))
+                .unwrap_or(false);
+            let stop_reason = message
+                .get("stop_reason")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            for block in content {
+                let Some(block) = block.as_object() else {
+                    continue;
+                };
+                let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+                if block_type == "tool_use" {
+                    if let Some(id) = block.get("id").and_then(Value::as_str) {
+                        if self.emitted_tool_use_ids.contains(id) {
+                            continue;
+                        }
+                        self.emitted_tool_use_ids.insert(id.to_string());
+                    }
+                    let input = self.wrapper_tool_use_input(block);
+                    self.emit_tool_use(
+                        block.get("id").and_then(Value::as_str),
+                        block.get("name").and_then(Value::as_str),
+                        input,
+                        on_event,
+                    );
+                } else if !text_done
+                    && block_type == "text"
+                    && block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(|t| !t.is_empty())
+                        .unwrap_or(false)
+                {
+                    on_event(StreamEvent::TextDelta {
+                        delta: block["text"].as_str().unwrap_or_default().to_string(),
+                    });
+                } else if !thinking_done
+                    && block_type == "thinking"
+                    && block
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .map(|t| !t.is_empty())
+                        .unwrap_or(false)
+                {
+                    on_event(StreamEvent::ThinkingDelta {
+                        delta: block["thinking"].as_str().unwrap_or_default().to_string(),
+                    });
+                }
+            }
+            if let Some(reason) = stop_reason {
+                self.emit_turn_end_once(
+                    explicit_id.or_else(|| self.current_message_id.clone()),
+                    &reason,
+                    parent_tool_use_id,
+                    on_event,
+                );
+            }
+            if let Some(error) = obj.get("error").and_then(Value::as_str) {
+                if !error.trim().is_empty() && parent_tool_use_id.is_none() {
+                    let mut text = String::new();
+                    for block in content {
+                        if let Some(block) = block.as_object() {
+                            if block.get("type").and_then(Value::as_str) == Some("text") {
+                                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                                    if !text.is_empty() {
+                                        text.push('\n');
+                                    }
+                                    text.push_str(t);
+                                }
+                            }
+                        }
+                    }
+                    let text = text.trim().to_string();
+                    on_event(StreamEvent::Error {
+                        message: if text.is_empty() {
+                            error.to_string()
+                        } else {
+                            text
+                        },
+                        code: Some(error.to_string()),
+                    });
+                }
+            }
+            self.current_message_streamed_text = false;
+            self.current_message_streamed_thinking = false;
+            return;
+        }
+
+        if obj_type == "user" {
+            if let Some(content) = obj
+                .get("message")
+                .and_then(Value::as_object)
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_array)
+            {
+                for block in content {
+                    let Some(block) = block.as_object() else {
+                        continue;
+                    };
+                    if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                        continue;
+                    }
+                    let content = match block.get("content") {
+                        Some(Value::String(text)) => text.clone(),
+                        Some(Value::Array(parts)) => parts
+                            .iter()
+                            .map(|part| {
+                                part.as_object()
+                                    .filter(|p| {
+                                        p.get("type").and_then(Value::as_str) == Some("text")
+                                    })
+                                    .and_then(|p| p.get("text"))
+                                    .map(|t| {
+                                        t.as_str().unwrap_or(&t.to_string()).to_string()
+                                    })
+                                    .unwrap_or_else(|| part.to_string())
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        Some(other) => other.to_string(),
+                        None => String::new(),
+                    };
+                    on_event(StreamEvent::ToolResult {
+                        tool_use_id: block
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        content,
+                        is_error: block.get("is_error") == Some(&Value::Bool(true)),
+                    });
+                }
+            }
+            return;
+        }
+
+        if obj_type == "result" {
+            let is_error = obj.get("is_error") == Some(&Value::Bool(true));
+            let stop_reason = obj
+                .get("stop_reason")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    obj.get("terminal_reason")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                });
+            let mut usage = obj.get("usage").cloned().unwrap_or(Value::Null);
+            if usage.is_null() {
+                usage = Value::Object(serde_json::Map::new());
+            }
+            // Cost/duration ride on the usage lane like TS.
+            if let Value::Object(ref mut map) = usage {
+                if let Some(cost) = obj.get("total_cost_usd") {
+                    map.insert("costUsd".to_string(), cost.clone());
+                }
+                if let Some(duration) = obj.get("duration_ms") {
+                    map.insert("durationMs".to_string(), duration.clone());
+                }
+                if is_error {
+                    map.insert("isError".to_string(), Value::Bool(true));
+                }
+            }
+            on_event(StreamEvent::Usage {
+                usage,
+                stop_reason: stop_reason.clone().unwrap_or_default(),
+                duration_ms: obj.get("duration_ms").and_then(Value::as_i64),
+            });
+            if is_error {
+                let message = obj
+                    .get("errors")
+                    .and_then(Value::as_array)
+                    .map(|errors| {
+                        errors
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        obj.get("result")
+                            .and_then(Value::as_str)
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                    })
+                    .or_else(|| {
+                        obj.get("subtype")
+                            .and_then(Value::as_str)
+                            .map(|s| format!("Claude run failed: {s}"))
+                    })
+                    .unwrap_or_else(|| "Claude run failed".to_string());
+                let trimmed = message.trim();
+                let code = if trimmed.eq_ignore_ascii_case("prompt is too long.")
+                    || trimmed.eq_ignore_ascii_case("prompt is too long")
+                    || (trimmed.to_lowercase().starts_with("api error:")
+                        && trimmed.to_lowercase().contains("prompt is too long"))
+                {
+                    Some("AGENT_PROMPT_TOO_LARGE".to_string())
+                } else {
+                    obj.get("subtype")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or(Some("result_error".to_string()))
+                };
+                on_event(StreamEvent::Error {
+                    message,
+                    code,
+                });
+            }
+        }
+    }
+
+    fn handle_stream_event(
+        &mut self,
+        event: &Value,
+        parent_tool_use_id: Option<&str>,
+        on_event: &mut dyn FnMut(StreamEvent),
+    ) {
+        let Some(event) = event.as_object() else {
+            return;
+        };
+        let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+
+        if event_type == "message_delta" {
+            if let Some(reason) = event
+                .get("delta")
+                .and_then(Value::as_object)
+                .and_then(|d| d.get("stop_reason"))
+                .and_then(Value::as_str)
+            {
+                self.emit_turn_end_once(
+                    self.current_message_id.clone(),
+                    reason,
+                    parent_tool_use_id,
+                    on_event,
+                );
+            }
+            return;
+        }
+
+        if event_type == "message_start" {
+            if let Some(id) = event
+                .get("message")
+                .and_then(Value::as_object)
+                .and_then(|m| m.get("id"))
+                .and_then(Value::as_str)
+            {
+                self.current_message_id = Some(id.to_string());
+            } else {
+                self.current_message_id = None;
+            }
+            self.current_message_streamed_text = false;
+            self.current_message_streamed_thinking = false;
+            if let Some(ttft) = event.get("ttft_ms").and_then(Value::as_i64) {
+                let mut data = serde_json::Map::new();
+                data.insert("type".to_string(), Value::String("status".to_string()));
+                data.insert("label".to_string(), Value::String("streaming".to_string()));
+                data.insert("ttftMs".to_string(), Value::from(ttft));
+                on_event(StreamEvent::Raw {
+                    line: Value::Object(data).to_string(),
+                    truncated_original_bytes: None,
+                });
+            }
+            return;
+        }
+
+        if event_type == "content_block_start" {
+            let Some(block) = event.get("content_block").and_then(Value::as_object) else {
+                return;
+            };
+            let key = self.block_key(event.get("index").unwrap_or(&Value::Null));
+            let mut state = BlockState {
+                block_type: block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                name: block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                id: block.get("id").and_then(Value::as_str).map(str::to_string),
+                input: String::new(),
+                input_value: block.get("input").cloned(),
+            };
+            let _ = &mut state;
+            if state.block_type.as_deref() == Some("thinking") {
+                on_event(StreamEvent::ThinkingStart);
+            }
+            self.blocks.insert(key, state);
+            return;
+        }
+
+        if event_type == "content_block_delta" {
+            let Some(delta) = event.get("delta").and_then(Value::as_object) else {
+                return;
+            };
+            let key = self.block_key(event.get("index").unwrap_or(&Value::Null));
+            let delta_type = delta.get("type").and_then(Value::as_str).unwrap_or("");
+            if delta_type == "text_delta" {
+                if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                    if let Some(id) = self.current_message_id.clone() {
+                        self.text_streamed.insert(id);
+                    }
+                    self.current_message_streamed_text = true;
+                    on_event(StreamEvent::TextDelta {
+                        delta: text.to_string(),
+                    });
+                }
+                return;
+            }
+            if delta_type == "thinking_delta" {
+                if let Some(thinking) = delta.get("thinking").and_then(Value::as_str) {
+                    // Only a delta that carried characters counts as
+                    // "reasoning already streamed" (parity comment in TS).
+                    if !thinking.is_empty() {
+                        if let Some(id) = self.current_message_id.clone() {
+                            self.thinking_streamed.insert(id);
+                        }
+                        self.current_message_streamed_thinking = true;
+                    }
+                    on_event(StreamEvent::ThinkingDelta {
+                        delta: thinking.to_string(),
+                    });
+                }
+                return;
+            }
+            if delta_type == "input_json_delta" {
+                if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
+                    let state = self.blocks.get_mut(&key);
+                    if let Some(state) = state {
+                        if state.block_type.as_deref() == Some("tool_use") {
+                            state.input.push_str(partial);
+                            if let (Some(id), Some(name)) =
+                                (state.id.clone(), state.name.clone())
+                            {
+                                on_event(StreamEvent::ToolInputDelta {
+                                    id,
+                                    name,
+                                    delta: partial.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            return;
+        }
+
+        if event_type == "content_block_stop" {
+            let key = self.block_key(event.get("index").unwrap_or(&Value::Null));
+            let state = self.blocks.get(&key).cloned();
+            let already = state.as_ref().is_some_and(|state| {
+                state.block_type.as_deref() == Some("tool_use")
+                    && state
+                        .id
+                        .as_deref()
+                        .map(|id| self.emitted_tool_use_ids.contains(id))
+                        .unwrap_or(false)
+            });
+            if already {
+                self.blocks.remove(&key);
+                return;
+            }
+            if let Some(state) = state {
+                if state.block_type.as_deref() == Some("tool_use")
+                    && state.id.is_some()
+                    && !state.input.trim().is_empty()
+                {
+                    if let Ok(input) = serde_json::from_str::<Value>(&state.input) {
+                        let id = state.id.clone();
+                        let name = state.name.clone();
+                        if let Some(id) = id.as_deref() {
+                            self.emitted_tool_use_ids.insert(id.to_string());
+                        }
+                        self.emit_tool_use(id.as_deref(), name.as_deref(), input, on_event);
+                    }
+                } else if state.block_type.as_deref() == Some("tool_use")
+                    && state.id.is_some()
+                    && state.input_value.is_some()
+                {
+                    let id = state.id.clone();
+                    let name = state.name.clone();
+                    let input = state.input_value.clone().unwrap_or(Value::Null);
+                    if let Some(id) = id.as_deref() {
+                        self.emitted_tool_use_ids.insert(id.to_string());
+                    }
+                    self.emit_tool_use(id.as_deref(), name.as_deref(), input, on_event);
+                }
+                self.blocks.remove(&key);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod claude_tests {
+    use super::*;
+
+    fn collect(feed: &str) -> Vec<StreamEvent> {
+        let mut parser = ClaudeParser::new();
+        let mut events = Vec::new();
+        parser.feed(feed, &mut |event| events.push(event));
+        parser.flush(&mut |_| {});
+        events
+    }
+
+    fn lane(events: &[StreamEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .map(|event| match event {
+                StreamEvent::Status { .. } => "status",
+                StreamEvent::ThinkingDelta { .. } => "thinking_delta",
+                StreamEvent::TextDelta { .. } => "text_delta",
+                StreamEvent::ToolUse { .. } => "tool_use",
+                StreamEvent::ToolResult { .. } => "tool_result",
+                StreamEvent::Usage { .. } => "usage",
+                StreamEvent::TurnEnd { .. } => "turn_end",
+                StreamEvent::ThinkingStart => "thinking_start",
+                StreamEvent::ThinkingTokens { .. } => "thinking_tokens",
+                StreamEvent::ToolInputDelta { .. } => "tool_input_delta",
+                StreamEvent::RequestUsage { .. } => "request_usage",
+                StreamEvent::Error { .. } => "error",
+                StreamEvent::Raw { .. } => "raw",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn streamed_turn_maps_deltas_tool_use_and_turn_end() {
+        let feed = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"sonnet\",\"session_id\":\"s1\"}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\",\"message\":{\"id\":\"m1\"}}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_stop\",\"index\":0}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{}}}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\": \\\"\"}}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"ls\\\"}\"}}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_stop\",\"index\":1}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}}\n",
+        );
+        let events = collect(feed);
+        assert_eq!(
+            lane(&events),
+            vec![
+                "status",
+                "text_delta",
+                "tool_input_delta",
+                "tool_input_delta",
+                "tool_use",
+                "turn_end",
+            ]
+        );
+        match &events[4] {
+            StreamEvent::ToolUse { id, name, input } => {
+                assert_eq!(id.as_deref(), Some("t1"));
+                assert_eq!(name.as_deref(), Some("Bash"));
+                assert_eq!(input["command"], serde_json::json!("ls"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_wrapper_covers_text_and_result_without_deltas() {
+        let feed = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"m9\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"usage\":{\"input_tokens\":3,\"output_tokens\":5}}}\n",
+            "{\"type\":\"result\",\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":3},\"total_cost_usd\":0.01,\"duration_ms\":7}\n",
+        );
+        let events = collect(feed);
+        assert_eq!(
+            lane(&events),
+            vec!["request_usage", "text_delta", "usage"]
+        );
+        match &events[2] {
+            StreamEvent::Usage { stop_reason, .. } => assert_eq!(stop_reason, "end_turn"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_result_maps_to_error_event() {
+        let events = collect("{\"type\":\"result\",\"is_error\":true,\"subtype\":\"error_during_execution\",\"errors\":[\"boom\"]}\n");
+        assert_eq!(lane(&events), vec!["usage", "error"]);
+        match &events[1] {
+            StreamEvent::Error { message, code } => {
+                assert_eq!(message, "boom");
+                assert_eq!(code.as_deref(), Some("error_during_execution"));
             }
             other => panic!("unexpected {other:?}"),
         }
