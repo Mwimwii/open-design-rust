@@ -67,7 +67,7 @@ Tracked with beads (`bd list`); the epic is `open-design-rust-59s`.
 | Sandbox external-root allowlist, legacy migrate helpers | done |
 | Static resources + chat artifacts routes | done |
 | Runs engine (create/list/events/SSE/cancel/steer/result-package) | done |
-| MCP routes (`apps/daemon/src/mcp.ts`) | open — `open-design-rust-r2r` |
+| MCP routes (`apps/daemon/src/mcp.ts`) | done |
 | Chat + BYOK routes | open — `open-design-rust-us2` |
 
 To port a surface: read the TS source, mirror routes with parity, add tests
