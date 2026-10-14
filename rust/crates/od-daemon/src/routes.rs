@@ -55,6 +55,10 @@ pub struct AppState {
     /// [`Self::mcp_write_lock`]; the OAuth disconnect route holds it across
     /// read → modify → write.
     pub mcp_tokens_lock: Arc<tokio::sync::Mutex<()>>,
+    /// In-memory pending-state cache for the MCP OAuth dance (parity:
+    /// `PendingAuthCache` in `mcp-oauth.ts`). State is single-use and
+    /// TTL-scoped to the daemon process.
+    pub mcp_pending_auth: Arc<tokio::sync::Mutex<std::collections::HashMap<String, crate::mcp_oauth::PendingAuthState>>>,
 }
 
 impl AppState {
@@ -70,6 +74,7 @@ impl AppState {
             mcp_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             mcp_install_info_cache: Arc::new(std::sync::Mutex::new(None)),
             mcp_tokens_lock: Arc::new(tokio::sync::Mutex::new(())),
+            mcp_pending_auth: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 }

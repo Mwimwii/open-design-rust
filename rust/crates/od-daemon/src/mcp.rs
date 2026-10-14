@@ -268,7 +268,7 @@ use axum::{Json, Router};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use crate::mcp_tokens::{clear_token, get_token};
+use crate::mcp_tokens::{clear_token, get_token, set_token, StoredMcpToken};
 use crate::routes::{api_error, internal_error, single_query_value, AppState};
 
 /// The request facts the same-origin guard needs (parity: the `req` + `env`
@@ -1343,6 +1343,8 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/mcp/oauth/status", get(get_oauth_status))
         .route("/api/mcp/oauth/disconnect", post(post_oauth_disconnect))
+        .route("/api/mcp/oauth/start", post(post_oauth_start))
+        .route("/api/mcp/oauth/callback", get(get_oauth_callback))
 }
 
 /// Parity: the `isLocalSameOrigin(req, getResolvedPort())` prologue of both
@@ -2101,6 +2103,190 @@ async fn post_oauth_disconnect(
             api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &err.to_string())
         }
         Err(join) => internal_error(&join.to_string()),
+    }
+}
+
+
+// ───────────────────────────────────────────────────────────────────────
+// OAuth dance — parity port of `POST /api/mcp/oauth/start` and
+// `GET /api/mcp/oauth/callback` (mcp-routes.ts:230-358) plus the support
+// layer (`mcp-oauth.ts`).
+// ───────────────────────────────────────────────────────────────────────
+
+async fn post_oauth_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Some(response) = local_same_origin_rejection(&state, &headers) {
+        return response;
+    }
+    let server_id = body
+        .get("serverId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    if server_id.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "serverId is required");
+    }
+
+    let data_dir = state.config.paths.data_dir().to_path_buf();
+    let cfg = match tokio::task::spawn_blocking(move || read_mcp_config(&data_dir)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(err)) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &err.to_string());
+        }
+        Err(join) => return internal_error(&join.to_string()),
+    };
+    let server = match cfg.servers.iter().find(|s| s.id == server_id) {
+        Some(s) => s.clone(),
+        None => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                &format!("unknown serverId {}", server_id),
+            );
+        }
+    };
+    if server.transport != McpTransport::Http && server.transport != McpTransport::Sse {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "OAuth flow only applies to http/sse transports",
+        );
+    }
+    let server_url = match server.url.clone() {
+        Some(u) if !u.trim().is_empty() => u,
+        _ => {
+            return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "server has no URL configured");
+        }
+    };
+    if server.auth_mode == Some(McpAuthMode::None) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "server is configured for no managed OAuth",
+        );
+    }
+
+    let redirect_uri = crate::mcp_oauth::get_public_base_url(&headers);
+    let redirect_uri = format!("{}/api/mcp/oauth/callback", redirect_uri);
+
+    let begin_input = crate::mcp_oauth::BeginAuthInput {
+        server_id: server_id.clone(),
+        server_url,
+        redirect_uri: redirect_uri.clone(),
+        data_dir: state.config.paths.data_dir().to_path_buf(),
+        scope: None,
+    };
+    match crate::mcp_oauth::begin_auth(begin_input).await {
+        Ok(result) => {
+            let mut map = state.mcp_pending_auth.lock().await;
+            map.insert(result.state.clone(), result.pending);
+            drop(map);
+            Json(serde_json::json!({
+                "authorizeUrl": result.authorize_url,
+                "state": result.state,
+                "redirectUri": redirect_uri,
+            }))
+            .into_response()
+        }
+        Err(msg) => api_error(StatusCode::BAD_GATEWAY, "BAD_GATEWAY", &msg),
+    }
+}
+
+async fn get_oauth_callback(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let code = params.get("code").cloned().unwrap_or_default();
+    let state_param = params.get("state").cloned().unwrap_or_default();
+    let error = params.get("error").cloned().unwrap_or_default();
+
+    if !error.is_empty() {
+        let html = crate::mcp_oauth::render_oauth_result_page(
+            false,
+            None,
+            Some(&format!("Auth provider returned error: {}", error)),
+        );
+        return (StatusCode::BAD_REQUEST, [("content-type", "text/html; charset=utf-8")], html).into_response();
+    }
+    if code.is_empty() || state_param.is_empty() {
+        let html = crate::mcp_oauth::render_oauth_result_page(
+            false,
+            None,
+            Some("Missing code or state — open Settings → External MCP servers and click Connect again."),
+        );
+        return (StatusCode::BAD_REQUEST, [("content-type", "text/html; charset=utf-8")], html).into_response();
+    }
+
+    // consume pending state
+    let pending = {
+        let mut map = state.mcp_pending_auth.lock().await;
+        map.remove(&state_param)
+    };
+    let Some(pending) = pending else {
+        let html = crate::mcp_oauth::render_oauth_result_page(
+            false,
+            None,
+            Some("Auth state expired or already used. Click Connect again."),
+        );
+        return (StatusCode::BAD_REQUEST, [("content-type", "text/html; charset=utf-8")], html).into_response();
+    };
+    let now = crate::mcp_oauth::now_millis_pub();
+    if now.saturating_sub(pending.created_at) > 10 * 60 * 1000 {
+        let html = crate::mcp_oauth::render_oauth_result_page(
+            false,
+            None,
+            Some("Auth state expired or already used. Click Connect again."),
+        );
+        return (StatusCode::BAD_REQUEST, [("content-type", "text/html; charset=utf-8")], html).into_response();
+    }
+
+    let data_dir = state.config.paths.data_dir().to_path_buf();
+    let exchange_input = crate::mcp_oauth::ExchangeCodeInput {
+        token_endpoint: pending.token_endpoint.clone(),
+        client_id: pending.client_id.clone(),
+        client_secret: pending.client_secret.clone(),
+        redirect_uri: pending.redirect_uri.clone(),
+        code: code.clone(),
+        code_verifier: pending.code_verifier.clone(),
+        resource: pending.resource_url.clone(),
+    };
+    let client = reqwest::Client::new();
+    match crate::mcp_oauth::exchange_code_for_token(exchange_input, &client).await {
+        Ok(tok) => {
+            let expires_at = tok.expires_in.map(|s| {
+                let ms = s * 1000;
+                serde_json::Number::from(now + ms)
+            });
+            let stored = StoredMcpToken {
+                access_token: tok.access_token,
+                token_type: tok.token_type.unwrap_or_else(|| "Bearer".to_string()),
+                saved_at: serde_json::Number::from(now),
+                refresh_token: tok.refresh_token,
+                scope: tok.scope.or(pending.scope.clone()),
+                expires_at,
+                token_endpoint: Some(pending.token_endpoint.clone()),
+                client_id: Some(pending.client_id.clone()),
+                client_secret: pending.client_secret.clone(),
+                auth_server_issuer: Some(pending.auth_server_issuer.clone()),
+                redirect_uri: Some(pending.redirect_uri.clone()),
+                resource_url: pending.resource_url.clone(),
+            };
+            let sid = pending.server_id.clone();
+            let dd = data_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || set_token(&dd, &sid, stored)).await;
+            let server_id = pending.server_id.clone();
+            let html = crate::mcp_oauth::render_oauth_result_page(true, Some(&server_id), None);
+            (StatusCode::OK, [("content-type", "text/html; charset=utf-8")], html).into_response()
+        }
+        Err(err) => {
+            tracing::error!("[mcp-oauth] callback failed: {}", err);
+            let html = crate::mcp_oauth::render_oauth_result_page(false, None, Some(&err));
+            (StatusCode::BAD_GATEWAY, [("content-type", "text/html; charset=utf-8")], html).into_response()
+        }
     }
 }
 

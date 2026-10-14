@@ -23,6 +23,8 @@ serde = { version = "1", features = ["derive"] }
 # (mcp-config env/headers maps, MCP template objects).
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
+rand = "0.8"
+sha2 = "0.10"
 # "process": tokio::process::Command for the Codex CLI runner in
 # crates/od-daemon/src/mcp.rs (parity: spawn() in apps/daemon/src/codex-cli.ts).
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs", "process"] }
