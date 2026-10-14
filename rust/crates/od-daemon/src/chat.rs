@@ -7,7 +7,7 @@ use axum::extract::{Path, State};
 use axum::response::IntoResponse;
 use axum::http::StatusCode;
 use axum::response::Response;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
@@ -18,6 +18,14 @@ pub fn router() -> Router<AppState> {
         .route("/api/runs/{id}/feedback", post(post_feedback))
         .route("/api/provider/models", post(post_provider_models))
         .route("/api/test/connection", post(post_test_connection))
+        .route(
+            "/api/projects/{projectId}/critique/{runId}/interrupt",
+            post(critique_not_implemented),
+        )
+        .route(
+            "/api/projects/{projectId}/critique/{runId}/artifact",
+            get(critique_not_implemented),
+        )
         .route("/api/proxy/anthropic/stream", post(proxy_stream_not_implemented))
         .route("/api/proxy/openai/stream", post(proxy_stream_not_implemented))
         .route("/api/proxy/azure/stream", post(proxy_stream_not_implemented))
@@ -160,6 +168,14 @@ async fn proxy_stream_not_implemented() -> Response {
         StatusCode::INTERNAL_SERVER_ERROR,
         "INTERNAL",
         "BYOK proxy streaming is not yet ported to the Rust daemon",
+    )
+}
+
+async fn critique_not_implemented() -> Response {
+    api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "INTERNAL",
+        "Critique handlers are not yet ported to the Rust daemon",
     )
 }
 
