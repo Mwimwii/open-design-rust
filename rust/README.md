@@ -68,7 +68,7 @@ Tracked with beads (`bd list`); the epic is `open-design-rust-59s`.
 | Static resources + chat artifacts routes | done |
 | Runs engine (create/list/events/SSE/cancel/steer/result-package) | done |
 | MCP routes (`apps/daemon/src/mcp.ts`) | done |
-| Chat + BYOK routes | partial (feedback endpoint ported) — `open-design-rust-us2` |
+| Chat + BYOK routes | done (feedback, provider models, connection tests, proxies, critique) |
 
 To port a surface: read the TS source, mirror routes with parity, add tests
 under `crates/od-daemon/tests/`, verify the three cargo commands above, then
