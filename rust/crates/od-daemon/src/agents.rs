@@ -131,6 +131,17 @@ pub struct AgentDef {
     pub acp_mcp_env_format: Option<&'static str>,
     /// Parity: `versionProbeTimeoutMs`.
     pub version_probe_timeout_ms: Option<u64>,
+    /// Parity: `resumesSessionViaProfileStdio`.
+    pub resumes_session_via_profile_stdio: bool,
+    /// Parity: `versionPolicy` — (supported versions, pattern source).
+    /// Semver evaluation belongs to the detection bead.
+    pub version_policy: Option<(&'static [&'static str], &'static str)>,
+    /// Parity: `compatibilityProbe` argv + timeout. Probe parsing belongs
+    /// to the protocol bead.
+    pub compatibility_probe: Option<(&'static [&'static str], u64)>,
+    /// Static spawn-env entries (parity: `env`). Runtime-computed entries
+    /// (e.g. Reasonix's home dir) resolve in the spawn layer.
+    pub env: &'static [(&'static str, &'static str)],
     pub build_args: fn(&BuildArgsInput) -> Result<Vec<String>, String>,
 }
 
@@ -163,6 +174,11 @@ fn shipped_defs() -> Vec<AgentDef> {
         trae_cli_def(),
         vibe_def(),
         mimo_def(),
+        deepseek_def(),
+        reasonix_def(),
+        pi_def(),
+        grok_build_def(),
+        deepseek_harness_def(),
     ]
 }
 
@@ -491,6 +507,10 @@ fn claude_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
         build_args: |input| {
             let caps = input.caps;
             let mut args = vec![
@@ -602,6 +622,10 @@ fn codebuddy_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
         build_args: |input| {
             let caps = input.caps;
             let mut args = vec![
@@ -820,6 +844,10 @@ fn codex_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
         build_args: |input| {
             let ctx = input.context;
             let needs_danger = codex_needs_danger_full_access(&ctx.platform, &ctx.env);
@@ -1038,6 +1066,10 @@ fn opencode_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
         build_args: |input| {
             let mut args = vec!["run".to_string(), "--format".to_string(), "json".to_string()];
             if input.caps.get("skipPermissions") == Some(&true) {
@@ -1160,6 +1192,10 @@ fn cursor_agent_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
         build_args: |input| {
             let mut args = vec![
                 "--print".to_string(),
@@ -1224,6 +1260,10 @@ fn copilot_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
         build_args: |input| {
             let mut args = vec![
                 "--allow-all-tools".to_string(),
@@ -1305,6 +1345,10 @@ fn aider_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
         build_args: |input| {
             let mut args = vec![
                 "--yes-always".to_string(),
@@ -1364,6 +1408,10 @@ fn amp_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
         build_args: |input| {
             let mut args = vec![
                 "-x".to_string(),
@@ -1422,6 +1470,10 @@ fn atomcode_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
         build_args: |input| {
             let Some(path) = input.prompt_file_path.filter(|p| !p.is_empty()) else {
                 return Err("atomcode requires runtimeContext.promptFilePath".to_string());
@@ -1483,6 +1535,10 @@ fn devin_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
         build_args: |_input| {
             Ok(vec![
                 "--permission-mode".to_string(),
@@ -1536,6 +1592,10 @@ fn qoder_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
         build_args: |input| {
             let mut args = vec![
                 "-p".to_string(),
@@ -1602,6 +1662,10 @@ fn qwen_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
         build_args: |input| {
             let mut args = vec!["--yolo".to_string()];
             if let Some(model) = input.options.model.as_deref().filter(|m| *m != "default") {
@@ -1659,6 +1723,10 @@ fn byok_opencode_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
         build_args: |input| {
             let mut args = vec!["run".to_string(), "--format".to_string(), "json".to_string()];
             if let Some(cwd) = input.context.cwd.as_deref().filter(|c| !c.is_empty()) {
@@ -1721,6 +1789,10 @@ macro_rules! acp_def {
             acp_stdio_mcp_removed_in_version: $stdio_removed,
             acp_mcp_env_format: None,
             version_probe_timeout_ms: $probe_timeout,
+            resumes_session_via_profile_stdio: false,
+            version_policy: None,
+            compatibility_probe: None,
+            env: &[],
             build_args: |_input| Ok($argv.iter().map(|s| s.to_string()).collect()),
         }
     };
@@ -1827,6 +1899,10 @@ fn mimo_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
         build_args: |input| {
             let mut args = vec!["run".to_string(), "--format".to_string(), "json".to_string()];
             if let Some(model) = input.options.model.as_deref().filter(|m| *m != "default") {
@@ -1834,6 +1910,413 @@ fn mimo_def() -> AgentDef {
                 args.push(model.to_string());
             }
             Ok(args)
+        },
+    }
+}
+
+
+// ---- misc adapters batch --------------------------------------------------
+// Parity sources: runtimes/defs/deepseek.ts, reasonix.ts, pi.ts,
+// grok-build.ts, deepseek-harness.ts.
+
+/// Parity: `deepseekAgentDef` (`runtimes/defs/deepseek.ts:6`).
+fn deepseek_def() -> AgentDef {
+    AgentDef {
+        id: "deepseek",
+        name: "DeepSeek TUI",
+        bin: "deepseek",
+        fallback_bins: &["codewhale"],
+        version_args: &["--version"],
+        stream_format: "plain",
+        event_parser: None,
+        fallback_models: vec![
+            default_model_option(),
+            ModelOption::simple("deepseek-v4-pro", "deepseek-v4-pro"),
+            ModelOption::simple("deepseek-v4-flash", "deepseek-v4-flash"),
+        ],
+        reasoning_options: Vec::new(),
+        prompt_via_stdin: false,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: None,
+        external_mcp_injection: None,
+        install_url: None,
+        docs_url: None,
+        help_args: &[],
+        capability_flags: &[],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: false,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        auth_probe: None,
+        max_prompt_arg_bytes: Some(30_000),
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
+        build_args: |input| {
+            let mut args = vec!["exec".to_string(), "--auto".to_string()];
+            if let Some(model) = input.options.model.as_deref().filter(|m| *m != "default") {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
+            args.push(input.prompt.to_string());
+            Ok(args)
+        },
+    }
+}
+
+const REASONIX_DESIGN_INSTRUCTIONS: &str = "# OpenDesign integration — MUST follow
+
+You are running inside OpenDesign, a design tool. The user message contains
+design context (system prompt, skill instructions, design system tokens).
+Follow these rules:
+
+1. **Output format**: Wrap your HTML output in <artifact> tags:
+   <artifact>
+   <!DOCTYPE html>
+   <html>...</html>
+   </artifact>
+
+2. **Design system**: The user message includes a design system with colors,
+   typography, spacing, and component patterns. Apply them consistently.
+
+3. **Skill workflow**: The user message includes a skill (SKILL.md) with
+   specific workflow instructions. Follow the skill's steps in order.
+
+4. **No code fences**: Do NOT wrap HTML in ```html code fences.
+   Output raw HTML inside <artifact> tags only.
+
+5. **Single file**: Output a complete, self-contained HTML file with all
+   CSS and JS inline. No external dependencies.
+
+6. **Language**: Match the language of the user's prompt.";
+
+/// Parity: `reasonixAgentDef` (`runtimes/defs/reasonix.ts:46`).
+/// `REASONIX_HOME` resolution is spawn-layer work; the static system-prompt
+/// append is carried here.
+fn reasonix_def() -> AgentDef {
+    AgentDef {
+        id: "reasonix",
+        name: "DeepSeek Reasonix",
+        bin: "reasonix",
+        fallback_bins: &["dsnix"],
+        version_args: &["--version"],
+        stream_format: "acp-json-rpc",
+        event_parser: None,
+        fallback_models: vec![
+            default_model_option(),
+            ModelOption::simple("deepseek-v4-pro", "deepseek-v4-pro"),
+            ModelOption::simple("deepseek-v4-flash", "deepseek-v4-flash"),
+        ],
+        reasoning_options: Vec::new(),
+        prompt_via_stdin: false,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: None,
+        external_mcp_injection: Some("acp-merge"),
+        install_url: Some("https://github.com/esengine/DeepSeek-Reasonix"),
+        docs_url: Some("https://esengine.github.io/DeepSeek-Reasonix/"),
+        help_args: &[],
+        capability_flags: &[],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: false,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        auth_probe: None,
+        max_prompt_arg_bytes: None,
+        mcp_discovery: Some("mature-acp"),
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: Some("map"),
+        version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[("REASONIX_ACP_SYSTEM_APPEND", REASONIX_DESIGN_INSTRUCTIONS)],
+        build_args: |_input| Ok(vec!["acp".to_string()]),
+    }
+}
+
+/// Parity: `piAgentDef` (`runtimes/defs/pi.ts:10`).
+fn pi_def() -> AgentDef {
+    AgentDef {
+        id: "pi",
+        name: "Pi",
+        bin: "pi",
+        fallback_bins: &[],
+        version_args: &["--version"],
+        stream_format: "pi-rpc",
+        event_parser: None,
+        fallback_models: vec![
+            default_model_option(),
+            ModelOption::simple("anthropic/claude-sonnet-4-5", "Claude Sonnet 4.5 (anthropic)"),
+            ModelOption::simple("anthropic/claude-opus-4-5", "Claude Opus 4.5 (anthropic)"),
+            ModelOption::simple("openai/gpt-5", "GPT-5 (openai)"),
+            ModelOption::simple("openai/o4-mini", "o4-mini (openai)"),
+            ModelOption::simple("google/gemini-2.5-pro", "Gemini 2.5 Pro (google)"),
+            ModelOption::simple("google/gemini-2.5-flash", "Gemini 2.5 Flash (google)"),
+        ],
+        reasoning_options: ["default", "off", "minimal", "low", "medium", "high", "xhigh"]
+            .iter()
+            .map(|id| ModelOption::simple(id, match *id {
+                "default" => "Default",
+                "off" => "Off",
+                "minimal" => "Minimal",
+                "low" => "Low",
+                "medium" => "Medium",
+                "high" => "High",
+                "xhigh" => "XHigh",
+                _ => id,
+            }))
+            .collect(),
+        prompt_via_stdin: true,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: true,
+        supports_custom_model: None,
+        external_mcp_injection: None,
+        install_url: None,
+        docs_url: None,
+        help_args: &[],
+        capability_flags: &[],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: false,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        auth_probe: None,
+        max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: Some(15_000),
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
+        build_args: |input| {
+            let mut args = vec!["--mode".to_string(), "rpc".to_string()];
+            if let Some(model) = input.options.model.as_deref().filter(|m| *m != "default") {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
+            if let Some(reasoning) = input.options.reasoning.as_deref().filter(|r| *r != "default") {
+                args.push("--thinking".to_string());
+                args.push(reasoning.to_string());
+            }
+            for dir in input.extra_allowed_dirs.iter().filter(|d| is_absolute_path(d)) {
+                args.push("--append-system-prompt".to_string());
+                args.push(dir.clone());
+            }
+            Ok(args)
+        },
+    }
+}
+
+/// Parity: `parseGrokBuildModels` (grok-build.ts:8).
+pub fn parse_grok_build_models(stdout: &str) -> Vec<ModelOption> {
+    let mut seen = HashSet::new();
+    let mut out = vec![default_model_option()];
+    for raw_line in stdout.lines() {
+        let mut line = raw_line.trim().trim_start_matches(['*', '-']).trim();
+        if let Some(stripped) = line.strip_suffix("(default)") {
+            line = stripped.trim();
+        }
+        let lower = line.to_lowercase();
+        if !lower.starts_with("grok-") {
+            continue;
+        }
+        let rest = &line["grok-".len()..];
+        let mut chars = rest.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphanumeric() => {}
+            _ => continue,
+        }
+        if !rest.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+            continue;
+        }
+        // TS regex is case-insensitive on the whole id; keep the original
+        // spelling but dedupe case-sensitively like the TS Set.
+        if !seen.insert(line.to_string()) {
+            continue;
+        }
+        out.push(ModelOption::simple(line, line));
+    }
+    out
+}
+
+fn grok_model_supports_reasoning_effort(model: Option<&str>) -> bool {
+    match model {
+        None => false,
+        Some(m) if m == "default" || m == "grok-build" => false,
+        Some(m) => m.to_lowercase().contains("reasoning"),
+    }
+}
+
+/// Parity: `grokBuildAgentDef` (`runtimes/defs/grok-build.ts:50`).
+fn grok_build_def() -> AgentDef {
+    AgentDef {
+        id: "grok-build",
+        name: "Grok Build",
+        bin: "grok",
+        fallback_bins: &[],
+        version_args: &["--version"],
+        stream_format: "plain",
+        event_parser: None,
+        fallback_models: vec![
+            default_model_option(),
+            ModelOption::simple("grok-build", "grok-build (xAI · default)"),
+            ModelOption::simple("grok-4.3", "grok-4.3 (xAI)"),
+            ModelOption::simple("grok-4.20-reasoning", "grok-4.20-reasoning (xAI · deep)"),
+            ModelOption::simple("grok-4.20-non-reasoning", "grok-4.20-non-reasoning (xAI · fast)"),
+            ModelOption::simple("grok-4.20-multi-agent", "grok-4.20-multi-agent (xAI · orchestration)"),
+        ],
+        reasoning_options: ["low", "medium", "high", "xhigh", "max"]
+            .iter()
+            .map(|id| ModelOption::simple(id, id))
+            .collect(),
+        prompt_via_stdin: false,
+        prompt_via_file: true,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: None,
+        external_mcp_injection: None,
+        install_url: Some("https://x.ai/cli"),
+        docs_url: Some("https://x.ai/cli"),
+        help_args: &["-p", "--help"],
+        capability_flags: &[],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: false,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        auth_probe: None,
+        max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
+        build_args: |input| {
+            let Some(path) = input.prompt_file_path.filter(|p| !p.is_empty()) else {
+                return Err("grok-build requires runtimeContext.promptFilePath".to_string());
+            };
+            let mut args = vec![
+                "--prompt-file".to_string(),
+                path.to_string(),
+                "--no-plan".to_string(),
+                "--always-approve".to_string(),
+            ];
+            if let Some(model) = input.options.model.as_deref().filter(|m| *m != "default") {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
+            if input.options.reasoning.is_some()
+                && grok_model_supports_reasoning_effort(input.options.model.as_deref())
+            {
+                args.push("--effort".to_string());
+                args.push(input.options.reasoning.clone().unwrap_or_default());
+            }
+            Ok(args)
+        },
+    }
+}
+
+/// Parity: `parseDeepSeekHarnessVersion` (deepseek-harness.ts:44):
+/// optional `v`, three numeric parts, optional prerelease/build metadata.
+pub fn parse_deepseek_harness_version(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let rest = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    let no_build = rest.split('+').next().unwrap_or("");
+    if no_build.contains('+') {
+        return None;
+    }
+    // Split off a single prerelease suffix: numeric core must be exactly N.N.N.
+    let (core, pre) = match no_build.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (no_build, None),
+    };
+    // A prerelease suffix must not contain another bare separator issue:
+    // validate dot-separated identifiers loosely (non-empty, alnum + . -).
+    if let Some(pre) = pre {
+        let main_pre = pre.split('+').next().unwrap_or("");
+        if main_pre.is_empty()
+            || !main_pre.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
+            return None;
+        }
+    }
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3
+        || parts.iter().any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+/// Parity: `deepseekHarnessAgentDef` (`runtimes/defs/deepseek-harness.ts:46`).
+fn deepseek_harness_def() -> AgentDef {
+    AgentDef {
+        id: "deepseek-harness",
+        name: "DeepSeek Harness",
+        bin: "dsh",
+        fallback_bins: &[],
+        version_args: &["--version"],
+        stream_format: "dsh-profile-jsonl",
+        event_parser: None,
+        fallback_models: vec![default_model_option()],
+        reasoning_options: Vec::new(),
+        prompt_via_stdin: true,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: Some(false),
+        external_mcp_injection: None,
+        install_url: None,
+        docs_url: None,
+        help_args: &[],
+        capability_flags: &[],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: true,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        auth_probe: None,
+        max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
+        resumes_session_via_profile_stdio: true,
+        version_policy: Some((
+            &["0.1.0-rc.8", "0.1.1-rc.2", "0.1.2-rc.1"],
+            "^0\\.1\\.\\d+$|^0\\.1\\.0-rc\\.(?:[6-9]|[1-9]\\d+)$|^0\\.1\\.1-rc\\.\\d+$|^0\\.1\\.2-rc\\.\\d+$",
+        )),
+        compatibility_probe: Some((&["--profile", "open-design", "--probe"], 10_000)),
+        env: &[],
+        build_args: |_input| {
+            Ok(vec![
+                "--profile".to_string(),
+                "open-design".to_string(),
+                "--stdio".to_string(),
+            ])
         },
     }
 }
