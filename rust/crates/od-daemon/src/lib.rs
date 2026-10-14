@@ -9,6 +9,7 @@
 //! ([`od_core::RuntimePaths`]).
 
 pub mod agents;
+pub mod agent_auth;
 pub mod auth;
 pub mod chat;
 pub mod connection_test;
