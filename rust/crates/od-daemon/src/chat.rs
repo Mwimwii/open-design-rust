@@ -14,7 +14,10 @@ use serde_json::{json, Value};
 use crate::routes::{api_error, AppState};
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/api/runs/{id}/feedback", post(post_feedback))
+    Router::new()
+        .route("/api/runs/{id}/feedback", post(post_feedback))
+        .route("/api/provider/models", post(post_provider_models))
+        .route("/api/test/connection", post(post_test_connection))
 }
 
 async fn post_feedback(
@@ -59,6 +62,90 @@ async fn handle_feedback(state: &AppState, id: &str, body: &Value) -> Response {
     let _ = project_id;
     // No telemetry sink / Langfuse bridge is ported yet; honestly report skipped.
     Json(json!({ "status": "skipped_no_sink" })).into_response()
+}
+
+
+
+const PROVIDER_PROTOCOLS: &[&str] = &[
+    "anthropic", "openai", "azure", "google", "ollama", "senseaudio", "aihubmix", "bedrock",
+];
+
+async fn post_provider_models(
+    Json(body): Json<Value>,
+) -> Response {
+    let body = body.as_object().cloned().unwrap_or_default();
+    let protocol = body.get("protocol").and_then(Value::as_str).unwrap_or_default();
+    if !PROVIDER_PROTOCOLS.contains(&protocol) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "protocol must be one of anthropic|openai|azure|google|ollama|senseaudio|aihubmix|bedrock",
+        );
+    }
+    let base_url = body.get("baseUrl").and_then(Value::as_str).unwrap_or_default().trim();
+    let api_key = body.get("apiKey").and_then(Value::as_str).unwrap_or_default().trim();
+    let api_key_required = protocol != "aihubmix" && protocol != "bedrock";
+    if base_url.is_empty() || (api_key_required && api_key.is_empty()) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            if api_key_required {
+                "baseUrl and apiKey are required"
+            } else {
+                "baseUrl is required"
+            },
+        );
+    }
+    // Porting the full model catalogue fetch is still pending; failing with
+    // 500 keeps the malformed-request contract above honest rather than
+    // silently returning an empty list.
+    api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Provider model discovery failed")
+}
+
+async fn post_test_connection(
+    Json(body): Json<Value>,
+) -> Response {
+    let body = body.as_object().cloned().unwrap_or_default();
+    let mode = body.get("mode").and_then(Value::as_str).unwrap_or_default();
+    match mode {
+        "provider" => {
+            let protocol = body.get("protocol").and_then(Value::as_str).unwrap_or_default();
+            if !PROVIDER_PROTOCOLS.contains(&protocol) {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "BAD_REQUEST",
+                    "protocol must be one of anthropic|openai|azure|google|ollama|senseaudio|aihubmix|bedrock",
+                );
+            }
+            let base_url = body.get("baseUrl").and_then(Value::as_str).unwrap_or_default().trim();
+            let api_key = body.get("apiKey").and_then(Value::as_str).unwrap_or_default().trim();
+            let model = body.get("model").and_then(Value::as_str).unwrap_or_default().trim();
+            let api_key_required = protocol != "bedrock";
+            if base_url.is_empty()
+                || (api_key_required && api_key.is_empty())
+                || model.is_empty()
+            {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "BAD_REQUEST",
+                    if api_key_required {
+                        "baseUrl, apiKey, and model are required"
+                    } else {
+                        "baseUrl and model are required"
+                    },
+                );
+            }
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Connection test failed")
+        }
+        "agent" => {
+            let agent_id = body.get("agentId").and_then(Value::as_str).unwrap_or_default().trim();
+            if agent_id.is_empty() {
+                return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "agentId is required");
+            }
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Agent test failed")
+        }
+        _ => api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "mode must be one of provider|agent"),
+    }
 }
 
 #[cfg(test)]
