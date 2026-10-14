@@ -144,8 +144,9 @@ pub struct AgentDef {
     /// Parity: `resumesSessionViaProfileStdio`.
     pub resumes_session_via_profile_stdio: bool,
     /// Parity: `versionPolicy` — (supported versions, pattern source).
-    /// Semver evaluation belongs to the detection bead.
     pub version_policy: Option<(&'static [&'static str], &'static str)>,
+    /// Parity: `versionPolicy.requireVersion`.
+    pub version_policy_require_version: bool,
     /// Parity: `compatibilityProbe` argv + timeout. Probe parsing belongs
     /// to the protocol bead.
     pub compatibility_probe: Option<(&'static [&'static str], u64)>,
@@ -523,6 +524,7 @@ fn claude_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -640,6 +642,7 @@ fn codebuddy_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -864,6 +867,7 @@ fn codex_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -1088,6 +1092,7 @@ fn opencode_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -1216,6 +1221,7 @@ fn cursor_agent_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -1286,6 +1292,7 @@ fn copilot_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -1373,6 +1380,7 @@ fn aider_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -1438,6 +1446,7 @@ fn amp_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -1502,6 +1511,7 @@ fn atomcode_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -1569,6 +1579,7 @@ fn devin_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |_input| {
@@ -1628,6 +1639,7 @@ fn qoder_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -1700,6 +1712,7 @@ fn qwen_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -1763,6 +1776,7 @@ fn byok_opencode_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -1831,6 +1845,7 @@ macro_rules! acp_def {
             encode_stdin_prompt: None,
             resumes_session_via_profile_stdio: false,
             version_policy: None,
+        version_policy_require_version: false,
             compatibility_probe: None,
             env: &[],
             build_args: |_input| Ok($argv.iter().map(|s| s.to_string()).collect()),
@@ -1943,6 +1958,7 @@ fn mimo_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -2003,6 +2019,7 @@ fn deepseek_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -2087,6 +2104,7 @@ fn reasonix_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[("REASONIX_ACP_SYSTEM_APPEND", REASONIX_DESIGN_INSTRUCTIONS)],
         build_args: |_input| Ok(vec!["acp".to_string()]),
@@ -2151,6 +2169,7 @@ fn pi_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -2260,6 +2279,7 @@ fn grok_build_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -2361,6 +2381,7 @@ fn deepseek_harness_def() -> AgentDef {
             &["0.1.0-rc.8", "0.1.1-rc.2", "0.1.2-rc.1"],
             "^0\\.1\\.\\d+$|^0\\.1\\.0-rc\\.(?:[6-9]|[1-9]\\d+)$|^0\\.1\\.1-rc\\.\\d+$|^0\\.1\\.2-rc\\.\\d+$",
         )),
+        version_policy_require_version: true,
         compatibility_probe: Some((&["--profile", "open-design", "--probe"], 10_000)),
         env: &[],
         build_args: |_input| {
@@ -2559,6 +2580,7 @@ fn amr_def() -> AgentDef {
         encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |_input| Ok(vec!["agent".to_string(), "run".to_string()]),
@@ -2663,6 +2685,7 @@ fn antigravity_def() -> AgentDef {
         encode_stdin_prompt: Some(encode_antigravity_stdin_prompt),
         resumes_session_via_profile_stdio: false,
         version_policy: None,
+        version_policy_require_version: false,
         compatibility_probe: None,
         env: &[],
         build_args: |input| {
@@ -2688,6 +2711,51 @@ fn antigravity_def() -> AgentDef {
     }
 }
 
+
+/// Whether a probed version is one the daemon stands behind (parity:
+/// `versionIsSupported` + the `requireVersion` gate in detection.ts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionSupport {
+    Supported,
+    /// A version is present but matches neither the exercised list nor the
+    /// declared release line (warn, don't block).
+    Unsupported,
+    /// No version could be probed while the policy requires one (block).
+    VersionMissing,
+}
+
+pub fn version_support(def: &AgentDef, version: Option<&str>) -> VersionSupport {
+    let Some((supported, pattern)) = def.version_policy else {
+        return VersionSupport::Supported;
+    };
+    let Some(version) = version.filter(|v| !v.is_empty()) else {
+        return if def.version_policy_require_version {
+            VersionSupport::VersionMissing
+        } else {
+            VersionSupport::Supported
+        };
+    };
+    if supported.contains(&version) {
+        return VersionSupport::Supported;
+    }
+    match regex::Regex::new(pattern) {
+        Ok(re) if re.is_match(version) => VersionSupport::Supported,
+        _ => VersionSupport::Unsupported,
+    }
+}
+
+/// Apply a def's version `parse` step to a raw first line (parity: the
+/// `versionPolicy.parse` hook; only deepseek-harness declares one).
+pub fn parsed_version(def: &AgentDef, raw_first_line: &str) -> Option<String> {
+    if def.id == "deepseek-harness" {
+        return parse_deepseek_harness_version(raw_first_line);
+    }
+    let trimmed = raw_first_line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
 
 #[cfg(test)]
 mod tests {
@@ -2781,6 +2849,43 @@ mod tests {
         );
         let args = (def.build_args)(&args_input(&caps, &options, &dirs, &ctx, &live)).expect("args");
         assert!(!args.contains(&"--effort".to_string()));
+    }
+
+    #[test]
+    fn version_policy_matches_release_line() {
+        let def = get_agent_def("deepseek-harness").expect("dsh def");
+        assert_eq!(
+            version_support(def, Some("0.1.0-rc.8")),
+            VersionSupport::Supported
+        );
+        assert_eq!(
+            version_support(def, Some("0.1.1-rc.9")),
+            VersionSupport::Supported
+        );
+        assert_eq!(
+            version_support(def, Some("0.1.0-rc.6")),
+            VersionSupport::Supported
+        );
+        assert_eq!(
+            version_support(def, Some("0.1.0-rc.5")),
+            VersionSupport::Unsupported
+        );
+        assert_eq!(
+            version_support(def, Some("0.2.0")),
+            VersionSupport::Unsupported
+        );
+        assert_eq!(version_support(def, None), VersionSupport::VersionMissing);
+        let claude = get_agent_def("claude").expect("claude def");
+        assert_eq!(version_support(claude, None), VersionSupport::Supported);
+        assert_eq!(
+            version_support(claude, Some("whatever")),
+            VersionSupport::Supported
+        );
+        assert_eq!(
+            parsed_version(def, "v0.1.2-rc.1"),
+            Some("0.1.2-rc.1".to_string())
+        );
+        assert_eq!(parsed_version(def, "garbage"), None);
     }
 
     #[test]
