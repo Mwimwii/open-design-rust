@@ -52,6 +52,12 @@ const rerunInfraCancelScriptPath = join(workspaceRoot, ".github", "scripts", "re
 const bakePluginPreviewsWorkflowPath = join(workspaceRoot, ".github", "workflows", "bake-plugin-previews.yml");
 const bakePluginPreviewsPrWorkflowPath = join(workspaceRoot, ".github", "workflows", "bake-plugin-previews-pr.yml");
 const dockerImageWorkflowPath = join(workspaceRoot, ".github", "workflows", "docker-image.yml");
+const releaseStableDockerWorkflowPath = join(
+  workspaceRoot,
+  ".github",
+  "workflows",
+  "release-stable-docker.yml",
+);
 const backportAutomergeWorkflowPath = join(workspaceRoot, ".github", "workflows", "backport-automerge.yml");
 const bakePreviewsAutomergeWorkflowPath = join(
   workspaceRoot,
@@ -438,9 +444,10 @@ describe("packaged smoke workflow", () => {
   });
 
   it("[P2] keeps merge queue as the authoritative post-PR validation path", async () => {
-    const [ciWorkflow, dockerWorkflow, commentWorkflow, autofixWorkflow, reportWorkflow] = await Promise.all([
+    const [ciWorkflow, dockerWorkflow, stableDockerWorkflow, commentWorkflow, autofixWorkflow, reportWorkflow] = await Promise.all([
       readFile(ciWorkflowPath, "utf8"),
       readFile(dockerImageWorkflowPath, "utf8"),
+      readFile(releaseStableDockerWorkflowPath, "utf8"),
       readFile(commentWorkflowPath, "utf8"),
       readFile(autofixWorkflowPath, "utf8"),
       readFile(reportWorkflowPath, "utf8"),
@@ -456,25 +463,35 @@ describe("packaged smoke workflow", () => {
     expect(ciTrigger).not.toContain("push:");
     expect(ciBlobGuard).not.toContain('${{ github.event_name }}" = "push"');
     expect(dockerTrigger).toContain("workflow_call:");
-    expect(dockerTrigger).toContain("tags: ['v*.*.*']");
     expect(dockerTrigger).toContain("pull_request:");
-    // Publish stays tag/call only — no continuous main-branch image push.
+    expect(dockerTrigger).not.toContain("push:");
+    // No continuous main-branch or legacy tag-push image publication.
     expect(dockerTrigger).not.toContain("branches: [main]");
     expect(dockerTrigger).not.toMatch(/push:\s*\n\s*branches:/);
-    // Publish mode must not key only on event_name == workflow_call (caller keeps
-    // its own event name). Release calls pass release_version / publish_latest.
+    // Publish mode is an explicit, paired identity contract. Standalone manual
+    // runs remain smoke-only and the legacy tag-push path cannot bypass it.
     const dockerMode = sectionBetween(dockerWorkflow, "Resolve publish mode", "Set up QEMU");
     expect(dockerMode).toContain("RELEASE_VERSION");
-    expect(dockerMode).toContain("PUBLISH_LATEST");
-    expect(dockerMode).toContain('[ "$EVENT_NAME" = "push" ]');
+    expect(dockerMode).toContain("EXPECTED_REVISION");
     expect(dockerMode).toContain('[ -n "${RELEASE_VERSION:-}" ]');
-    // Shell condition must not treat literal workflow_call as the publish signal.
-    expect(dockerMode).not.toMatch(/\[\s*"\$EVENT_NAME"\s*=\s*"workflow_call"\s*\]/);
+    expect(dockerMode).toContain("release_version and expected_revision must be supplied together");
+    expect(dockerWorkflow).not.toContain("publish_latest");
+    expect(dockerWorkflow).not.toContain("id-token: write");
+    expect(dockerWorkflow).toContain("stable-docker.py image-state");
+    expect(dockerWorkflow).toContain("steps.existing.outputs.state != 'complete'");
     // Smoke-only sha tags must be disabled whenever publish mode is true (release
     // callers are workflow_dispatch with release_version, and would otherwise push
     // manual-sha-* alongside the real version tags).
     expect(dockerWorkflow).toContain("steps.mode.outputs.publish != 'true' && github.event_name == 'pull_request'");
     expect(dockerWorkflow).toContain("steps.mode.outputs.publish != 'true' && github.event_name == 'workflow_dispatch'");
+    expect(stableDockerWorkflow).toContain("group: open-design-release-stable-docker");
+    expect(stableDockerWorkflow).toContain("cancel-in-progress: false");
+    expect(stableDockerWorkflow).toContain("stable/versions/${RELEASE_VERSION}/metadata.json");
+    expect(stableDockerWorkflow).toContain("stable/latest/metadata.json");
+    expect(stableDockerWorkflow).toContain("uses: ./.github/workflows/docker-image.yml");
+    expect(stableDockerWorkflow).toContain("expected_revision: ${{ needs.resolve.outputs.commit }}");
+    expect(stableDockerWorkflow).toContain("docker buildx imagetools create");
+    expect(stableDockerWorkflow).not.toContain("secrets: inherit");
     expect(commentWorkflow).toContain("workflows: [ci]");
     // comment.atom consumes merge_group runs too, so the needs-validation gate can surface a
     // queue-ejection notice on the PR; autofix/report stay pull_request-only trusted consumers.
@@ -1014,6 +1031,35 @@ else { process.stderr.write("unexpected gh call: " + args + "\\n"); process.exit
     expect(workflow).toContain("gh label delete");
   });
 
+  it("[P2] keeps stable publication independent from idempotent Docker reconciliation", async () => {
+    const [stable, docker] = await Promise.all([
+      readFile(releaseStableWorkflowPath, "utf8"),
+      readFile(releaseStableDockerWorkflowPath, "utf8"),
+    ]);
+    const stablePermissions = sectionBetween(stable, "permissions:", "\nconcurrency:");
+    const dispatch = sectionBetween(stable, "  dispatch_stable_docker:", "  cleanup_partial_release_assets:");
+
+    expect(stable).not.toContain("publish_docker_image:");
+    expect(stablePermissions).not.toContain("packages: write");
+    expect(dispatch).toContain("needs.publish.result == 'success'");
+    expect(dispatch).toContain("continue-on-error: true");
+    expect(dispatch).toContain("actions: write");
+    expect(dispatch).toContain("release-stable-docker.yml");
+    expect(dispatch).toContain('-f "release_version=$RELEASE_VERSION"');
+    expect(dispatch).toContain('-f "origin_run_id=$GITHUB_RUN_ID"');
+    expect(dispatch).toContain('-f "origin_run_attempt=$GITHUB_RUN_ATTEMPT"');
+    expect(dispatch).not.toContain("uses: ./.github/workflows/docker-image.yml");
+
+    expect(docker).toContain("workflow_dispatch:");
+    expect(docker).toContain("stable-docker.py resolve");
+    expect(docker).toContain("--allow-version-mismatch");
+    expect(docker).toContain("steps.latest.outputs.is_target_version == 'true'");
+    expect(docker).toContain("steps.current.outputs.action == 'promote'");
+    expect(docker).toContain("steps.current.outputs.action != 'skip-newer'");
+  });
+
+  // This exercises six isolated bash + Node CLI fixtures; process startup alone
+  // can exceed the default Vitest budget on a loaded developer or CI host.
   it("[P2] resolves finalize-release shipped versions from the real workflow shell step", async () => {
     const workflow = await readFile(finalizeReleaseWorkflowPath, "utf8");
     const script = extractWorkflowRunScript(
@@ -1122,7 +1168,7 @@ process.stdin.on("end", () => {
     await expect(runResolve({ event: "workflow_run", ghExit: true })).resolves.toMatchObject({
       output: { skip: "true" },
     });
-  });
+  }, T.long);
 
   it("[P2] bumps only synchronized workspace manifests in finalize-release", async () => {
     const workflow = await readFile(finalizeReleaseWorkflowPath, "utf8");
@@ -2819,6 +2865,43 @@ process.stdin.on("end", () => {
     expect(workflow).toContain("  notify_failure:");
     expect(workflow).toContain("if: ${{ always() && needs.build.result == 'failure' }}");
     expect(workflow).toContain("tools/release/src/notifications/feishu-notice.ts");
+  });
+
+  it.each(["0.24.1", "0.25.0"])("[P1] cuts and pushes a release when main's packaged version is %s", async (mainVersion) => {
+    const workflow = await readFile(cutReleaseWorkflowPath, "utf8");
+    const script = extractWorkflowRunScript(workflow, "Create branch + bump version + push");
+    const dir = await mkdtemp(join(tmpdir(), "od-release-recut-"));
+    const checkout = join(dir, "checkout");
+    const remote = join(dir, "remote.git");
+    const branch = "release/v0.25.0";
+    const env = workflowFixtureEnv({ VERSION: "0.25.0", BRANCH: branch, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" });
+    const git = (args: string[]) => execFileAsync("git", args, { cwd: checkout, env });
+
+    try {
+      await mkdir(join(checkout, "apps", "packaged"), { recursive: true });
+      await writeFile(join(checkout, "apps", "packaged", "package.json"), `${JSON.stringify({ name: "fixture", version: mainVersion }, null, 2)}\n`);
+      await execFileAsync("git", ["init", "--bare", remote], { env });
+      await git(["init", "--initial-branch=main"]);
+      await git(["config", "user.name", "fixture"]);
+      await git(["config", "user.email", "fixture@example.com"]);
+      await git(["add", "."]);
+      await git(["commit", "-m", "main fixture"]);
+      await git(["remote", "add", "origin", remote]);
+      const mainSha = (await git(["rev-parse", "HEAD"])).stdout.trim();
+
+      await execFileAsync("bash", ["-c", script], { cwd: checkout, env });
+
+      const cutSha = (await git(["rev-parse", "HEAD"])).stdout.trim();
+      expect(cutSha).not.toBe(mainSha);
+      expect((await git(["rev-parse", "HEAD^"])).stdout.trim()).toBe(mainSha);
+      expect((await git(["log", "-1", "--format=%an|%s"])).stdout.trim()).toBe("open-design-release-bot[bot]|chore(release): v0.25.0");
+      expect((await git(["ls-remote", "--heads", "origin", branch])).stdout.trim()).toBe(`${cutSha}\trefs/heads/${branch}`);
+      expect(JSON.parse(await readFile(join(checkout, "apps", "packaged", "package.json"), "utf8")).version).toBe("0.25.0");
+      expect((await git(["diff", "--name-only", "HEAD^", "HEAD"])).stdout.trim()).toBe(mainVersion === "0.25.0" ? "" : "apps/packaged/package.json");
+      expect((await git(["status", "--porcelain"])).stdout.trim()).toBe("");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("[P1] skips the scheduled minor cut until the highest release branch is published stable", async () => {

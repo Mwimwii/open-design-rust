@@ -467,9 +467,13 @@ export interface Dict {
   'settings.amrNotSignedIn': string;
   'settings.amrSigningIn': string;
   'settings.amrActivationHint': string;
-  'settings.amrActivationBrowserFailed': string;
+  'settings.amrActivationBrowserFailedTitle': string;
+  'settings.amrActivationBrowserFailedDescription': string;
   'settings.amrActivationOpen': string;
   'settings.amrCancelSignIn': string;
+  'settings.onboardingActivationPrompt': string;
+  'settings.onboardingActivationBrowserFailed': string;
+  'settings.onboardingActivationReopen': string;
   'settings.amrAccountStatus': string;
   'settings.amrConsole': string;
   'settings.amrBalance': string;
@@ -1082,6 +1086,8 @@ export interface Dict {
   'updater.dialogAvailableGeneric': string;
   'updater.dialogAvailableVersion': string;
   'updater.dialogCheckFailed': string;
+  'updater.dialogDownloadFailed': string;
+  'updater.downloadFailedTitle': string;
   'updater.dialogReadyGeneric': string;
   'updater.dialogReadyVersion': string;
   'updater.dialogUnsupported': string;
@@ -1214,6 +1220,7 @@ export interface Dict {
   'entry.navDashboard': string;
   'entry.blankDraftsTitle': string;
   'entry.blankDraftsDescription': string;
+  'entry.projectsLoadFailed': string;
   'entry.blankAllProjectsTitle': string;
   'entry.blankAllProjectsDescription': string;
   'entry.blankCreate': string;
@@ -1250,6 +1257,9 @@ export interface Dict {
   'home.amrGateUnavailable': string;
   'home.bundledScenarioMissing': string;
   'entry.cloudCalloutBody': string;
+  'entry.cloudCreditsTitle': string;
+  'entry.cloudCreditsBody': string;
+  'entry.cloudCreditsCta': string;
   /** Name of the identity row on the local (signed-out) account dock. */
   'entry.localAccountName': string;
   'entry.cloudCalloutDismissAria': string;
@@ -2922,6 +2932,7 @@ export interface Dict {
   'chat.runError.title.sessionExpired': string;
   'chat.runError.title.gitBashMissing': string;
   'chat.runError.title.cpuUnsupported': string;
+  'chat.runError.title.osUnsupported': string;
   'chat.runError.title.cliSessionRefused': string;
   'chat.runError.title.strategyTaskHalted': string;
   'chat.runError.title.agentReplyIncomplete': string;
@@ -2973,6 +2984,7 @@ export interface Dict {
   'chat.runError.sessionExpiredMessage': string;
   'chat.runError.gitBashMissingMessage': string;
   'chat.runError.cpuUnsupportedMessage': string;
+  'chat.runError.osUnsupportedMessage': string;
   'chat.runError.title.agentCrashed': string;
   'chat.runError.agentCrashedMessage': string;
   'chat.runError.title.accountSuspended': string;
@@ -3129,6 +3141,10 @@ export interface Dict {
   'chat.upgrade.balance': string;
   'chat.upgrade.whyLow': string;
   'chat.upgrade.whyOut': string;
+  'chat.upgrade.pausedTitle': string;
+  'chat.upgrade.pausedMessage': string;
+  'chat.upgrade.pausedTeamTitle': string;
+  'chat.upgrade.pausedTeamMessage': string;
   'chat.openFile': string;
   'chat.copyPrompt': string;
   'chat.copyErrorDiagnostic': string;
@@ -3994,6 +4010,18 @@ export interface Dict {
   'fileViewer.versions.countMany': string;
   'fileViewer.versions.current': string;
   'fileViewer.versions.sourceAi': string;
+  'collab.contentUpdate.available': string;
+  'collab.contentUpdate.updating': string;
+  'collab.contentUpdate.askAgain': string;
+  'collab.contentUpdate.title': string;
+  'collab.contentUpdate.description': string;
+  'collab.contentUpdate.dontPrompt': string;
+  'collab.contentUpdate.later': string;
+  'collab.contentUpdate.replace': string;
+  'collab.contentUpdate.failed': string;
+  'collab.contentUpdate.busy': string;
+  'collab.contentUpdate.unsupported': string;
+  'fileViewer.versions.sourceSync': string;
   'fileViewer.versions.sourceManual': string;
   'fileViewer.versions.sourceRestore': string;
   'fileViewer.versions.restoredFrom': string;
@@ -4235,7 +4263,8 @@ export interface Dict {
   'fileViewer.exportSlideProgress': string;
   'fileViewer.exportingElapsed': string;
   'fileViewer.exportSlideEta': string;
-  'fileViewer.exportFailed': string;
+  'fileViewer.exportFailedTitle': string;
+  'fileViewer.exportFailedDescription': string;
   'fileViewer.exportDone': string;
   'fileViewer.exportImageFailed': string;
   'fileViewer.exportImageModalSubtitle': string;
@@ -4429,6 +4458,7 @@ export interface Dict {
   /** Run title while the last turn's question form is still unanswered (OPEND-2744). */
   'assistant.awaitingReplyLabel': string;
   'assistant.canceledLabel': string;
+  'assistant.canceledDetail': string;
   'assistant.copyMarkdown': string;
   /**
    * 回合动作行那颗按钮的名字。**必须和 `chat.newSession` 同字** —— 聊天面板内
@@ -4469,6 +4499,7 @@ export interface Dict {
   'assistant.emptyResponseLabel': string;
   'assistant.emptyResponseMessage': string;
   'assistant.unfinishedLabel': string;
+  'assistant.unfinishedDetail': string;
   'assistant.unfinishedSummary': string;
   'assistant.unfinishedMore': string;
   'assistant.continueRemaining': string;
@@ -4596,6 +4627,8 @@ export interface Dict {
   'chat.edge.reconnecting': string;
   'chat.edge.reconnectingDescription': string;
   'chat.edge.retrying': string;
+  'chat.edge.retryingRateLimitedTitle': string;
+  'chat.edge.retryingRateLimitedDescription': string;
   'qf.visualNext': string;
   'qf.visualPrev': string;
   'qf.visualRandom': string;
