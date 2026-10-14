@@ -3206,7 +3206,7 @@ async fn setup_and_spawn(setup: SpawnSetup) {
             return;
         }
     }
-    pump_child(runs, run_id, handle, stdin_bytes, prompt_file).await;
+    pump_child(runs, run_id, handle, stdin_bytes, prompt_file, def.stream_format).await;
 }
 
 /// Forward the user's external MCP servers to runtimes with a native
@@ -3301,6 +3301,7 @@ async fn pump_child(
     handle: Arc<tokio::sync::Mutex<tokio::process::Child>>,
     stdin_bytes: Option<Vec<u8>>,
     prompt_file: Option<String>,
+    stream_format: &'static str,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     if let Some(bytes) = stdin_bytes {
@@ -3320,7 +3321,41 @@ async fn pump_child(
     let runs_for_out = runs.clone();
     let out_id = run_id.clone();
     let out_task = tokio::spawn(async move {
-        if let Some(stdout) = stdout {
+        if stream_format == "copilot-stream-json" {
+            if let Some(stdout) = stdout {
+                // Copilot's JSONL wire maps onto UI-lane events; anything
+                // else on a line is a bounded raw event.
+                let mut parser = crate::protocol::CopilotParser::new();
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let mut events = Vec::new();
+                    parser.feed(&format!("{line}\n"), &mut |event| events.push(event));
+                    for event in events {
+                        let name = match &event {
+                            crate::protocol::StreamEvent::Status { .. } => "status",
+                            crate::protocol::StreamEvent::ThinkingDelta { .. } => {
+                                "thinking_delta"
+                            }
+                            crate::protocol::StreamEvent::TextDelta { .. } => "text_delta",
+                            crate::protocol::StreamEvent::ToolUse { .. } => "tool_use",
+                            crate::protocol::StreamEvent::ToolResult { .. } => "tool_result",
+                            crate::protocol::StreamEvent::Usage { .. } => "usage",
+                            crate::protocol::StreamEvent::Raw { .. } => "raw",
+                        };
+                        let mut data = event.to_json();
+                        if let serde_json::Value::Object(ref mut map) = data {
+                            map.insert("runId".to_string(), serde_json::json!(out_id));
+                        }
+                        runs_for_out.push_external_event(&out_id, name, data);
+                    }
+                }
+                let mut tail = Vec::new();
+                parser.flush(&mut |event| tail.push(event));
+                for event in tail {
+                    runs_for_out.push_external_event(&out_id, "raw", event.to_json());
+                }
+            }
+        } else if let Some(stdout) = stdout {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 runs_for_out.push_external_event(

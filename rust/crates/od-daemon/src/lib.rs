@@ -26,6 +26,7 @@ pub mod mcp_tokens;
 pub mod migrations;
 pub mod project_dir;
 pub mod proxy;
+pub mod protocol;
 pub mod provider_models;
 pub mod project_files;
 pub mod routes;

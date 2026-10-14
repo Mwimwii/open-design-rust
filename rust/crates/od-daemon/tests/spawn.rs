@@ -35,6 +35,18 @@ fn shim_dir() -> std::path::PathBuf {
         "claude",
         "#!/bin/sh\ncat > /dev/null\nsleep 30\n",
     );
+    // Emits one Copilot JSONL turn, then exits: proves protocol parsing.
+    write_shim(
+        &dir,
+        "copilot",
+        concat!(
+            "#!/bin/sh\n",
+            "cat > /dev/null\n",
+            "echo '{\"type\":\"assistant.message_delta\",\"data\":{\"deltaContent\":\"hey\"}}'\n",
+            "echo '{\"type\":\"result\",\"success\":true}'\n",
+            "exit 0\n",
+        ),
+    );
     dir
 }
 
@@ -232,4 +244,37 @@ async fn live_child_accepts_steer_and_cancel_kills_it() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert_eq!(status, "canceled", "child kill did not cancel the run");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copilot_wire_maps_to_lane_events() {
+    ensure_shim_on_path();
+    let daemon = RunningDaemon::start(config(temp_paths("copilot"))).await.expect("start");
+    let addr = daemon.addr();
+    let (head, body) = post_run(addr, r#"{"agentId":"copilot","prompt":"hi"}"#).await;
+    assert!(head.contains("202"), "head: {head} body: {body}");
+    let run_id: String = serde_json::from_str::<serde_json::Value>(&body)
+        .expect("json")
+        .get("runId")
+        .and_then(|v| v.as_str())
+        .expect("runId")
+        .to_string();
+    let mut status = String::new();
+    for _ in 0..100 {
+        let (_, body) = get_run(addr, &run_id).await;
+        status = serde_json::from_str::<serde_json::Value>(&body)
+            .expect("json")
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if matches!(status.as_str(), "succeeded" | "failed" | "canceled") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(status, "succeeded", "run did not succeed");
+    let (_, events) = get_events(addr, &run_id).await;
+    assert!(events.contains("text_delta"), "events: {events}");
+    assert!(events.contains("hey"), "events: {events}");
 }
