@@ -595,119 +595,6 @@ fn codebuddy_def() -> AgentDef {
         },
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn input(
-        caps: HashMap<String, bool>,
-        options: BuildOptions,
-    ) -> (
-        HashMap<String, bool>,
-        BuildOptions,
-        Vec<String>,
-        AgentContext,
-        LiveModelCache,
-    ) {
-        (
-            caps,
-            options,
-            Vec::new(),
-            AgentContext {
-                platform: "linux".to_string(),
-                ..AgentContext::default()
-            },
-            LiveModelCache::default(),
-        )
-    }
-
-    fn args_input<'a>(
-        caps: &'a HashMap<String, bool>,
-        options: &'a BuildOptions,
-        dirs: &'a [String],
-        context: &'a AgentContext,
-        live: &'a LiveModelCache,
-    ) -> BuildArgsInput<'a> {
-        BuildArgsInput {
-            caps,
-            options,
-            extra_allowed_dirs: dirs,
-            context,
-            live,
-            live_scope: None,
-        }
-    }
-
-    #[test]
-    fn claude_build_args_gate_on_capabilities() {
-        let def = get_agent_def("claude").expect("claude def");
-        let (caps, options, dirs, ctx, live) = input(HashMap::new(), BuildOptions::default());
-        let args = (def.build_args)(&args_input(&caps, &options, &dirs, &ctx, &live)).expect("args");
-        assert_eq!(
-            args,
-            vec![
-                "-p",
-                "--input-format",
-                "stream-json",
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--permission-mode",
-                "bypassPermissions",
-            ]
-        );
-        let mut caps = HashMap::new();
-        caps.insert("partialMessages".to_string(), true);
-        caps.insert("thinkingDisplay".to_string(), true);
-        let (caps, options, dirs, ctx, live) = input(
-            caps,
-            BuildOptions {
-                model: Some("claude-sonnet-5".to_string()),
-                ..BuildOptions::default()
-            },
-        );
-        let args = (def.build_args)(&args_input(&caps, &options, &dirs, &ctx, &live)).expect("args");
-        assert!(args.contains(&"--include-partial-messages".to_string()));
-        assert!(args.contains(&"--thinking-display".to_string()));
-        assert!(args.contains(&"--model".to_string()));
-    }
-
-    #[test]
-    fn codebuddy_default_reasoning_omits_effort_flag() {
-        let def = get_agent_def("codebuddy").expect("codebuddy def");
-        let (caps, options, dirs, ctx, live) = input(
-            HashMap::new(),
-            BuildOptions {
-                reasoning: Some("default".to_string()),
-                ..BuildOptions::default()
-            },
-        );
-        let args = (def.build_args)(&args_input(&caps, &options, &dirs, &ctx, &live)).expect("args");
-        assert!(!args.contains(&"--effort".to_string()));
-    }
-
-    #[test]
-    fn model_helpers_match_typescript() {
-        assert_eq!(sanitize_custom_model(Some("claude-sonnet-5")), Some("claude-sonnet-5".to_string()));
-        assert_eq!(sanitize_custom_model(Some("--evil")), None);
-        assert_eq!(sanitize_custom_model(Some("has space")), None);
-        let def = get_agent_def("claude").expect("claude def");
-        let live = LiveModelCache::default();
-        assert!(is_known_model(def, Some("sonnet"), &live, None));
-        assert!(!is_known_model(def, Some("nope"), &live, None));
-        assert_eq!(
-            clamp_codex_reasoning(Some("gpt-5.1"), Some("xhigh")),
-            Some("high".to_string())
-        );
-        assert_eq!(
-            clamp_codex_reasoning(Some("gpt-5.4"), Some("minimal")),
-            Some("low".to_string())
-        );
-        let models = parse_line_separated_models("a\n# comment\n\na\nb\n");
-        assert_eq!(models.len(), 3);
-    }
-}
 // ---- codex (parity: runtimes/defs/codex.ts, exec-json transport) ----------
 // The app-server transport override (`withCodexTransport`) belongs to the
 // spawn bead: it needs version probing + launch resolution.
@@ -1116,5 +1003,118 @@ fn opencode_def() -> AgentDef {
             }
             Ok(args)
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(
+        caps: HashMap<String, bool>,
+        options: BuildOptions,
+    ) -> (
+        HashMap<String, bool>,
+        BuildOptions,
+        Vec<String>,
+        AgentContext,
+        LiveModelCache,
+    ) {
+        (
+            caps,
+            options,
+            Vec::new(),
+            AgentContext {
+                platform: "linux".to_string(),
+                ..AgentContext::default()
+            },
+            LiveModelCache::default(),
+        )
+    }
+
+    fn args_input<'a>(
+        caps: &'a HashMap<String, bool>,
+        options: &'a BuildOptions,
+        dirs: &'a [String],
+        context: &'a AgentContext,
+        live: &'a LiveModelCache,
+    ) -> BuildArgsInput<'a> {
+        BuildArgsInput {
+            caps,
+            options,
+            extra_allowed_dirs: dirs,
+            context,
+            live,
+            live_scope: None,
+        }
+    }
+
+    #[test]
+    fn claude_build_args_gate_on_capabilities() {
+        let def = get_agent_def("claude").expect("claude def");
+        let (caps, options, dirs, ctx, live) = input(HashMap::new(), BuildOptions::default());
+        let args = (def.build_args)(&args_input(&caps, &options, &dirs, &ctx, &live)).expect("args");
+        assert_eq!(
+            args,
+            vec![
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--permission-mode",
+                "bypassPermissions",
+            ]
+        );
+        let mut caps = HashMap::new();
+        caps.insert("partialMessages".to_string(), true);
+        caps.insert("thinkingDisplay".to_string(), true);
+        let (caps, options, dirs, ctx, live) = input(
+            caps,
+            BuildOptions {
+                model: Some("claude-sonnet-5".to_string()),
+                ..BuildOptions::default()
+            },
+        );
+        let args = (def.build_args)(&args_input(&caps, &options, &dirs, &ctx, &live)).expect("args");
+        assert!(args.contains(&"--include-partial-messages".to_string()));
+        assert!(args.contains(&"--thinking-display".to_string()));
+        assert!(args.contains(&"--model".to_string()));
+    }
+
+    #[test]
+    fn codebuddy_default_reasoning_omits_effort_flag() {
+        let def = get_agent_def("codebuddy").expect("codebuddy def");
+        let (caps, options, dirs, ctx, live) = input(
+            HashMap::new(),
+            BuildOptions {
+                reasoning: Some("default".to_string()),
+                ..BuildOptions::default()
+            },
+        );
+        let args = (def.build_args)(&args_input(&caps, &options, &dirs, &ctx, &live)).expect("args");
+        assert!(!args.contains(&"--effort".to_string()));
+    }
+
+    #[test]
+    fn model_helpers_match_typescript() {
+        assert_eq!(sanitize_custom_model(Some("claude-sonnet-5")), Some("claude-sonnet-5".to_string()));
+        assert_eq!(sanitize_custom_model(Some("--evil")), None);
+        assert_eq!(sanitize_custom_model(Some("has space")), None);
+        let def = get_agent_def("claude").expect("claude def");
+        let live = LiveModelCache::default();
+        assert!(is_known_model(def, Some("sonnet"), &live, None));
+        assert!(!is_known_model(def, Some("nope"), &live, None));
+        assert_eq!(
+            clamp_codex_reasoning(Some("gpt-5.1"), Some("xhigh")),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            clamp_codex_reasoning(Some("gpt-5.4"), Some("minimal")),
+            Some("low".to_string())
+        );
+        let models = parse_line_separated_models("a\n# comment\n\na\nb\n");
+        assert_eq!(models.len(), 3);
     }
 }
