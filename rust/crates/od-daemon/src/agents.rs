@@ -2444,7 +2444,7 @@ fn normalize_known_vela_version_id(raw_id: &str) -> Option<String> {
 
 fn split_numeric_tail(rest: &str) -> Option<(String, String, String)> {
     // `<major><sep><minor><suffix>` where sep is `_` or `-`.
-    let sep_pos = rest.find(|c| c == '_' || c == '-')?;
+    let sep_pos = rest.find(|c| ['_', '-'].contains(&c))?;
     let major = rest[..sep_pos].to_string();
     let tail = &rest[sep_pos + 1..];
     let minor_len = tail.chars().take_while(|c| c.is_ascii_digit()).count();
