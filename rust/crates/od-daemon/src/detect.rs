@@ -161,6 +161,34 @@ pub async fn probe_hidden_capabilities(
     caps
 }
 
+/// Probe the capability map for an already-resolved binary (help scan
+/// plus the Claude hidden-flag probe). Shared by [`detect_agent`] and the
+/// run spawn path, which resolves synchronously and probes async.
+pub async fn probe_caps(
+    def: &crate::agents::AgentDef,
+    bin_path: &Path,
+    env_extra: &HashMap<String, String>,
+) -> HashMap<String, bool> {
+    let mut caps = probe_capabilities(def, bin_path, env_extra, Duration::from_millis(5_000))
+        .await
+        .unwrap_or_default();
+    // Claude Code's hidden `--thinking-display` flag (parity: the
+    // `hiddenCapabilityFlags` block on the TS def, kept inline here until
+    // the per-def hidden-flag table is ported).
+    if def.id == "claude" {
+        let hidden = probe_hidden_capabilities(
+            &["-p"],
+            &[("--thinking-display", "thinkingDisplay")],
+            bin_path,
+            env_extra,
+            Duration::from_millis(5_000),
+        )
+        .await;
+        caps.extend(hidden);
+    }
+    caps
+}
+
 /// The detected state of one agent: resolved binary, version line, and
 /// capability map (parity: the per-agent detection result).
 #[derive(Debug, Clone)]
@@ -180,23 +208,7 @@ pub async fn detect_agent(
     let probe_timeout =
         Duration::from_millis(def.version_probe_timeout_ms.unwrap_or(5_000));
     let version = probe_version(bin_path.as_path(), def.version_args, env_extra, probe_timeout).await;
-    let mut caps = probe_capabilities(def, bin_path.as_path(), env_extra, Duration::from_millis(5_000))
-        .await
-        .unwrap_or_default();
-    // Claude Code's hidden `--thinking-display` flag (parity: the
-    // `hiddenCapabilityFlags` block on the TS def, kept inline here until
-    // the per-def hidden-flag table is ported).
-    if def.id == "claude" {
-        let hidden = probe_hidden_capabilities(
-            &["-p"],
-            &[("--thinking-display", "thinkingDisplay")],
-            bin_path.as_path(),
-            env_extra,
-            Duration::from_millis(5_000),
-        )
-        .await;
-        caps.extend(hidden);
-    }
+    let caps = probe_caps(def, bin_path.as_path(), env_extra).await;
     Some(DetectedAgent {
         bin_path,
         version,

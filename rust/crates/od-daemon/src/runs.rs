@@ -1553,13 +1553,27 @@ impl Runs {
             )
         };
         let def = agents::get_agent_def(&agent_id).expect("def checked above");
-    inject_external_mcp(def, cwd.as_deref(), data_dir);
+        inject_external_mcp(def, cwd.as_deref(), data_dir);
         if let Err(message) = spawn::check_prompt_budget(def, prompt.len()) {
             self.fail_spawn(run_id, &message);
             return;
         }
-        // Capability probing and the spawn itself run off the request path:
-        // probes cost bounded child spawns that must not block the 202.
+        // Binary resolution is synchronous filesystem work: a missing
+        // binary fails the run deterministically before the 202 returns
+        // (parity: the `startChatRun` guard). Capability probing and the
+        // spawn itself run off the request path — probes cost bounded
+        // child spawns that must not block the 202.
+        let launch = crate::launch::resolve_agent_launch(def, &HashMap::new());
+        if launch.launch_path.is_none() {
+            self.fail_spawn(
+                run_id,
+                &format!(
+                    "agent binary not found: Agent {:?} (`{}`) is not installed or not on PATH. Install it and refresh the agent list (GET /api/agents) before retrying.",
+                    def.name, def.bin
+                ),
+            );
+            return;
+        }
         let setup = SpawnSetup {
             runs: self.clone(),
             run_id: run_id.to_string(),
@@ -1571,6 +1585,8 @@ impl Runs {
             project_id,
             cwd,
             data_dir: data_dir.to_path_buf(),
+            configured_env: HashMap::new(),
+            launch,
         };
         tokio::spawn(async move {
             setup_and_spawn(setup).await;
@@ -3065,6 +3081,8 @@ struct SpawnSetup {
     project_id: Option<String>,
     cwd: Option<String>,
     data_dir: std::path::PathBuf,
+    configured_env: HashMap<String, String>,
+    launch: crate::launch::AgentLaunch,
 }
 
 async fn setup_and_spawn(setup: SpawnSetup) {
@@ -3079,26 +3097,18 @@ async fn setup_and_spawn(setup: SpawnSetup) {
         project_id,
         cwd,
         data_dir,
+        configured_env,
+        launch,
     } = setup;
     let def = agents::get_agent_def(&agent_id).expect("def checked above");
-    let detected = crate::detect::detect_agent(def, &HashMap::new()).await;
-    let caps = detected.as_ref().map(|d| d.caps.clone()).unwrap_or_default();
-    let bin_path = match detected {
-        Some(detected) => detected.bin_path,
-        None => match spawn::resolve_bin(def.bin, def.fallback_bins) {
-            Some(path) => path,
-            None => {
-                runs.fail_spawn(
-                    &run_id,
-                    &format!(
-                        "agent binary not found: Agent {:?} (`{}`) is not installed or not on PATH. Install it and refresh the agent list (GET /api/agents) before retrying.",
-                        def.name, def.bin
-                    ),
-                );
-                return;
-            }
-        },
+    let bin_path = match launch.launch_path.clone() {
+        Some(path) => path,
+        None => {
+            runs.fail_spawn(&run_id, "agent launch resolved no binary");
+            return;
+        }
     };
+    let caps = crate::detect::probe_caps(def, &bin_path, &configured_env).await;
     // Prompt-file adapters need the staged path before argv is final.
     let prompt_file: Option<String> = if def.prompt_via_file {
         match stage_prompt_file(&run_id, &prompt) {
@@ -3148,6 +3158,18 @@ async fn setup_and_spawn(setup: SpawnSetup) {
         project_id.as_deref(),
         cwd.as_deref(),
     );
+    if !launch.child_path_prepend.is_empty() {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.to_string_lossy().into_owned()));
+        let with_path = crate::launch::apply_agent_launch_env(
+            env_extra,
+            &launch.child_path_prepend,
+            exe_dir.as_deref(),
+            &crate::launch::user_toolchain_bin_dirs(&configured_env),
+        );
+        env_extra = with_path;
+    }
     let mut allowed_dirs = vec![cwd.clone().unwrap_or_default()];
     allowed_dirs.extend(dirs.clone());
     if let Some((key, content)) = mcp_env_config_content(def, &data_dir, &allowed_dirs) {
