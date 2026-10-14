@@ -69,6 +69,12 @@ pub struct AgentContext {
     pub has_prior_assistant_turn: bool,
     pub platform: String,
     pub env: HashMap<String, String>,
+    /// Parity: `RuntimeContext.agentLogFilePath`.
+    pub agent_log_file_path: Option<String>,
+    /// Parity: `RuntimeContext.antigravitySettingsPath` (test override).
+    pub antigravity_settings_path: Option<String>,
+    /// Home directory for adapters resolving `~/` paths.
+    pub home_dir: Option<String>,
 }
 
 /// Input to every `build_args` implementation.
@@ -131,6 +137,10 @@ pub struct AgentDef {
     pub acp_mcp_env_format: Option<&'static str>,
     /// Parity: `versionProbeTimeoutMs`.
     pub version_probe_timeout_ms: Option<u64>,
+    /// Parity: `resumesSessionViaAcpLoad`.
+    pub resumes_session_via_acp_load: bool,
+    /// Parity: `encodeStdinPrompt` — whole-prompt stdin encoding.
+    pub encode_stdin_prompt: Option<fn(&str) -> String>,
     /// Parity: `resumesSessionViaProfileStdio`.
     pub resumes_session_via_profile_stdio: bool,
     /// Parity: `versionPolicy` — (supported versions, pattern source).
@@ -179,6 +189,8 @@ fn shipped_defs() -> Vec<AgentDef> {
         pi_def(),
         grok_build_def(),
         deepseek_harness_def(),
+        amr_def(),
+        antigravity_def(),
     ]
 }
 
@@ -507,6 +519,8 @@ fn claude_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -622,6 +636,8 @@ fn codebuddy_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -844,6 +860,8 @@ fn codex_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -1066,6 +1084,8 @@ fn opencode_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -1192,6 +1212,8 @@ fn cursor_agent_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -1260,6 +1282,8 @@ fn copilot_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -1345,6 +1369,8 @@ fn aider_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -1408,6 +1434,8 @@ fn amp_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -1470,6 +1498,8 @@ fn atomcode_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -1535,6 +1565,8 @@ fn devin_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -1592,6 +1624,8 @@ fn qoder_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -1662,6 +1696,8 @@ fn qwen_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -1723,6 +1759,8 @@ fn byok_opencode_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -1789,6 +1827,8 @@ macro_rules! acp_def {
             acp_stdio_mcp_removed_in_version: $stdio_removed,
             acp_mcp_env_format: None,
             version_probe_timeout_ms: $probe_timeout,
+            resumes_session_via_acp_load: false,
+            encode_stdin_prompt: None,
             resumes_session_via_profile_stdio: false,
             version_policy: None,
             compatibility_probe: None,
@@ -1899,6 +1939,8 @@ fn mimo_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -1957,6 +1999,8 @@ fn deepseek_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -2039,6 +2083,8 @@ fn reasonix_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: Some("map"),
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -2101,6 +2147,8 @@ fn pi_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: Some(15_000),
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -2208,6 +2256,8 @@ fn grok_build_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: false,
         version_policy: None,
         compatibility_probe: None,
@@ -2304,6 +2354,8 @@ fn deepseek_harness_def() -> AgentDef {
         acp_stdio_mcp_removed_in_version: None,
         acp_mcp_env_format: None,
         version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: None,
         resumes_session_via_profile_stdio: true,
         version_policy: Some((
             &["0.1.0-rc.8", "0.1.1-rc.2", "0.1.2-rc.1"],
@@ -2320,6 +2372,322 @@ fn deepseek_harness_def() -> AgentDef {
         },
     }
 }
+
+// ---- amr + antigravity (parity: runtimes/defs/amr.ts, antigravity.ts) -----
+// `parseVelaModelJson` (price metadata) and all live `fetchModels` probing
+// belong to the detection bead.
+
+/// Parity: `normalizeVelaModelId` (amr.ts:48).
+pub fn normalize_vela_model_id(raw_id: &str) -> Option<String> {
+    let trimmed = raw_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_provider = trimmed.strip_prefix("vela/").unwrap_or(trimmed);
+    let without_prefix = without_provider.strip_prefix("public_model_").unwrap_or(without_provider);
+    if without_prefix.is_empty() {
+        return None;
+    }
+    let lower = without_prefix.to_lowercase();
+    if lower == "deepseek_v3_2" || lower == "deepseek-v3-2" {
+        return Some("deepseek-v3.2".to_string());
+    }
+    if lower == "kimi_k2_6" {
+        return Some("kimi-k2.6".to_string());
+    }
+    if lower == "kimi_k2_7_code" {
+        return Some("kimi-k2.7-code".to_string());
+    }
+    if lower == "glm_5_1" {
+        return Some("glm-5.1".to_string());
+    }
+    if lower == "glm_5" {
+        return Some("glm-5".to_string());
+    }
+    if let Some(versioned) = normalize_known_vela_version_id(without_prefix) {
+        return Some(versioned);
+    }
+    Some(without_prefix.replace('_', "-"))
+}
+
+fn normalize_known_vela_version_id(raw_id: &str) -> Option<String> {
+    let lower = raw_id.to_lowercase();
+    // claude_<family>_<major>_<minor><suffix>
+    for prefix in ["claude_haiku", "claude_opus", "claude_sonnet", "claude-haiku", "claude-opus", "claude-sonnet"] {
+        let sep = if prefix.contains('_') { '_' } else { '-' };
+        if lower.starts_with(prefix) {
+            let rest = &raw_id[prefix.len()..];
+            let rest = rest.strip_prefix(sep).or_else(|| rest.strip_prefix(if sep == '_' { '-' } else { '_' }))?;
+            let (major, minor, suffix) = split_numeric_tail(rest)?;
+            let family = prefix.replace('-', "_").replace("claude_", "");
+            return Some(format!("claude-{family}-{major}.{minor}{}", suffix.replace('_', "-")));
+        }
+    }
+    for (name, dash) in [("gpt", "gpt"), ("gemini", "gemini")] {
+        for sep in ['_', '-'] {
+            if lower.starts_with(&format!("{name}{sep}")) {
+                let rest = &raw_id[name.len() + 1..];
+                let (major, minor, suffix) = split_numeric_tail(rest)?;
+                return Some(format!("{dash}-{major}.{minor}{}", suffix.replace('_', "-")));
+            }
+        }
+    }
+    for sep in ['_', '-'] {
+        if lower.starts_with(&format!("minimax{sep}m")) {
+            let rest = &raw_id[8..];
+            let (major, minor, suffix) = split_numeric_tail(rest)?;
+            return Some(format!("minimax-m{major}.{minor}{}", suffix.replace('_', "-")));
+        }
+    }
+    None
+}
+
+fn split_numeric_tail(rest: &str) -> Option<(String, String, String)> {
+    // `<major><sep><minor><suffix>` where sep is `_` or `-`.
+    let sep_pos = rest.find(|c| c == '_' || c == '-')?;
+    let major = rest[..sep_pos].to_string();
+    let tail = &rest[sep_pos + 1..];
+    let minor_len = tail.chars().take_while(|c| c.is_ascii_digit()).count();
+    if major.is_empty() || !major.chars().all(|c| c.is_ascii_digit()) || minor_len == 0 {
+        return None;
+    }
+    let minor = tail[..minor_len].to_string();
+    let suffix = tail[minor_len..].to_string();
+    Some((major, minor, suffix))
+}
+
+/// Parity: `isVelaChatCapableModelId` (amr.ts:107).
+pub fn is_vela_chat_capable_model_id(model_id: &str) -> bool {
+    let id = normalize_vela_model_id(model_id)
+        .unwrap_or_else(|| model_id.trim().to_string())
+        .to_lowercase();
+    for prefix in [
+        "gpt-image-",
+        "nano-banana-",
+        "seedream-",
+        "seedance-",
+        "doubao-seedance-",
+        "veo-",
+        "imagen-",
+    ] {
+        if id.starts_with(prefix) {
+            return false;
+        }
+    }
+    true
+}
+
+fn order_amr_chat_models(mut models: Vec<ModelOption>) -> Vec<ModelOption> {
+    // Preferred ids first (stable), the rest by id — parity with the TS
+    // comparator except for locale collation (byte order here).
+    let rank = |id: &str| match id {
+        "deepseek-v4-flash" => 0,
+        "deepseek-v4-pro" => 1,
+        _ => 2,
+    };
+    models.sort_by(|a, b| {
+        rank(&a.id).cmp(&rank(&b.id)).then_with(|| {
+            if rank(&a.id) == 2 {
+                a.id.cmp(&b.id)
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+    });
+    models
+}
+
+/// Parity: `parseVelaModels` (amr.ts:117, line-based form).
+pub fn parse_vela_models(stdout: &str) -> Vec<ModelOption> {
+    let mut seen = std::collections::HashSet::new();
+    let mut models = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let raw_id = trimmed.split_whitespace().next().unwrap_or("");
+        if raw_id.is_empty() {
+            continue;
+        }
+        let Some(id) = normalize_vela_model_id(raw_id) else {
+            continue;
+        };
+        if !seen.insert(id.clone()) || !is_vela_chat_capable_model_id(&id) {
+            continue;
+        }
+        models.push(ModelOption::simple(&id, &id));
+    }
+    order_amr_chat_models(models)
+}
+
+/// Parity: `amrAgentDef` (`runtimes/defs/amr.ts:667`).
+fn amr_def() -> AgentDef {
+    AgentDef {
+        id: "amr",
+        name: "AMR",
+        bin: "vela",
+        fallback_bins: &[],
+        version_args: &["--version"],
+        stream_format: "acp-json-rpc",
+        event_parser: None,
+        fallback_models: Vec::new(),
+        reasoning_options: Vec::new(),
+        prompt_via_stdin: false,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: true,
+        supports_custom_model: Some(false),
+        external_mcp_injection: None,
+        install_url: None,
+        docs_url: None,
+        help_args: &[],
+        capability_flags: &[],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: false,
+        default_model_env_var: Some("VELA_DEFAULT_MODEL"),
+        inactivity_timeout_ms: Some(30 * 60 * 1000),
+        first_output_timeout_ms: Some(2 * 60 * 1000),
+        auth_probe: None,
+        max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: true,
+        encode_stdin_prompt: None,
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
+        build_args: |_input| Ok(vec!["agent".to_string(), "run".to_string()]),
+    }
+}
+
+// ---- antigravity (parity: runtimes/defs/antigravity.ts) --------------------
+
+/// Parity: `encodeAntigravityStdinPrompt` (antigravity.ts:37).
+pub fn encode_antigravity_stdin_prompt(prompt: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({ "event": "user", "message": { "content": prompt } })
+    )
+}
+
+/// Parity: `writeAntigravityModelSelection` (antigravity.ts:68). Returns the
+/// path written so callers can assert on it in tests.
+pub fn write_antigravity_model_selection(
+    label: &str,
+    settings_path: Option<&str>,
+    home_dir: Option<&str>,
+) -> std::io::Result<std::path::PathBuf> {
+    let path = match settings_path.filter(|p| !p.is_empty()) {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            let home = home_dir
+                .map(str::to_string)
+                .or_else(|| std::env::var("HOME").ok())
+                .unwrap_or_default();
+            std::path::Path::new(&home)
+                .join(".gemini")
+                .join("antigravity-cli")
+                .join("settings.json")
+        }
+    };
+    let mut existing: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    existing.insert(
+        "model".to_string(),
+        serde_json::Value::String(label.to_string()),
+    );
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(
+        &path,
+        format!("{}\n", serde_json::Value::Object(existing)),
+    )?;
+    Ok(path)
+}
+
+/// Parity: `antigravityAgentDef` (`runtimes/defs/antigravity.ts:196`).
+fn antigravity_def() -> AgentDef {
+    AgentDef {
+        id: "antigravity",
+        name: "Antigravity",
+        bin: "agy",
+        fallback_bins: &[],
+        version_args: &["--version"],
+        stream_format: "json-event-stream",
+        event_parser: Some("antigravity"),
+        fallback_models: vec![
+            default_model_option(),
+            ModelOption::simple("Gemini 3.1 Pro (High)", "Gemini 3.1 Pro (High)"),
+            ModelOption::simple("Gemini 3.1 Pro (Low)", "Gemini 3.1 Pro (Low)"),
+            ModelOption::simple("Gemini 3.5 Flash (High)", "Gemini 3.5 Flash (High)"),
+            ModelOption::simple("Gemini 3.5 Flash (Medium)", "Gemini 3.5 Flash (Medium)"),
+            ModelOption::simple("Gemini 3.5 Flash (Low)", "Gemini 3.5 Flash (Low)"),
+            ModelOption::simple("Claude Sonnet 4.6 (Thinking)", "Claude Sonnet 4.6 (Thinking)"),
+            ModelOption::simple("Claude Opus 4.6 (Thinking)", "Claude Opus 4.6 (Thinking)"),
+            ModelOption::simple("GPT-OSS 120B (Medium)", "GPT-OSS 120B (Medium)"),
+        ],
+        reasoning_options: Vec::new(),
+        prompt_via_stdin: true,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: Some(false),
+        external_mcp_injection: None,
+        install_url: Some("https://antigravity.google/cli"),
+        docs_url: Some("https://antigravity.google/docs/cli-overview"),
+        help_args: &["--help"],
+        capability_flags: &[("--dangerously-skip-permissions", "skipPermissions")],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: false,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        auth_probe: None,
+        max_prompt_arg_bytes: None,
+        mcp_discovery: None,
+        acp_turn_end_completes_prompt: false,
+        acp_stdio_mcp_removed_in_version: None,
+        acp_mcp_env_format: None,
+        version_probe_timeout_ms: None,
+        resumes_session_via_acp_load: false,
+        encode_stdin_prompt: Some(encode_antigravity_stdin_prompt),
+        resumes_session_via_profile_stdio: false,
+        version_policy: None,
+        compatibility_probe: None,
+        env: &[],
+        build_args: |input| {
+            if let Some(model) = input.options.model.as_deref().filter(|m| *m != "default") {
+                let settings = input.context.antigravity_settings_path.as_deref();
+                write_antigravity_model_selection(model, settings, input.context.home_dir.as_deref())
+                    .map_err(|e| e.to_string())?;
+            }
+            let mut args = Vec::new();
+            if let Some(log) = input.context.agent_log_file_path.as_deref().filter(|l| !l.is_empty()) {
+                args.push("--log-file".to_string());
+                args.push(log.to_string());
+            }
+            if input.caps.get("skipPermissions") == Some(&true) {
+                args.push("--dangerously-skip-permissions".to_string());
+            }
+            args.push("--input-format".to_string());
+            args.push("stream-json".to_string());
+            args.push("--output-format".to_string());
+            args.push("stream-json".to_string());
+            Ok(args)
+        },
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
