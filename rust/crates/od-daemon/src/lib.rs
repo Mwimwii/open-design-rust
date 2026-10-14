@@ -8,6 +8,7 @@
 //! daemon-owned data derives from the resolved `OD_DATA_DIR`
 //! ([`od_core::RuntimePaths`]).
 
+pub mod agents;
 pub mod auth;
 pub mod chat;
 pub mod connection_test;
