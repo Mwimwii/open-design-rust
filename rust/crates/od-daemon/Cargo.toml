@@ -21,11 +21,12 @@ serde_json.workspace = true
 rand.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tokio-stream = "0.1"
 tokio.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json","stream"] }
 tracing-subscriber.workspace = true
 # WHATWG URL parsing/serialization for MCP server URLs (parity: `new URL`
 # in apps/daemon/src/mcp-config.ts). Already in the workspace lockfile via
