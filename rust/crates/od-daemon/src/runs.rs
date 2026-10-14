@@ -1553,6 +1553,7 @@ impl Runs {
             )
         };
         let def = agents::get_agent_def(&agent_id).expect("def checked above");
+    inject_external_mcp(def, cwd.as_deref(), data_dir);
         if let Err(message) = spawn::check_prompt_budget(def, prompt.len()) {
             self.fail_spawn(run_id, &message);
             return;
@@ -3141,12 +3142,17 @@ async fn setup_and_spawn(setup: SpawnSetup) {
         }
     };
     let stdin_piped = def.prompt_via_stdin;
-    let env_extra = spawn::agent_env(
+    let mut env_extra = spawn::agent_env(
         &data_dir,
         def,
         project_id.as_deref(),
         cwd.as_deref(),
     );
+    let mut allowed_dirs = vec![cwd.clone().unwrap_or_default()];
+    allowed_dirs.extend(dirs.clone());
+    if let Some((key, content)) = mcp_env_config_content(def, &data_dir, &allowed_dirs) {
+        env_extra.insert(key, content);
+    }
     let spawned = match spawn::spawn_child(
         &bin_path,
         &argv,
@@ -3179,6 +3185,79 @@ async fn setup_and_spawn(setup: SpawnSetup) {
         }
     }
     pump_child(runs, run_id, handle, stdin_bytes, prompt_file).await;
+}
+
+/// Forward the user's external MCP servers to runtimes with a native
+/// transport for it (parity: the spawn-time injection in `server.ts`).
+/// Failures are best-effort: injection must never fail a run on its own.
+fn inject_external_mcp(
+    def: &agents::AgentDef,
+    cwd: Option<&str>,
+    data_dir: &std::path::Path,
+) {
+    let strategy = def.external_mcp_injection.unwrap_or("");
+    if strategy != "claude-mcp-json"
+        && strategy != "opencode-env-content"
+        && strategy != "mimo-env-content"
+    {
+        return;
+    }
+    // acp-merge needs the ACP session layer (protocol bead).
+    let config = match crate::mcp::read_mcp_config(data_dir) {
+        Ok(config) => config,
+        Err(_) => return,
+    };
+    if !config.servers.iter().any(|s| s.enabled) {
+        return;
+    }
+    let tokens: std::collections::HashMap<String, String> =
+        match crate::mcp_tokens::read_all_tokens(data_dir) {
+            Ok(tokens) => tokens
+                .into_iter()
+                .map(|(id, token)| (id, token.access_token))
+                .collect(),
+            Err(_) => std::collections::HashMap::new(),
+        };
+    if strategy != "claude-mcp-json" {
+        return;
+    }
+    let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
+        return;
+    };
+    let projects_dir = data_dir.join("projects");
+    if !crate::mcp_inject::is_managed_project_cwd(Some(cwd), &projects_dir) {
+        return;
+    }
+    let payload = crate::mcp_inject::build_claude_mcp_json(&config.servers, &tokens);
+    let _ = crate::mcp_inject::sync_claude_mcp_json(std::path::Path::new(cwd), payload.as_ref());
+}
+
+/// Inline MCP config for the env-var strategies (`opencode-env-content`
+/// → `OPENCODE_CONFIG_CONTENT`, `mimo-env-content` →
+/// `MIMOCODE_CONFIG_CONTENT`). `None` means "leave the env untouched".
+fn mcp_env_config_content(
+    def: &agents::AgentDef,
+    data_dir: &std::path::Path,
+    allowed_directories: &[String],
+) -> Option<(String, String)> {
+    let key = match def.external_mcp_injection {
+        Some("opencode-env-content") => "OPENCODE_CONFIG_CONTENT",
+        Some("mimo-env-content") => "MIMOCODE_CONFIG_CONTENT",
+        _ => return None,
+    };
+    let config = crate::mcp::read_mcp_config(data_dir).ok()?;
+    let tokens: std::collections::HashMap<String, String> =
+        crate::mcp_tokens::read_all_tokens(data_dir)
+            .ok()?
+            .into_iter()
+            .map(|(id, token)| (id, token.access_token))
+            .collect();
+    let content = crate::mcp_inject::build_env_config_content(
+        &config.servers,
+        &tokens,
+        allowed_directories,
+    )?;
+    Some((key.to_string(), content))
 }
 
 /// Stage the composed prompt in a temp file for file-prompt adapters
