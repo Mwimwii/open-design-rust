@@ -79,6 +79,12 @@ pub struct BuildArgsInput<'a> {
     pub context: &'a AgentContext,
     pub live: &'a LiveModelCache,
     pub live_scope: Option<&'a str>,
+    /// The composed prompt text (only read by argv-prompt adapters).
+    pub prompt: &'a str,
+    /// Daemon-created temp file holding the prompt (file-prompt adapters).
+    pub prompt_file_path: Option<&'a str>,
+    /// Image attachment paths (adapters that forward them as flags).
+    pub image_paths: &'a [String],
 }
 
 /// Parity: `RuntimeAgentDef` (`runtimes/types.ts:145`) — static subset.
@@ -113,6 +119,8 @@ pub struct AgentDef {
     pub first_output_timeout_ms: Option<u64>,
     /// Parity: `authProbe` — (argv, timeout_ms).
     pub auth_probe: Option<(&'static [&'static str], u64)>,
+    /// Parity: `maxPromptArgBytes`.
+    pub max_prompt_arg_bytes: Option<usize>,
     pub build_args: fn(&BuildArgsInput) -> Result<Vec<String>, String>,
 }
 
@@ -131,6 +139,13 @@ fn shipped_defs() -> Vec<AgentDef> {
         opencode_def(),
         cursor_agent_def(),
         copilot_def(),
+        aider_def(),
+        amp_def(),
+        atomcode_def(),
+        devin_def(),
+        qoder_def(),
+        qwen_def(),
+        byok_opencode_def(),
     ]
 }
 
@@ -453,6 +468,7 @@ fn claude_def() -> AgentDef {
         inactivity_timeout_ms: None,
         first_output_timeout_ms: None,
         auth_probe: Some((&["auth", "status"], 5000)),
+        max_prompt_arg_bytes: None,
         build_args: |input| {
             let caps = input.caps;
             let mut args = vec![
@@ -558,6 +574,7 @@ fn codebuddy_def() -> AgentDef {
         inactivity_timeout_ms: None,
         first_output_timeout_ms: None,
         auth_probe: None,
+        max_prompt_arg_bytes: None,
         build_args: |input| {
             let caps = input.caps;
             let mut args = vec![
@@ -770,6 +787,7 @@ fn codex_def() -> AgentDef {
         inactivity_timeout_ms: None,
         first_output_timeout_ms: None,
         auth_probe: Some((&["login", "status"], 5000)),
+        max_prompt_arg_bytes: None,
         build_args: |input| {
             let ctx = input.context;
             let needs_danger = codex_needs_danger_full_access(&ctx.platform, &ctx.env);
@@ -982,6 +1000,7 @@ fn opencode_def() -> AgentDef {
         inactivity_timeout_ms: None,
         first_output_timeout_ms: None,
         auth_probe: None,
+        max_prompt_arg_bytes: None,
         build_args: |input| {
             let mut args = vec!["run".to_string(), "--format".to_string(), "json".to_string()];
             if input.caps.get("skipPermissions") == Some(&true) {
@@ -1098,6 +1117,7 @@ fn cursor_agent_def() -> AgentDef {
         inactivity_timeout_ms: None,
         first_output_timeout_ms: None,
         auth_probe: Some((&["status"], 5000)),
+        max_prompt_arg_bytes: None,
         build_args: |input| {
             let mut args = vec![
                 "--print".to_string(),
@@ -1156,6 +1176,7 @@ fn copilot_def() -> AgentDef {
         inactivity_timeout_ms: Some(30 * 60 * 1000),
         first_output_timeout_ms: None,
         auth_probe: None,
+        max_prompt_arg_bytes: None,
         build_args: |input| {
             let mut args = vec![
                 "--allow-all-tools".to_string(),
@@ -1169,6 +1190,405 @@ fn copilot_def() -> AgentDef {
             for dir in non_empty_dirs(input.extra_allowed_dirs) {
                 args.push("--add-dir".to_string());
                 args.push(dir.clone());
+            }
+            Ok(args)
+        },
+    }
+}
+
+
+// ---- small adapters batch -------------------------------------------------
+// Parity sources: runtimes/defs/aider.ts, amp.ts, atomcode.ts, devin.ts,
+// qoder.ts, qwen.ts, byok-opencode.ts.
+
+/// Node `path.isAbsolute` spelling for both platforms (TS filters
+/// extra dirs/attachments to absolute paths before forwarding).
+fn is_absolute_path(path: &str) -> bool {
+    if path.starts_with('/') {
+        return true;
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+    path.starts_with("\\\\")
+}
+
+/// Parity: `aiderAgentDef` (`runtimes/defs/aider.ts:6`).
+fn aider_def() -> AgentDef {
+    AgentDef {
+        id: "aider",
+        name: "Aider",
+        bin: "aider",
+        fallback_bins: &[],
+        version_args: &["--version"],
+        stream_format: "plain",
+        event_parser: None,
+        fallback_models: vec![
+            default_model_option(),
+            ModelOption::simple("sonnet", "sonnet"),
+            ModelOption::simple("gpt-4o", "gpt-4o"),
+            ModelOption::simple("deepseek/deepseek-chat", "deepseek/deepseek-chat"),
+            ModelOption::simple("gemini/gemini-2.0-flash", "gemini/gemini-2.0-flash"),
+        ],
+        reasoning_options: Vec::new(),
+        prompt_via_stdin: false,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: None,
+        external_mcp_injection: None,
+        install_url: Some("https://aider.chat/docs/install.html"),
+        docs_url: Some("https://aider.chat"),
+        help_args: &[],
+        capability_flags: &[],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: false,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        auth_probe: None,
+        max_prompt_arg_bytes: Some(30_000),
+        build_args: |input| {
+            let mut args = vec![
+                "--yes-always".to_string(),
+                "--no-pretty".to_string(),
+                "--no-git".to_string(),
+                "--no-auto-commits".to_string(),
+                "--no-suggest-shell-commands".to_string(),
+                "--no-show-model-warnings".to_string(),
+            ];
+            if let Some(model) = input.options.model.as_deref().filter(|m| *m != "default") {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
+            args.push("--message".to_string());
+            args.push(input.prompt.to_string());
+            Ok(args)
+        },
+    }
+}
+
+/// Parity: `ampAgentDef` (`runtimes/defs/amp.ts:40`).
+fn amp_def() -> AgentDef {
+    AgentDef {
+        id: "amp",
+        name: "Amp",
+        bin: "amp",
+        fallback_bins: &[],
+        version_args: &["--version"],
+        stream_format: "claude-stream-json",
+        event_parser: None,
+        fallback_models: vec![
+            default_model_option(),
+            ModelOption::simple("smart", "Smart (mode)"),
+            ModelOption::simple("deep", "Deep (mode)"),
+            ModelOption::simple("rush", "Rush (mode)"),
+        ],
+        reasoning_options: Vec::new(),
+        prompt_via_stdin: true,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: Some(false),
+        external_mcp_injection: None,
+        install_url: None,
+        docs_url: None,
+        help_args: &[],
+        capability_flags: &[],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: false,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        auth_probe: None,
+        max_prompt_arg_bytes: None,
+        build_args: |input| {
+            let mut args = vec![
+                "-x".to_string(),
+                "--stream-json".to_string(),
+                "--dangerously-allow-all".to_string(),
+            ];
+            if let Some(mode) = input.options.model.as_deref().filter(|m| *m != "default") {
+                if matches!(mode, "deep" | "smart" | "rush") {
+                    args.push("--mode".to_string());
+                    args.push(mode.to_string());
+                }
+            }
+            Ok(args)
+        },
+    }
+}
+
+/// Parity: `atomcodeAgentDef` (`runtimes/defs/atomcode.ts:37`).
+fn atomcode_def() -> AgentDef {
+    AgentDef {
+        id: "atomcode",
+        name: "AtomCode CLI",
+        bin: "atomcode",
+        fallback_bins: &[],
+        version_args: &["--version"],
+        stream_format: "plain",
+        event_parser: None,
+        fallback_models: vec![
+            default_model_option(),
+            ModelOption::simple("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+            ModelOption::simple("claude-sonnet-4-5", "Claude Sonnet 4.5"),
+            ModelOption::simple("gpt-5.2", "GPT-5.2"),
+            ModelOption::simple("glm-5.2", "GLM-5.2"),
+            ModelOption::simple("deepseek-v4", "DeepSeek V4"),
+        ],
+        reasoning_options: Vec::new(),
+        prompt_via_stdin: false,
+        prompt_via_file: true,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: None,
+        external_mcp_injection: None,
+        install_url: Some("https://atomcode.atomgit.com/docs/en/quickstart.html"),
+        docs_url: Some("https://atomcode.atomgit.com/docs/en/index.html"),
+        help_args: &[],
+        capability_flags: &[],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: false,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        auth_probe: None,
+        max_prompt_arg_bytes: None,
+        build_args: |input| {
+            let Some(path) = input.prompt_file_path.filter(|p| !p.is_empty()) else {
+                return Err("atomcode requires runtimeContext.promptFilePath".to_string());
+            };
+            let mut args = vec![
+                "--prompt-file".to_string(),
+                path.to_string(),
+                "-y".to_string(),
+            ];
+            if let Some(model) = input.options.model.as_deref().filter(|m| *m != "default") {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
+            Ok(args)
+        },
+    }
+}
+
+/// Parity: `devinAgentDef` (`runtimes/defs/devin.ts:5`).
+fn devin_def() -> AgentDef {
+    AgentDef {
+        id: "devin",
+        name: "Devin for Terminal",
+        bin: "devin",
+        fallback_bins: &[],
+        version_args: &["--version"],
+        stream_format: "acp-json-rpc",
+        event_parser: None,
+        fallback_models: vec![
+            default_model_option(),
+            ModelOption::simple("adaptive", "adaptive"),
+            ModelOption::simple("swe", "swe"),
+            ModelOption::simple("opus", "opus"),
+            ModelOption::simple("sonnet", "sonnet"),
+            ModelOption::simple("codex", "codex"),
+            ModelOption::simple("gpt", "gpt"),
+            ModelOption::simple("gemini", "gemini"),
+        ],
+        reasoning_options: Vec::new(),
+        prompt_via_stdin: false,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: None,
+        external_mcp_injection: Some("acp-merge"),
+        install_url: None,
+        docs_url: None,
+        help_args: &[],
+        capability_flags: &[],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: false,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        auth_probe: None,
+        max_prompt_arg_bytes: None,
+        build_args: |_input| {
+            Ok(vec![
+                "--permission-mode".to_string(),
+                "dangerous".to_string(),
+                "--respect-workspace-trust".to_string(),
+                "false".to_string(),
+                "acp".to_string(),
+            ])
+        },
+    }
+}
+
+/// Parity: `qoderAgentDef` (`runtimes/defs/qoder.ts:6`).
+fn qoder_def() -> AgentDef {
+    AgentDef {
+        id: "qoder",
+        name: "Qoder CLI",
+        bin: "qodercli",
+        fallback_bins: &[],
+        version_args: &["--version"],
+        stream_format: "qoder-stream-json",
+        event_parser: None,
+        fallback_models: vec![
+            default_model_option(),
+            ModelOption::simple("lite", "Lite"),
+            ModelOption::simple("efficient", "Efficient"),
+            ModelOption::simple("auto", "Auto"),
+            ModelOption::simple("performance", "Performance"),
+            ModelOption::simple("ultimate", "Ultimate"),
+        ],
+        reasoning_options: Vec::new(),
+        prompt_via_stdin: true,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: None,
+        external_mcp_injection: None,
+        install_url: None,
+        docs_url: None,
+        help_args: &[],
+        capability_flags: &[],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: false,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        auth_probe: None,
+        max_prompt_arg_bytes: None,
+        build_args: |input| {
+            let mut args = vec![
+                "-p".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--yolo".to_string(),
+            ];
+            if let Some(cwd) = input.context.cwd.as_deref().filter(|c| !c.is_empty()) {
+                args.push("-w".to_string());
+                args.push(cwd.to_string());
+            }
+            if let Some(model) = input.options.model.as_deref().filter(|m| *m != "default") {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
+            for dir in input.extra_allowed_dirs.iter().filter(|d| is_absolute_path(d)) {
+                args.push("--add-dir".to_string());
+                args.push(dir.clone());
+            }
+            for path in input.image_paths.iter().filter(|p| is_absolute_path(p)) {
+                args.push("--attachment".to_string());
+                args.push(path.clone());
+            }
+            Ok(args)
+        },
+    }
+}
+
+/// Parity: `qwenAgentDef` (`runtimes/defs/qwen.ts:21`).
+fn qwen_def() -> AgentDef {
+    AgentDef {
+        id: "qwen",
+        name: "Qwen Code",
+        bin: "qwen",
+        fallback_bins: &[],
+        version_args: &["--version"],
+        stream_format: "plain",
+        event_parser: None,
+        fallback_models: vec![
+            default_model_option(),
+            ModelOption::simple("qwen3-coder-plus", "qwen3-coder-plus"),
+            ModelOption::simple("qwen3-coder-flash", "qwen3-coder-flash"),
+        ],
+        reasoning_options: Vec::new(),
+        prompt_via_stdin: true,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: None,
+        external_mcp_injection: None,
+        install_url: None,
+        docs_url: None,
+        help_args: &[],
+        capability_flags: &[],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: false,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        auth_probe: None,
+        max_prompt_arg_bytes: None,
+        build_args: |input| {
+            let mut args = vec!["--yolo".to_string()];
+            if let Some(model) = input.options.model.as_deref().filter(|m| *m != "default") {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
+            Ok(args)
+        },
+    }
+}
+
+/// Parity: `opencodeByokModelId` (`runtimes/byok-opencode.ts:35`).
+pub fn opencode_byok_model_id(model: Option<&str>) -> Option<String> {
+    let trimmed = model.unwrap_or_default().trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+        return None;
+    }
+    if trimmed.starts_with("open-design-byok/") {
+        return Some(trimmed.to_string());
+    }
+    Some(format!("open-design-byok/{trimmed}"))
+}
+
+/// Parity: `byokOpenCodeAgentDef` (`runtimes/defs/byok-opencode.ts:11`).
+fn byok_opencode_def() -> AgentDef {
+    AgentDef {
+        id: "byok-opencode",
+        name: "BYOK OpenCode",
+        bin: "opencode-cli",
+        fallback_bins: &["opencode"],
+        version_args: &["--version"],
+        stream_format: "json-event-stream",
+        event_parser: Some("opencode"),
+        fallback_models: vec![default_model_option()],
+        reasoning_options: Vec::new(),
+        prompt_via_stdin: true,
+        prompt_via_file: false,
+        prompt_input_format: None,
+        supports_image_paths: false,
+        supports_custom_model: Some(true),
+        external_mcp_injection: Some("opencode-env-content"),
+        install_url: None,
+        docs_url: None,
+        help_args: &["run", "--help"],
+        capability_flags: &[("--dangerously-skip-permissions", "skipPermissions")],
+        resumes_session_via_cli: false,
+        captures_session_id_from_stream: false,
+        default_model_env_var: None,
+        inactivity_timeout_ms: None,
+        first_output_timeout_ms: None,
+        auth_probe: None,
+        max_prompt_arg_bytes: None,
+        build_args: |input| {
+            let mut args = vec!["run".to_string(), "--format".to_string(), "json".to_string()];
+            if let Some(cwd) = input.context.cwd.as_deref().filter(|c| !c.is_empty()) {
+                args.push("--dir".to_string());
+                args.push(cwd.to_string());
+            }
+            if input.caps.get("skipPermissions") == Some(&true) {
+                args.push("--dangerously-skip-permissions".to_string());
+            }
+            if let Some(model) = opencode_byok_model_id(input.options.model.as_deref()) {
+                args.push("-m".to_string());
+                args.push(model);
             }
             Ok(args)
         },
@@ -1215,6 +1635,9 @@ mod tests {
             context,
             live,
             live_scope: None,
+            prompt: "",
+            prompt_file_path: None,
+            image_paths: &[],
         }
     }
 
