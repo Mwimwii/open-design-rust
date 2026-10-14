@@ -18,6 +18,12 @@ pub fn router() -> Router<AppState> {
         .route("/api/runs/{id}/feedback", post(post_feedback))
         .route("/api/provider/models", post(post_provider_models))
         .route("/api/test/connection", post(post_test_connection))
+        .route("/api/proxy/anthropic/stream", post(proxy_stream_not_implemented))
+        .route("/api/proxy/openai/stream", post(proxy_stream_not_implemented))
+        .route("/api/proxy/azure/stream", post(proxy_stream_not_implemented))
+        .route("/api/proxy/google/stream", post(proxy_stream_not_implemented))
+        .route("/api/proxy/ollama/stream", post(proxy_stream_not_implemented))
+        .route("/api/proxy/{provider}/stream", post(proxy_stream_not_implemented))
 }
 
 async fn post_feedback(
@@ -146,6 +152,16 @@ async fn post_test_connection(
         }
         _ => api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "mode must be one of provider|agent"),
     }
+}
+
+
+
+async fn proxy_stream_not_implemented() -> Response {
+    api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "INTERNAL",
+        "BYOK proxy streaming is not yet ported to the Rust daemon",
+    )
 }
 
 #[cfg(test)]
