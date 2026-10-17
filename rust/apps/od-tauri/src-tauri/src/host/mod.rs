@@ -25,6 +25,7 @@
 pub mod bridge;
 pub mod capture;
 pub mod desktop_auth;
+pub mod diagnostics;
 pub mod misc;
 pub mod pdf;
 pub mod project;
