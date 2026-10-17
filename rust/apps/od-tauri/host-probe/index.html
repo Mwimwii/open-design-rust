@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>od host probe</title>
+    <style>
+      body { font: 15px/1.5 monospace; padding: 28px; background: #fff; color: #111; }
+      h1 { font: 600 18px/1.3 sans-serif; margin: 0 0 16px; }
+      pre { white-space: pre-wrap; margin: 0; }
+    </style>
+  </head>
+  <body>
+    <h1>OpenDesign host-bridge probe (served by the embedded Rust daemon)</h1>
+    <p>
+      A fixture for the headless shell check documented in
+      <code>rust/README.md</code>. Point <code>OD_WEB_DIST_DIR</code> at this
+      directory and run <code>cargo run -p od-tauri</code>; the window renders
+      the facts below, which prove the <code>__od__</code> bridge and the
+      remote-origin IPC grant actually reached the page — not just that the
+      process started.
+    </p>
+    <pre id="out">running…</pre>
+    <script>
+      // Reads only public surfaces: the injected `__od__` global and Tauri's own
+      // `__TAURI_INTERNALS__.invoke`. No app-relative path is used, so the fixture
+      // works when the daemon serves it from any dist directory.
+      (async () => {
+        const lines = [];
+        const p = (k, v) => lines.push(k + ': ' + v);
+        p('location.origin', location.origin);
+        p('window.__TAURI_INTERNALS__', !!window.__TAURI_INTERNALS__);
+        p('typeof window.__od__', typeof window.__od__);
+        const od = window.__od__;
+        if (od) {
+          p('__od__.version', od.version);
+          p('__od__.client', JSON.stringify(od.client));
+          // Every group `isOpenDesignHostBridge` validates, so a missing command
+          // shows up as `undefined` here rather than at the first real use.
+          p('__od__.shell.openExternal', typeof od.shell?.openExternal);
+          p('__od__.shell.openPath', typeof od.shell?.openPath);
+          p('__od__.browser.clearData', typeof od.browser?.clearData);
+          p('__od__.capture.page', typeof od.capture?.page);
+          p('__od__.project.pickWorkingDir', typeof od.project?.pickWorkingDir);
+          p('__od__.project.pickAndImport', typeof od.project?.pickAndImport);
+          p('__od__.pdf.print', typeof od.pdf?.print);
+          p('__od__.pet.setVisible', typeof od.pet?.setVisible);
+          p('__od__.updater.check', typeof od.updater?.check);
+        }
+        // A real round trip, so the ACL is exercised and not merely declared:
+        // these three commands are granted to the daemon origin in
+        // `capabilities/default.json`.
+        for (const cmd of ['app_version', 'daemon_health', 'daemon_info']) {
+          try {
+            const value = await window.__TAURI_INTERNALS__.invoke(cmd);
+            p('invoke ' + cmd, JSON.stringify(value));
+          } catch (error) {
+            p('invoke ' + cmd + ' ERROR', String(error));
+          }
+        }
+        document.getElementById('out').textContent = lines.join('\n');
+      })();
+    </script>
+  </body>
+</html>

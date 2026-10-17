@@ -94,7 +94,14 @@ DISPLAY=:99 import -window root /tmp/shell.png   # screenshot
 Point `OD_WEB_DIST_DIR` at a directory holding an `index.html` that reports
 facts back to a local HTTP listener (its `location.origin`, whether
 `window.__TAURI_INTERNALS__` exists, the result of an `invoke`) to observe what
-the window actually loaded.
+the window actually loaded. `apps/od-tauri/host-probe/` is that fixture: it
+renders the injected `__od__` version and client, the presence of every bridge
+method group, and three real `invoke` round trips, so a screenshot is enough
+evidence that the bridge and the remote-origin ACL reached the page.
+
+```sh
+DISPLAY=:99 OD_WEB_DIST_DIR=$PWD/apps/od-tauri/host-probe cargo run -p od-tauri
+```
 
 ## Data directory
 
