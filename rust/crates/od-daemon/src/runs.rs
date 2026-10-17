@@ -3283,28 +3283,18 @@ fn mcp_env_config_content(
 }
 
 /// Map one parsed lane event onto the run's SSE feed.
+///
+/// Parity: the TS daemon emits every parser event as `send('agent', payload)`,
+/// so the SSE event name is always `agent` and the payload carries its own
+/// `type`. `apps/web` (`providers/daemon.ts`) switches on `event.event ===
+/// 'agent'` and reads `event.data.type`; naming the frame after the type
+/// (`event: text_delta`) makes the renderer skip the frame entirely.
 fn push_lane_event(runs: &Runs, run_id: &str, event: crate::protocol::StreamEvent) {
-    use crate::protocol::StreamEvent;
-    let name = match &event {
-        StreamEvent::Status { .. } => "status",
-        StreamEvent::ThinkingDelta { .. } => "thinking_delta",
-        StreamEvent::TextDelta { .. } => "text_delta",
-        StreamEvent::ToolUse { .. } => "tool_use",
-        StreamEvent::ToolResult { .. } => "tool_result",
-        StreamEvent::Usage { .. } => "usage",
-        StreamEvent::Raw { .. } => "raw",
-        StreamEvent::TurnEnd { .. } => "turn_end",
-        StreamEvent::ThinkingStart => "thinking_start",
-        StreamEvent::ThinkingTokens { .. } => "thinking_tokens",
-        StreamEvent::ToolInputDelta { .. } => "tool_input_delta",
-        StreamEvent::RequestUsage { .. } => "request_usage",
-        StreamEvent::Error { .. } => "error",
-    };
     let mut data = event.to_json();
     if let serde_json::Value::Object(ref mut map) = data {
         map.insert("runId".to_string(), serde_json::json!(run_id));
     }
-    runs.push_external_event(run_id, name, data);
+    runs.push_external_event(run_id, "agent", data);
 }
 
 fn push_lane_events(

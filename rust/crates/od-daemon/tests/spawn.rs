@@ -284,4 +284,11 @@ async fn copilot_wire_maps_to_lane_events() {
     let (_, events) = get_events(addr, &run_id).await;
     assert!(events.contains("text_delta"), "events: {events}");
     assert!(events.contains("hey"), "events: {events}");
+    // Parity: parser events ride the `agent` SSE lane with their `type` in the
+    // payload (apps/web switches on `event.event === 'agent'`). Naming the frame
+    // after the type (`event: text_delta`) is dropped by the renderer.
+    assert!(
+        events.contains("event: agent"),
+        "lane events must use the agent SSE name: {events}"
+    );
 }
