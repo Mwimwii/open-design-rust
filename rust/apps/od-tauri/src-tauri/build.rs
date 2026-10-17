@@ -1,4 +1,15 @@
 fn main() {
+    // `bundle.resources` maps `../web-export` to `<resource_dir>/web`, and
+    // `tauri-build` canonicalizes that source on every `cargo build` — before
+    // any bundle step runs. A fresh checkout has no `web-export/` (it is
+    // git-ignored and staged by `npm run build:web`), so a clean-clone
+    // `cargo build --workspace` would fail at canonicalize. Create it here,
+    // before `tauri_build`, so the mapping is always resolvable; an empty
+    // directory simply copies nothing and the shell falls back to the
+    // checkout's `apps/web/out`.
+    let web_export = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../web-export");
+    std::fs::create_dir_all(&web_export).expect("failed to create web-export staging dir");
+
     // The shell window is a remote origin: it loads the loopback daemon, which
     // serves the apps/web export. Tauri refuses app commands to remote origins
     // unless the app declares an ACL manifest for them, so without this every

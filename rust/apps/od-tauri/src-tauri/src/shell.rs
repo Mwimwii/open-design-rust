@@ -150,12 +150,12 @@ fn dev_url() -> Option<Url> {
 /// `apps/daemon/src/server.ts`). Resolution order:
 ///
 /// 1. `OD_WEB_DIST_DIR` — explicit override (dev, ops, tests).
-/// 2. `<resource_dir>/web` — where the packaged bundle is expected to place
-///    the export. Nothing wires this yet: `bundle.resources` is validated at
-///    compile time, so pointing it at the `npm run build:web` output would
-///    make a fresh-clone `cargo build --workspace` fail until the web app has
-///    been built. Packaging (which owns that copy) tracks this.
-/// 3. `../dist` next to this crate — the `npm run build:web` output.
+/// 2. `<resource_dir>/web` — the packaged location. `bundle.resources` maps
+///    `../web-export` here and `build.rs` keeps that source dir present so a
+///    clean-clone `cargo build` works; `npm run build:web` stages the export
+///    into `web-export/`, and `tauri-build` copies it to `<resource_dir>/web`
+///    on every build, so this is what a bundled app and `tauri dev` both take.
+/// 3. `../dist` next to this crate — legacy manual staging location.
 /// 4. the source checkout's `apps/web/out` — a repo build of the web app, so
 ///    `cargo run` needs no copy step.
 ///

@@ -1,5 +1,6 @@
 target/
 apps/od-tauri/node_modules/
-# `npm run build:web` copies the apps/web static export here; it is a build
-# output, embedded into the binary and shipped as the `web` bundle resource.
-apps/od-tauri/dist/
+# `npm run build:web` copies the apps/web static export here; `tauri-build`
+# embeds it into the binary and ships it as the `web` bundle resource.
+# `build.rs` recreates the empty directory before every `cargo build`.
+apps/od-tauri/web-export/

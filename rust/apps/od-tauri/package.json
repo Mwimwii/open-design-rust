@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "build:web": "cd ../../.. && corepack pnpm --filter @open-design/web build && rm -rf rust/apps/od-tauri/dist && cp -r apps/web/out rust/apps/od-tauri/dist",
+    "build:web": "cd ../../.. && corepack pnpm --filter @open-design/web build && rm -rf rust/apps/od-tauri/web-export && cp -r apps/web/out rust/apps/od-tauri/web-export",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build --no-bundle"
