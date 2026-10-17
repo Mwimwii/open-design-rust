@@ -56,7 +56,7 @@ pub struct PlainStreamArtifact {
 /// `char::is_whitespace` — see the module docblock.
 const JS_WS: &str = r"[\t\n\x0B\x0C\r \u{00A0}\u{1680}\u{2000}-\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}]";
 
-fn js_whitespace(ch: char) -> bool {
+pub(crate) fn js_whitespace(ch: char) -> bool {
     matches!(
         ch,
         '\t' | '\n'

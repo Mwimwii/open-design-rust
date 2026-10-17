@@ -105,6 +105,7 @@ async fn post_provider_models(
 }
 
 async fn post_test_connection(
+    State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Response {
     let body = body.as_object().cloned().unwrap_or_default();
@@ -146,7 +147,27 @@ async fn post_test_connection(
             if agent_id.is_empty() {
                 return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "agentId is required");
             }
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Agent test failed")
+            let request = crate::agent_connection::AgentConnectionRequest {
+                agent_id: agent_id.to_string(),
+                model: body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                reasoning: body
+                    .get("reasoning")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                service_tier: body
+                    .get("serviceTier")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                agent_cli_env: body.get("agentCliEnv").cloned(),
+            };
+            let probe = crate::agent_connection::SpawnAgentProbe::from_process_env(
+                state.config.paths.data_dir().to_path_buf(),
+            );
+            let result = crate::agent_connection::test_agent_connection(&probe, &request).await;
+            Json(result).into_response()
         }
         _ => api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "mode must be one of provider|agent"),
     }

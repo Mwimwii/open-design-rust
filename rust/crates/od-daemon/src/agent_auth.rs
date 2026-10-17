@@ -1,10 +1,7 @@
 //! Agent authentication probing — Rust parity port of
 //! `apps/daemon/src/runtimes/auth.ts` (guidance strings, failure-text
-//! predicates, `classifyAgentAuthFailure`, and `probeAgentAuthStatus`).
-//!
-//! Deferred to a follow-up: `classifyAgentServiceFailure` and
-//! `reportsToolPrincipalAuthFailure` (the STATUS_CTX attribution
-//! machinery), which feed run-failure classification rather than probing.
+//! predicates, `classifyAgentAuthFailure`, `classifyAgentServiceFailure`,
+//! `reportsToolPrincipalAuthFailure`, and `probeAgentAuthStatus`).
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -47,6 +44,10 @@ pub fn deepseek_harness_auth_guidance() -> &'static str {
 
 pub fn antigravity_auth_guidance() -> &'static str {
     "Antigravity needs to sign in. The agy CLI's keyring entry has expired or been cleared, and `-p` print mode cannot complete OAuth on its own (it has no field to paste the auth code into).\n\nFix: open a terminal and run `agy` once — it will open Google sign-in in your browser, accept the redirect, and store the token in your system keyring. After you finish, return here and retry this chat. You only need to do this once; the keyring entry persists across both terminal and OpenDesign runs."
+}
+
+pub fn antigravity_quota_guidance() -> &'static str {
+    "Antigravity returned \"RESOURCE_EXHAUSTED: Individual quota reached\" for the current model. Each Antigravity model (Gemini 3 Pro / Flash, Claude 4.6, GPT-OSS) has its own quota.\n\nFix: open `agy` in a terminal and use its Switch Model picker (the menu at the bottom of the TUI) to pick a model with available quota, then retry here. OpenDesign uses whatever model you pick in agy's TUI when the Settings model picker is left on \"Default\". Quotas reset automatically on Antigravity's schedule."
 }
 
 pub fn reasonix_auth_guidance() -> &'static str {
@@ -265,6 +266,274 @@ pub fn normalize_deepseek_harness_failure(
     (code, message, auth_required)
 }
 
+// ---- service-failure classification (parity: auth.ts STATUS_CTX block) ------
+
+/// Model-service failure classes that map a CLI agent's raw error text to a
+/// structured API error code (parity: `AgentServiceFailureCode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentServiceFailureCode {
+    AgentAuthRequired,
+    RateLimited,
+    UpstreamUnavailable,
+}
+
+impl AgentServiceFailureCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentServiceFailureCode::AgentAuthRequired => "AGENT_AUTH_REQUIRED",
+            AgentServiceFailureCode::RateLimited => "RATE_LIMITED",
+            AgentServiceFailureCode::UpstreamUnavailable => "UPSTREAM_UNAVAILABLE",
+        }
+    }
+}
+
+/// A bare HTTP status number is too noisy to trust on its own — agent stderr
+/// is full of unrelated numbers (`line 500`, `read 502 bytes`, `exit code
+/// 401`). Only treat one as a signal when it carries explicit HTTP-status
+/// context. `code` alone is NOT enough; it only counts when qualified
+/// (status/error/response code) or immediately followed by `:`/`=`/`#`.
+///
+/// The TS source writes `\bcode(?=\s*[:=#])`; `regex` has no lookahead, so the
+/// separator is consumed here instead (`\bcode\s*[:=#]`), which is equivalent
+/// because the whole context is followed by `[\s:=#-]*` anyway.
+const STATUS_CTX: &str = concat!(
+    r"(?:\bhttp(?:[ /]?[0-9](?:\.[0-9])?)?\b",
+    r"|\b(?:status|error|response)(?:[ _-]?code)?\b",
+    r"|\bcode\s*[:=#]",
+    r"|\b(?:server|http)[ _-]?error\b)",
+    r"[\s:=#-]*"
+);
+
+/// Parity: `AGENT_AUTH_FAILURE_RE` — a missing, invalid, or expired credential.
+fn agent_auth_failure_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&format!(
+            concat!(
+                r"(?i)(\b(unauthor(?:ized|ised)|authenticat(?:e|ed|ion)",
+                r"|invalid[ _-]?(?:api[ _-]?)?key|incorrect api key|no api key|x-api-key",
+                r"|missing[ _-]?credentials?|not (?:authenticated|logged[ _-]?in)",
+                r"|please (?:sign|log)[ _-]?in|oauth token (?:has )?expired|session expired",
+                r"|credentials? (?:are )?(?:missing|invalid|required))\b",
+                r"|/login\b|{}401\b)"
+            ),
+            STATUS_CTX
+        ))
+        .expect("agent auth failure regex")
+    })
+}
+
+/// Parity: `AGENT_RATE_FAILURE_RE` — quota / rate limit / billing balance.
+fn agent_rate_failure_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&format!(
+            concat!(
+                r"(?i)(\b(rate[ _-]?limit|too many requests|quota",
+                r"|insufficient[ _-]?(?:quota|balance|credit|funds)",
+                r"|credit balance is too low|exceeded your current quota|usage limit",
+                r"|session limit|limit reached|billing (?:hard )?limit)\b",
+                r"|{}429\b)"
+            ),
+            STATUS_CTX
+        ))
+        .expect("agent rate failure regex")
+    })
+}
+
+/// Parity: `AGENT_UPSTREAM_FAILURE_RE` — overloaded / 5xx / unavailable.
+fn agent_upstream_failure_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&format!(
+            concat!(
+                r"(?i)(\b(overloaded(?:_error)?|service (?:is )?(?:temporarily )?unavailable",
+                r"|bad gateway|gateway timeout|internal server error",
+                r"|upstream (?:error|unavailable)|provider (?:error|unavailable)",
+                r"|temporarily unavailable|model is currently overloaded|5xx)\b",
+                r"|{}5[0-9][0-9]\b",
+                r"|\b5[0-9][0-9]\s+(?:bad gateway|service unavailable|internal server error|gateway timeout))"
+            ),
+            STATUS_CTX
+        ))
+        .expect("agent upstream failure regex")
+    })
+}
+
+/// Parity: `TOOL_INVOCATION_MARKER` — the agent saying a tool it ran failed.
+fn tool_invocation_marker_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(concat!(
+            r"(?i)\btool[_ -](?:error|use|call|result)\b",
+            r"|\btool\s+[A-Za-z0-9_./-]+\s+(?:failed|error)\b",
+            r"|\bmcp_auth_required\b|\b(?:mcp|connector|plugin)\b"
+        ))
+        .expect("tool invocation marker regex")
+    })
+}
+
+/// Parity: `PROGRAM_DIAGNOSTIC_PREFIX` — the Unix `progname: message`
+/// convention plus npm's `npm ERR!` variant.
+fn program_diagnostic_prefix_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^[ \t]*([A-Za-z][A-Za-z0-9_.+-]{0,31})(?::[ \t]|[ \t]ERR!)")
+            .expect("program diagnostic prefix regex")
+    })
+}
+
+/// Parity: `SEVERITY_LABELS` — a label says how bad a line is, not who wrote it.
+fn severity_labels() -> &'static std::collections::HashSet<&'static str> {
+    static SET: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| {
+        [
+            "err", "error", "errors", "warn", "warning", "fatal", "panic", "critical", "crit",
+            "note", "notice", "info", "debug", "trace", "verbose",
+        ]
+        .into_iter()
+        .collect()
+    })
+}
+
+/// Parity: `OWN_AGENT_COMMAND_NAMES` — every command name Open Design's own
+/// agent CLIs answer to (each shipped adapter's `id` and its `bin`). A row the
+/// text reports about a name in here is the agent speaking as itself, not a
+/// tool inside it. Kept as a literal because the adapter registry imports this
+/// module.
+pub fn own_agent_command_names() -> &'static std::collections::HashSet<&'static str> {
+    static SET: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| {
+        [
+            "agy", "aider", "amp", "amr", "antigravity", "atomcode", "byok-opencode", "claude",
+            "codebuddy", "codex", "copilot", "cursor-agent", "deepseek", "deepseek-harness",
+            "devin", "dsh", "grok", "grok-build", "hermes", "kilo", "kimi", "kiro", "kiro-cli",
+            "mimo", "opencode", "opencode-cli", "pi", "qoder", "qodercli", "qwen", "reasonix",
+            "trae-cli", "traecli", "vela", "vibe", "vibe-acp",
+        ]
+        .into_iter()
+        .collect()
+    })
+}
+
+/// True when a gateway's own provider-credential code says the PLATFORM's
+/// upstream credentials failed (parity:
+/// `reportsPlatformProviderCredentialFault`, vela-errors.ts:183).
+///
+/// Rust's `regex` has no lookbehind, so the `(?<![\w.-])…(?![\w.-])` boundary
+/// is checked by hand.
+pub fn reports_platform_provider_credential_fault(text: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?i)upstream_provider_(?:unauthenticated|forbidden)")
+            .expect("vela credential code regex")
+    });
+    let boundary = |ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'));
+    for found in re.find_iter(text) {
+        let before_ok = text[..found.start()].chars().next_back().is_none_or(boundary);
+        let after_ok = text[found.end()..].chars().next().is_none_or(boundary);
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when the auth failure `text` reports belongs to a TOOL the agent ran,
+/// rather than to the agent's own credential (parity:
+/// `reportsToolPrincipalAuthFailure`, auth.ts:437).
+///
+/// Scoped per line: an unrelated `npm ERR!` elsewhere in a long stderr tail
+/// must not vouch for the agent's own 401 on another line.
+pub fn reports_tool_principal_auth_failure(text: &str) -> bool {
+    if text.trim().is_empty() {
+        return false;
+    }
+    for raw_line in text.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if !agent_auth_failure_re().is_match(line) {
+            continue;
+        }
+        if tool_invocation_marker_re().is_match(line) {
+            return true;
+        }
+        let Some(captures) = program_diagnostic_prefix_re().captures(line) else {
+            continue;
+        };
+        let speaker = captures
+            .get(1)
+            .map(|capture| capture.as_str().to_lowercase())
+            .unwrap_or_default();
+        if severity_labels().contains(speaker.as_str()) {
+            continue;
+        }
+        if agent_auth_failure_re().is_match(&speaker) {
+            continue;
+        }
+        if own_agent_command_names().contains(speaker.as_str()) {
+            continue;
+        }
+        let prefix_end = captures.get(0).map(|capture| capture.end()).unwrap_or(0);
+        if agent_auth_failure_re().is_match(&line[prefix_end..]) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The model-service failure class implied by an agent's combined
+/// stdout/stderr/error text, or `None` for an ordinary process failure
+/// (parity: `classifyAgentServiceFailure`, auth.ts:465).
+///
+/// Auth is checked before rate/upstream so a `401` is never misread as `5xx`.
+pub fn classify_agent_service_failure(text: &str) -> Option<AgentServiceFailureCode> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    // A self-identifying machine code outranks a class read off prose.
+    if reports_platform_provider_credential_fault(text) {
+        return Some(AgentServiceFailureCode::UpstreamUnavailable);
+    }
+    // The auth class is a claim about THIS agent's credential. A report that
+    // names a different holder (a tool the agent ran) answers a different
+    // question, so it does not reach the auth branch. Rate and upstream stay
+    // global: a tool that hit a 503 or 429 still classifies.
+    if !reports_tool_principal_auth_failure(text) && agent_auth_failure_re().is_match(text) {
+        return Some(AgentServiceFailureCode::AgentAuthRequired);
+    }
+    if agent_rate_failure_re().is_match(text) {
+        return Some(AgentServiceFailureCode::RateLimited);
+    }
+    if agent_upstream_failure_re().is_match(text) {
+        return Some(AgentServiceFailureCode::UpstreamUnavailable);
+    }
+    None
+}
+
+/// Parity: `classifyProbedAuthFailure` (auth.ts:579) — agents with a tailored
+/// classifier use only that (`None` === authenticated); everyone else falls
+/// back to the generic HTTP/text classifier.
+fn classify_probed_auth_failure(
+    classifier_id: &str,
+    agent_name: &str,
+    text: &str,
+) -> Option<AuthProbeResult> {
+    if has_tailored_auth_classifier(classifier_id) {
+        return classify_agent_auth_failure(classifier_id, text);
+    }
+    if classify_agent_service_failure(text) == Some(AgentServiceFailureCode::AgentAuthRequired) {
+        return Some(AuthProbeResult {
+            status: AuthProbeStatus::Missing,
+            message: Some(generic_auth_guidance(agent_name)),
+            stdout_tail: None,
+            stderr_tail: None,
+            exit_code: None,
+            signal: None,
+        });
+    }
+    None
+}
+
 // ---- probe runner ------------------------------------------------------------
 
 fn has_non_empty_env(env: &HashMap<String, String>, keys: &[&str]) -> bool {
@@ -455,38 +724,45 @@ pub async fn probe_agent_auth_status(
         Ok(ProbeOutput {
             stdout,
             stderr,
-            success: _,
+            success,
+            exit_code,
         }) => {
             let output = format!("{stdout}\n{stderr}");
-            if has_tailored_auth_classifier(agent_id) {
-                match classify_agent_auth_failure(agent_id, &output) {
-                    Some(failure) => Some(with_probe_tails(failure, &stdout, &stderr)),
-                    None => Some(AuthProbeResult {
-                        status: AuthProbeStatus::Ok,
-                        message: None,
-                        stdout_tail: None,
-                        stderr_tail: None,
-                        exit_code: None,
-                        signal: None,
-                    }),
-                }
-            } else {
-                // Generic fallback for adapters without a tailored
-                // classifier: unknown either way without the service-failure
-                // classifier (follow-up bead).
-                Some(with_probe_tails(
-                    AuthProbeResult {
-                        status: AuthProbeStatus::Unknown,
-                        message: Some(generic_auth_guidance(agent_name)),
-                        stdout_tail: None,
-                        stderr_tail: None,
-                        exit_code: None,
-                        signal: None,
-                    },
-                    &stdout,
-                    &stderr,
-                ))
+            // Parity: the tailored classifier is authoritative for its agents
+            // (a `None` there means "authenticated"); everyone else falls back
+            // to the generic HTTP/text classifier.
+            if let Some(failure) =
+                classify_probed_auth_failure(agent_id, agent_name, &output)
+            {
+                let mut failure = with_probe_tails(failure, &stdout, &stderr);
+                failure.exit_code = if success { Some(0) } else { exit_code };
+                return Some(failure);
             }
+            if success {
+                return Some(AuthProbeResult {
+                    status: AuthProbeStatus::Ok,
+                    message: None,
+                    stdout_tail: None,
+                    stderr_tail: None,
+                    exit_code: None,
+                    signal: None,
+                });
+            }
+            // A non-zero probe exit the classifier cannot name is reported as
+            // unverifiable, never as a healthy install.
+            let mut result = AuthProbeResult {
+                status: AuthProbeStatus::Unknown,
+                message: Some(format!(
+                    "{agent_name} authentication status could not be verified with `{}`.",
+                    args.join(" ")
+                )),
+                stdout_tail: None,
+                stderr_tail: None,
+                exit_code,
+                signal: None,
+            };
+            result = with_probe_tails(result, &stdout, &stderr);
+            Some(result)
         }
         Err(err) => Some(AuthProbeResult {
             status: AuthProbeStatus::Unknown,
@@ -607,6 +883,191 @@ mod tests {
         .await
         .expect("result");
         assert_eq!(result.status, AuthProbeStatus::Missing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Parity: apps/daemon/tests/runtimes/service-failure-classification.test.ts.
+    #[test]
+    fn service_failure_classification_matches_typescript() {
+        let classify = |text: &str| classify_agent_service_failure(text).map(|c| c.as_str());
+
+        // The official DeepSeek Harness missing-credential failure.
+        assert_eq!(
+            classify("dsh: MISSING_CREDENTIAL: llm-deepseek: no API key for provider route \"deepseek-official\"; export DEEPSEEK_API_KEY"),
+            Some("AGENT_AUTH_REQUIRED")
+        );
+
+        for text in [
+            "Error: 401 {\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"}",
+            "Incorrect API key provided: sk-***. ",
+            "Please run /login to authenticate.",
+            "Unauthorized: OAuth token has expired",
+        ] {
+            assert_eq!(classify(text), Some("AGENT_AUTH_REQUIRED"), "{text}");
+        }
+
+        for text in [
+            "Error: 429 Too Many Requests",
+            "rate_limit_error: rate limit exceeded",
+            "You exceeded your current quota, please check your plan and billing details.",
+            "Your credit balance is too low to access the Anthropic API.",
+            "insufficient_quota",
+        ] {
+            assert_eq!(classify(text), Some("RATE_LIMITED"), "{text}");
+        }
+
+        for text in [
+            "Error: 529 {\"type\":\"overloaded_error\"}",
+            "Service temporarily unavailable (503)",
+            "Bad gateway",
+            "The model is currently overloaded. Please try again later.",
+            "HTTP 500 from provider",
+            "status 503",
+            "server error 502",
+            "502 Bad Gateway",
+        ] {
+            assert_eq!(classify(text), Some("UPSTREAM_UNAVAILABLE"), "{text}");
+        }
+
+        assert_eq!(classify("HTTP 401 Unauthorized"), Some("AGENT_AUTH_REQUIRED"));
+        assert_eq!(classify("status code 429"), Some("RATE_LIMITED"));
+        // Auth is checked first, so a 401 beside a 503 is still auth.
+        assert_eq!(
+            classify("401 unauthorized — also saw a 503 earlier"),
+            Some("AGENT_AUTH_REQUIRED")
+        );
+    }
+
+    /// R-053: a gateway's own provider-credential code is a service outage, not
+    /// the caller having signed out.
+    #[test]
+    fn platform_provider_credential_codes_are_upstream_not_auth() {
+        for text in [
+            "API request failed with status 500: upstream_provider_unauthenticated",
+            "[code=upstream_provider_unauthenticated] Upstream provider credentials are missing or invalid.",
+            "[code=upstream_provider_forbidden] Upstream provider rejected access for the configured credentials.",
+            "json-rpc id 4: opencode event stream: {\"properties\":{\"error\":{\"data\":{\"message\":\"\\\"[code=upstream_provider_unauthenticated] Upstream provider credentials are missing or invalid.\\\"\"}}}}",
+        ] {
+            assert_eq!(
+                classify_agent_service_failure(text).map(|c| c.as_str()),
+                Some("UPSTREAM_UNAVAILABLE"),
+                "{text}"
+            );
+        }
+
+        // The reverse guard: the caller's own bare `unauthenticated` code stays auth.
+        for text in [
+            "API request failed with status 401: unauthenticated",
+            "API request failed with status 401: invalid_api_key",
+            "API request failed with status 401: missing_api_key",
+            "HTTP 401 Unauthorized",
+            "Error: 401 {\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"}",
+        ] {
+            assert_eq!(
+                classify_agent_service_failure(text).map(|c| c.as_str()),
+                Some("AGENT_AUTH_REQUIRED"),
+                "{text}"
+            );
+        }
+
+        // A longer identifier that merely contains the code is not the code.
+        assert_eq!(
+            classify_agent_service_failure("code=upstream_provider_unauthenticatedx")
+                .map(|c| c.as_str()),
+            None
+        );
+    }
+
+    /// A tool inside the agent reporting its OWN credential failure must not
+    /// become the agent's sign-in prompt.
+    #[test]
+    fn tool_principal_auth_failures_are_not_the_agents_credential() {
+        assert!(reports_tool_principal_auth_failure(
+            "gh: authentication required: run gh auth login"
+        ));
+        // An unrelated tool line does not vouch for the agent's own 401 on
+        // another line.
+        assert!(!reports_tool_principal_auth_failure(
+            "Error: 401 unauthorized\nnpm ERR! code ELIFECYCLE\nnpm ERR! errno 1"
+        ));
+        // Our own CLI speaking as itself is not a foreign tool.
+        assert!(!reports_tool_principal_auth_failure(
+            "dsh: MISSING_CREDENTIAL: no API key for provider route"
+        ));
+        // A severity label or a status reason phrase is a label, not a speaker.
+        assert!(!reports_tool_principal_auth_failure(
+            "Error: list Link models: API request failed with status 401: invalid_api_key"
+        ));
+        // A tool's own auth failure is not the agent's, so it does not reach the
+        // auth branch — and there is no rate/upstream signal either.
+        assert_eq!(
+            classify_agent_service_failure("gh: authentication required: run gh auth login")
+                .map(|c| c.as_str()),
+            None
+        );
+        // The tool's own 401 is not auth, but an unrelated 429 still is a rate limit.
+        assert_eq!(
+            classify_agent_service_failure("gh: authentication required\nHTTP 429 Too Many Requests")
+                .map(|c| c.as_str()),
+            Some("RATE_LIMITED")
+        );
+    }
+
+    #[test]
+    fn service_failure_returns_none_for_ordinary_failures_and_bare_numbers() {
+        for text in [
+            "",
+            "spawn ENOENT",
+            "Segmentation fault (core dumped)",
+            "TypeError: cannot read properties of undefined",
+            "Compiled 500 modules in 503ms; read 502 bytes at line 529",
+            "Build failed at line 500 (exit code 1)",
+            "Processed 4290 rows, 401 skipped, took 4290ms",
+            "wrote 502 files",
+            "exit code 401",
+            "process exited with code 429",
+            "command failed: exit code 503",
+            "child process exited with code 500",
+        ] {
+            assert!(
+                classify_agent_service_failure(text).is_none(),
+                "{text}"
+            );
+        }
+    }
+
+    /// The generic (non-tailored) probe path now classifies auth instead of
+    /// always reporting `unknown` (auth.ts `classifyProbedAuthFailure`).
+    #[tokio::test]
+    async fn generic_probe_classifies_auth_via_the_service_classifier() {
+        let dir = std::env::temp_dir().join(format!("od-auth-probe3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let bin = dir.join("aider");
+        std::fs::write(&bin, "#!/bin/sh\necho 'HTTP 401 Unauthorized' >&2\nexit 1\n")
+            .expect("shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&bin).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bin, perms).expect("perms");
+        }
+        let result = probe_agent_auth_status(
+            "aider",
+            "Aider",
+            Some((&["status"], 5_000)),
+            &bin,
+            &HashMap::new(),
+        )
+        .await
+        .expect("result");
+        assert_eq!(result.status, AuthProbeStatus::Missing);
+        assert_eq!(result.exit_code, Some(1));
+        assert!(result
+            .message
+            .unwrap_or_default()
+            .contains("appears to be installed"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

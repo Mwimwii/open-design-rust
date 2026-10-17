@@ -27,6 +27,9 @@ pub struct ProbeOutput {
     pub stdout: String,
     pub stderr: String,
     pub success: bool,
+    /// Raw process exit code. `None` when the probe timed out (killed) or was
+    /// terminated by a signal — parity with `execFile`'s numeric `code`.
+    pub exit_code: Option<i32>,
 }
 
 /// Run a short read-only metadata probe with a hard timeout (parity:
@@ -77,6 +80,7 @@ pub async fn run_probe(
                 stdout: String::new(),
                 stderr: String::new(),
                 success: false,
+                exit_code: None,
             });
         }
     };
@@ -85,6 +89,7 @@ pub async fn run_probe(
         stdout: String::from_utf8_lossy(&out).into_owned(),
         stderr: String::from_utf8_lossy(&err).into_owned(),
         success: status.success(),
+        exit_code: status.code(),
     })
 }
 
