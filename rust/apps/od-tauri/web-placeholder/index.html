@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>OpenDesign</title>
+  </head>
+  <body>
+    <!--
+      This file is never displayed.
+
+      The shell window loads the embedded daemon origin, and the daemon serves
+      the built `apps/web` export; this document only satisfies the Tauri
+      bundler, which requires a `frontendDist`. Keeping it a placeholder means
+      the shell embeds no second copy of the interface, and a fresh clone can
+      run `cargo build --workspace` before any web build exists.
+    -->
+    <p>The OpenDesign interface is served by the embedded daemon.</p>
+  </body>
+</html>

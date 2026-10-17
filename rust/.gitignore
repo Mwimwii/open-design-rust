@@ -1,3 +1,5 @@
 target/
-ui/node_modules/
-ui/dist/
+apps/od-tauri/node_modules/
+# `npm run build:web` copies the apps/web static export here; it is a build
+# output, embedded into the binary and shipped as the `web` bundle resource.
+apps/od-tauri/dist/

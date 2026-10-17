@@ -4,10 +4,9 @@
   "version": "0.1.0",
   "identifier": "ai.open-design.desktop",
   "build": {
-    "frontendDist": "../ui/dist",
-    "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build:ui"
+    "frontendDist": "../web-placeholder",
+    "beforeDevCommand": "npm run build:web",
+    "beforeBuildCommand": "npm run build:web"
   },
   "app": {
     "windows": [],
