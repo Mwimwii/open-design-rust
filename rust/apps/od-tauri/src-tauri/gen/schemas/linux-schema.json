@@ -501,6 +501,12 @@
           "markdownDescription": "Enables the daemon_info command without any pre-configured scope."
         },
         {
+          "description": "Enables the host_capture_page command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-host-capture-page",
+          "markdownDescription": "Enables the host_capture_page command without any pre-configured scope."
+        },
+        {
           "description": "Enables the host_open_path command without any pre-configured scope.",
           "type": "string",
           "const": "allow-host-open-path",
@@ -523,6 +529,12 @@
           "type": "string",
           "const": "allow-host-pick-working-dir",
           "markdownDescription": "Enables the host_pick_working_dir command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the host_print_pdf command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-host-print-pdf",
+          "markdownDescription": "Enables the host_print_pdf command without any pre-configured scope."
         },
         {
           "description": "Enables the open_external command without any pre-configured scope.",
@@ -555,6 +567,12 @@
           "markdownDescription": "Denies the daemon_info command without any pre-configured scope."
         },
         {
+          "description": "Denies the host_capture_page command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-host-capture-page",
+          "markdownDescription": "Denies the host_capture_page command without any pre-configured scope."
+        },
+        {
           "description": "Denies the host_open_path command without any pre-configured scope.",
           "type": "string",
           "const": "deny-host-open-path",
@@ -577,6 +595,12 @@
           "type": "string",
           "const": "deny-host-pick-working-dir",
           "markdownDescription": "Denies the host_pick_working_dir command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the host_print_pdf command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-host-print-pdf",
+          "markdownDescription": "Denies the host_print_pdf command without any pre-configured scope."
         },
         {
           "description": "Denies the open_external command without any pre-configured scope.",

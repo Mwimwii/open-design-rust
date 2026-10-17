@@ -2772,6 +2772,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "cairo-rs",
+ "gtk",
  "od-core",
  "od-daemon",
  "rand 0.8.8",
@@ -2789,6 +2791,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "webkit2gtk",
 ]
 
 [[package]]

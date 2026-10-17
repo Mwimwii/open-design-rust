@@ -31,5 +31,13 @@ tauri-plugin-http = "2"
 tauri-plugin-opener = "2"
 url = "2"
 
+# The capture and PDF groups go through the platform webview directly:
+# WebKitGTK's snapshot and print operations. wry already links both, so these
+# declare the same versions it is built against.
+[target.'cfg(target_os = "linux")'.dependencies]
+cairo-rs = { version = "0.18", features = ["png"] }
+gtk = "0.18"
+webkit2gtk = "2"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

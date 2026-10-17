@@ -23,7 +23,9 @@
 //! remote origin gets no command that is absent from either list.
 
 pub mod bridge;
+pub mod capture;
 pub mod desktop_auth;
+pub mod pdf;
 pub mod project;
 pub mod shell;
 

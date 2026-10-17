@@ -51,6 +51,8 @@ pub fn run() {
             host::project::host_pick_working_dir,
             host::project::host_pick_and_import,
             host::project::host_pick_and_replace_working_dir,
+            host::capture::host_capture_page,
+            host::pdf::host_print_pdf,
         ])
         .setup(|app| shell::setup(app))
         .build(tauri::generate_context!())

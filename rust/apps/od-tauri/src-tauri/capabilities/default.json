@@ -21,6 +21,8 @@
     "allow-host-open-path",
     "allow-host-pick-working-dir",
     "allow-host-pick-and-import",
-    "allow-host-pick-and-replace-working-dir"
+    "allow-host-pick-and-replace-working-dir",
+    "allow-host-capture-page",
+    "allow-host-print-pdf"
   ]
 }
