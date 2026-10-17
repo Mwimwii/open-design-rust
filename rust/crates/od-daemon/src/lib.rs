@@ -24,6 +24,7 @@ pub mod mcp_inject;
 pub mod mcp_oauth;
 pub mod mcp_tokens;
 pub mod migrations;
+pub mod plain_stream;
 pub mod project_dir;
 pub mod proxy;
 pub mod protocol;
