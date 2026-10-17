@@ -5,16 +5,15 @@ fn main() {
     // `invoke` from the window fails with "not allowed" — the app would have no
     // reachable IPC at all. The generated `allow-<command>` permissions are
     // what `capabilities/default.json` grants.
-    tauri_build::try_build(
-        tauri_build::Attributes::new().app_manifest(
-            tauri_build::AppManifest::new().commands(&[
-                "app_version",
-                "daemon_health",
-                "daemon_info",
-                "open_external",
-                "pick_workspace_folder",
-            ]),
-        ),
-    )
+    tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
+        tauri_build::AppManifest::new().commands(&[
+            "app_version",
+            "daemon_health",
+            "daemon_info",
+            "open_external",
+            "pick_workspace_folder",
+            "host_open_path",
+        ]),
+    ))
     .expect("failed to run tauri-build");
 }

@@ -12,13 +12,15 @@
 //!
 //! The window serves the `apps/web` static export from the embedded daemon
 //! (transport A) instead of bundling its own frontend; the web app reaches the
-//! shell through the `__od__` host bridge, which is still to be built.
+//! shell through the `__od__` host bridge, injected at document start from
+//! [`host::bridge`].
 //!
-//! Follow-ups tracked in beads: the `__od__` host bridge
-//! (`open_design_rust-7c7.2`), splash/chrome parity, updater, frame capture,
-//! bundled-app packaging verification.
+//! Follow-ups tracked in beads: updater parity, splash/chrome parity, frame
+//! capture on platforms other than Linux, and bundled-app packaging
+//! verification.
 
 mod commands;
+mod host;
 mod shell;
 
 pub use shell::ShellState;
@@ -43,8 +45,9 @@ pub fn run() {
             commands::app_version,
             commands::daemon_health,
             commands::daemon_info,
-            commands::open_external,
             commands::pick_workspace_folder,
+            host::shell::open_external,
+            host::shell::host_open_path,
         ])
         .setup(|app| shell::setup(app))
         .build(tauri::generate_context!())

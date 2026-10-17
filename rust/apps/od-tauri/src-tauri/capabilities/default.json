@@ -17,6 +17,7 @@
     "allow-daemon-health",
     "allow-daemon-info",
     "allow-open-external",
-    "allow-pick-workspace-folder"
+    "allow-pick-workspace-folder",
+    "allow-host-open-path"
   ]
 }

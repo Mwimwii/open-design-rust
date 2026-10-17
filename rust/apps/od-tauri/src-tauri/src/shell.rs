@@ -49,14 +49,19 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         daemon: Mutex::new(Some(daemon)),
     });
 
-    let window_url = dev_url().unwrap_or_else(|| {
-        Url::parse(&daemon_url).expect("embedded daemon URL must parse")
-    });
+    let window_url = dev_url()
+        .unwrap_or_else(|| Url::parse(&daemon_url).expect("embedded daemon URL must parse"));
+
+    // The window's page is the apps/web export, so the shell injects the
+    // `__od__` host bridge before the page's own scripts run: the app's first
+    // render already sees a host.
+    let bridge_script = crate::host::bridge::script(&crate::host::bridge::ClientFacts::detect());
 
     WebviewWindowBuilder::new(app.handle(), "main", WebviewUrl::External(window_url))
         .title("OpenDesign")
         .inner_size(1440.0, 900.0)
         .min_inner_size(960.0, 640.0)
+        .initialization_script(bridge_script)
         .build()?;
 
     // `od://` invite/deeplink arrival → log + notify the webview.
@@ -117,7 +122,8 @@ fn start_daemon(mut config: DaemonConfig) -> Result<RunningDaemon, String> {
                 "preferred daemon port busy; falling back to an ephemeral port"
             );
             config.port = 0;
-            tauri::async_runtime::block_on(RunningDaemon::start(config)).map_err(|err| err.to_string())
+            tauri::async_runtime::block_on(RunningDaemon::start(config))
+                .map_err(|err| err.to_string())
         }
         Err(err) => Err(err.to_string()),
     }

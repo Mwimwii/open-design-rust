@@ -501,6 +501,12 @@
           "markdownDescription": "Enables the daemon_info command without any pre-configured scope."
         },
         {
+          "description": "Enables the host_open_path command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-host-open-path",
+          "markdownDescription": "Enables the host_open_path command without any pre-configured scope."
+        },
+        {
           "description": "Enables the open_external command without any pre-configured scope.",
           "type": "string",
           "const": "allow-open-external",
@@ -529,6 +535,12 @@
           "type": "string",
           "const": "deny-daemon-info",
           "markdownDescription": "Denies the daemon_info command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the host_open_path command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-host-open-path",
+          "markdownDescription": "Denies the host_open_path command without any pre-configured scope."
         },
         {
           "description": "Denies the open_external command without any pre-configured scope.",
