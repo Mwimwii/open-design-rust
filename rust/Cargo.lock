@@ -2748,6 +2748,8 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "crc32fast",
+ "flate2",
  "od-core",
  "rand 0.8.8",
  "regex",

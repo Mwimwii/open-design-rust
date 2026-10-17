@@ -26,6 +26,12 @@ thiserror = "2"
 regex = "1"
 rand = "0.8"
 sha2 = "0.10"
+# Diagnostics export (parity: `jszip` in packages/diagnostics/src/zip.ts).
+# Both crates are already in the lockfile via the Tauri shell, so the
+# diagnostics route adds no new crate to the graph: flate2 provides the
+# DEFLATE stream (ZIP method 8) and crc32fast the entry checksums.
+flate2 = "1"
+crc32fast = "1"
 # "process": tokio::process::Command for the Codex CLI runner in
 # crates/od-daemon/src/mcp.rs (parity: spawn() in apps/daemon/src/codex-cli.ts).
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs", "process"] }

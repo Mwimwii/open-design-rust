@@ -63,6 +63,14 @@ impl RuntimePaths {
         self.data_dir.join("artifacts")
     }
 
+    /// Per-run event log root (`<data root>/runs`), holding
+    /// `<runId>/events.jsonl` for each run. Same path the TypeScript daemon
+    /// passes to `createChatRunService({ runsLogDir })` and to the diagnostics
+    /// export (`path.join(RUNTIME_DATA_DIR, 'runs')`).
+    pub fn runs_dir(&self) -> PathBuf {
+        self.data_dir.join("runs")
+    }
+
     /// Value handed to agent subprocesses as `OD_DATA_DIR`.
     pub fn child_env_value(&self) -> std::ffi::OsString {
         self.data_dir.as_os_str().to_os_string()
@@ -111,6 +119,7 @@ mod tests {
         assert_eq!(paths.db_file(), dir.join("app.sqlite"));
         assert_eq!(paths.projects_dir(), dir.join("projects"));
         assert_eq!(paths.artifacts_dir(), dir.join("artifacts"));
+        assert_eq!(paths.runs_dir(), dir.join("runs"));
         assert!(dir.is_dir());
         let _ = fs::remove_dir_all(&dir);
     }

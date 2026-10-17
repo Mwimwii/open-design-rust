@@ -59,6 +59,9 @@ pub struct AppState {
     /// `PendingAuthCache` in `mcp-oauth.ts`). State is single-use and
     /// TTL-scoped to the daemon process.
     pub mcp_pending_auth: Arc<tokio::sync::Mutex<std::collections::HashMap<String, crate::mcp_oauth::PendingAuthState>>>,
+    /// Live diagnostics snapshots the export bundle drains (environment
+    /// evidence, the renderer's chat-scroll capture, recent API failures).
+    pub diagnostics: crate::diagnostics::SharedDiagnostics,
 }
 
 impl AppState {
@@ -75,6 +78,7 @@ impl AppState {
             mcp_install_info_cache: Arc::new(std::sync::Mutex::new(None)),
             mcp_tokens_lock: Arc::new(tokio::sync::Mutex::new(())),
             mcp_pending_auth: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            diagnostics: Arc::new(crate::diagnostics::DiagnosticsState::new()),
         }
     }
 }
@@ -108,6 +112,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::critique::router())
         .merge(crate::proxy::router())
         .merge(crate::mcp::router())
+        .merge(crate::diagnostics::router())
         .route(
             "/api/{*rest}",
             get(api_not_found)
@@ -116,7 +121,13 @@ pub fn build_router(state: AppState) -> Router {
                 .patch(api_not_found)
                 .delete(api_not_found),
         )
-        .layer(middleware::from_fn_with_state(state.clone(), api_auth));
+        .layer(middleware::from_fn_with_state(state.clone(), api_auth))
+        // Outermost, so it sees the auth middleware's 401s too: every failed
+        // `/api` response feeds the diagnostics failure journal.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::diagnostics::api_failure_recorder,
+        ));
 
     let web_dist = state.config.web_dist.clone();
 
