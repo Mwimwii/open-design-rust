@@ -3206,7 +3206,16 @@ async fn setup_and_spawn(setup: SpawnSetup) {
             return;
         }
     }
-    pump_child(runs, run_id, handle, stdin_bytes, prompt_file, def.stream_format).await;
+    pump_child(
+        runs,
+        run_id,
+        handle,
+        stdin_bytes,
+        prompt_file,
+        def.stream_format,
+        def.event_parser,
+    )
+    .await;
 }
 
 /// Forward the user's external MCP servers to runtimes with a native
@@ -3319,10 +3328,10 @@ fn stage_prompt_file(run_id: &str, prompt: &str) -> Result<String, String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
-/// Drive a spawned child to completion: deliver stdin, stream stdout lines
-/// as `stdout` events (raw interim shape until the protocol adapters in
-/// the `lhe` bead map them), drain stderr, then finish the run from the
-/// exit status. Cancellation wins races via `finish`'s terminal guard.
+/// Drive a spawned child to completion: deliver stdin, map stdout through the
+/// runtime's parser (or stream it raw on the plain lane), drain stderr, then
+/// finish the run from the exit status. Cancellation wins races via `finish`'s
+/// terminal guard.
 async fn pump_child(
     runs: Runs,
     run_id: String,
@@ -3330,6 +3339,7 @@ async fn pump_child(
     stdin_bytes: Option<Vec<u8>>,
     prompt_file: Option<String>,
     stream_format: &'static str,
+    event_parser: Option<&'static str>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     if let Some(bytes) = stdin_bytes {
@@ -3389,6 +3399,25 @@ async fn pump_child(
                 // Qoder's JSONL wire maps onto UI-lane events; anything else on
                 // a line is a bounded raw event.
                 let mut parser = crate::protocol::QoderParser::new();
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let mut events = Vec::new();
+                    parser.feed(&format!("{line}\n"), &mut |event| events.push(event));
+                    for event in events {
+                        push_lane_event(&runs_for_out, &out_id, event);
+                    }
+                }
+                parser.flush(&mut |event| {
+                    push_lane_event(&runs_for_out, &out_id, event);
+                });
+            }
+        } else if stream_format == "json-event-stream" && event_parser == Some("opencode") {
+            // The multi-runtime JSONL lane. Only the OpenCode kind is ported so
+            // far; any other `event_parser` on this format falls through to the
+            // plain lane below, so an unported runtime keeps streaming its
+            // stdout rather than losing every line to a bare raw event.
+            if let Some(stdout) = stdout {
+                let mut parser = crate::protocol::JsonEventParser::new("opencode");
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     let mut events = Vec::new();

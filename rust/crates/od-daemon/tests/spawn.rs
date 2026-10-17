@@ -47,6 +47,20 @@ fn shim_dir() -> std::path::PathBuf {
             "exit 0\n",
         ),
     );
+    // Emits one OpenCode JSONL turn, then exits: proves the multi-kind
+    // `json-event-stream` lane maps to parsed events, not raw stdout.
+    write_shim(
+        &dir,
+        "opencode",
+        concat!(
+            "#!/bin/sh\n",
+            "cat > /dev/null\n",
+            "echo '{\"type\":\"step_start\",\"sessionID\":\"ses-1\",\"part\":{\"type\":\"step-start\"}}'\n",
+            "echo '{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"hey\"}}'\n",
+            "echo '{\"type\":\"step_finish\",\"part\":{\"tokens\":{\"input\":11,\"output\":7},\"cost\":0}}'\n",
+            "exit 0\n",
+        ),
+    );
     dir
 }
 
@@ -290,5 +304,48 @@ async fn copilot_wire_maps_to_lane_events() {
     assert!(
         events.contains("event: agent"),
         "lane events must use the agent SSE name: {events}"
+    );
+}
+
+/// The `json-event-stream` lane must parse an OpenCode run into UI-lane events
+/// instead of streaming its stdout verbatim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opencode_jsonl_maps_to_lane_events() {
+    ensure_shim_on_path();
+    let daemon = RunningDaemon::start(config(temp_paths("opencode")))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+    let (head, body) = post_run(addr, r#"{"agentId":"opencode","prompt":"hi"}"#).await;
+    assert!(head.contains("202"), "head: {head} body: {body}");
+    let run_id: String = serde_json::from_str::<serde_json::Value>(&body)
+        .expect("json")
+        .get("runId")
+        .and_then(|v| v.as_str())
+        .expect("runId")
+        .to_string();
+    let mut status = String::new();
+    for _ in 0..100 {
+        let (_, body) = get_run(addr, &run_id).await;
+        status = serde_json::from_str::<serde_json::Value>(&body)
+            .expect("json")
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if matches!(status.as_str(), "succeeded" | "failed" | "canceled") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(status, "succeeded", "run did not succeed");
+    let (_, events) = get_events(addr, &run_id).await;
+    assert!(events.contains("event: agent"), "events: {events}");
+    assert!(events.contains("text_delta"), "events: {events}");
+    assert!(events.contains("hey"), "events: {events}");
+    assert!(events.contains("\"usage\""), "events: {events}");
+    assert!(
+        !events.contains("event: stdout"),
+        "an opencode run must not fall through to the plain lane: {events}"
     );
 }
