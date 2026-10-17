@@ -3,7 +3,7 @@
 use serde::Serialize;
 use tauri::State;
 
-use crate::shell::{web_dist, ShellState};
+use crate::shell::ShellState;
 
 #[derive(Debug, Serialize)]
 pub struct DaemonInfo {
@@ -24,7 +24,7 @@ pub fn daemon_info(state: State<'_, ShellState>) -> DaemonInfo {
         url: state.daemon_url.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         data_dir: state.data_dir.display().to_string(),
-        web_dist: web_dist().map(|path| path.display().to_string()),
+        web_dist: state.web_dist.as_ref().map(|path| path.display().to_string()),
     }
 }
 

@@ -1,6 +1,12 @@
 //! Shell lifecycle: data-root resolution, embedded daemon, main window.
+//!
+//! The window is not a Tauri frontend asset: it points at the embedded
+//! loopback daemon, which serves the `apps/web` static export (the same origin
+//! for the SPA and `/api`), the way `apps/desktop` points at the TypeScript
+//! daemon. `tauri.conf.json`'s `frontendDist` exists only because the bundler
+//! requires it — the app-origin assets it embeds are never loaded.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use od_core::RuntimePaths;
@@ -14,6 +20,8 @@ pub struct ShellState {
     pub daemon_url: String,
     /// Resolved `OD_DATA_DIR` for this app namespace.
     pub data_dir: PathBuf,
+    /// The static web export the daemon serves; `None` means API-only.
+    pub web_dist: Option<PathBuf>,
     /// Kept for graceful shutdown on `RunEvent::Exit`.
     daemon: Mutex<Option<RunningDaemon>>,
 }
@@ -29,13 +37,15 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
 
     let paths = RuntimePaths::resolve(&data_dir).map_err(|err| err.to_string())?;
     let mut config = DaemonConfig::with_paths(paths);
-    config.web_dist = web_dist();
+    let web_dist = web_dist(app);
+    config.web_dist = web_dist.clone();
     let daemon = start_daemon(config)?;
     let daemon_url = daemon.url().to_string();
 
     app.manage(ShellState {
         daemon_url: daemon_url.clone(),
         data_dir,
+        web_dist,
         daemon: Mutex::new(Some(daemon)),
     });
 
@@ -92,6 +102,11 @@ fn resolve_data_dir(app: &App) -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 /// Bind the daemon, falling back to an ephemeral port if the preferred port
 /// (default 7456, same as the TypeScript daemon) is taken.
+///
+/// The fallback stays because the shell's capability grants Tauri API access
+/// to the loopback origin with a port wildcard (`http://127.0.0.1:*` in
+/// `capabilities/default.json`), so a different port is still a granted
+/// origin rather than a silently degraded window.
 fn start_daemon(mut config: DaemonConfig) -> Result<RunningDaemon, String> {
     match tauri::async_runtime::block_on(RunningDaemon::start(config.clone())) {
         Ok(daemon) => Ok(daemon),
@@ -108,7 +123,8 @@ fn start_daemon(mut config: DaemonConfig) -> Result<RunningDaemon, String> {
     }
 }
 
-/// Vite dev server override for HMR development (`OD_UI_DEV_URL=http://localhost:5173`).
+/// Dev-server override for HMR development
+/// (`OD_UI_DEV_URL=http://localhost:3000`, e.g. `pnpm tools-dev run web`).
 fn dev_url() -> Option<Url> {
     std::env::var("OD_UI_DEV_URL")
         .ok()
@@ -116,13 +132,50 @@ fn dev_url() -> Option<Url> {
         .and_then(|value| Url::parse(&value).ok())
 }
 
-/// Static SPA directory the daemon serves. `OD_WEB_DIST_DIR` wins; otherwise
-/// the vite build next to this crate (`../ui/dist`) when it exists.
-/// Packaging will move this to the bundle resource dir (tracked in beads).
-pub fn web_dist() -> Option<PathBuf> {
+/// Static web export the daemon serves at `/` (parity: `STATIC_DIR` in
+/// `apps/daemon/src/server.ts`). Resolution order:
+///
+/// 1. `OD_WEB_DIST_DIR` — explicit override (dev, ops, tests).
+/// 2. `<resource_dir>/web` — where the packaged bundle is expected to place
+///    the export. Nothing wires this yet: `bundle.resources` is validated at
+///    compile time, so pointing it at the `npm run build:web` output would
+///    make a fresh-clone `cargo build --workspace` fail until the web app has
+///    been built. Packaging (which owns that copy) tracks this.
+/// 3. `../dist` next to this crate — the `npm run build:web` output.
+/// 4. the source checkout's `apps/web/out` — a repo build of the web app, so
+///    `cargo run` needs no copy step.
+///
+/// Every step must contain an `index.html`: a directory that exists but holds
+/// no shell means `None` (API-only daemon) rather than a window full of 404s.
+pub fn web_dist(app: &App) -> Option<PathBuf> {
     if let Some(value) = std::env::var_os("OD_WEB_DIST_DIR").filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(value));
     }
-    let dev_dist = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ui/dist");
-    dev_dist.is_dir().then_some(dev_dist)
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let packaged = app
+        .path()
+        .resource_dir()
+        .ok()
+        .map(|dir| dir.join("web"))
+        .filter(|dir| has_shell(dir));
+    if packaged.is_some() {
+        return packaged;
+    }
+
+    let app_dist = manifest_dir.join("../dist");
+    if has_shell(&app_dist) {
+        return Some(app_dist);
+    }
+
+    // `apps/web/out` in the source checkout: src-tauri → od-tauri → apps →
+    // rust → repository root.
+    let checkout_export = manifest_dir.join("../../../../apps/web/out");
+    has_shell(&checkout_export).then_some(checkout_export)
+}
+
+/// A usable static export contains the SPA shell the daemon answers deep
+/// links with.
+fn has_shell(dir: &Path) -> bool {
+    dir.join("index.html").is_file()
 }

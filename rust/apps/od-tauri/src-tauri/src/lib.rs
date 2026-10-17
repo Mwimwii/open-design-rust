@@ -10,8 +10,13 @@
 //! * `od://` deep-link scheme registration,
 //! * IPC commands: daemon info/health, folder picker, guarded external open.
 //!
-//! Follow-ups tracked in beads: splash/chrome parity, updater, frame capture,
-//! packaging paths.
+//! The window serves the `apps/web` static export from the embedded daemon
+//! (transport A) instead of bundling its own frontend; the web app reaches the
+//! shell through the `__od__` host bridge, which is still to be built.
+//!
+//! Follow-ups tracked in beads: the `__od__` host bridge
+//! (`open_design_rust-7c7.2`), splash/chrome parity, updater, frame capture,
+//! bundled-app packaging verification.
 
 mod commands;
 mod shell;

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "OpenDesign desktop shell: Tauri v2 app embedding the React UI and the in-process od-daemon"
+description = "OpenDesign desktop shell: Tauri v2 app embedding the in-process od-daemon and serving the apps/web static export"
 
 [lib]
 name = "od_tauri_lib"
