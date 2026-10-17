@@ -1531,6 +1531,11 @@ struct JsonParserState {
     pending_artifact_text: String,
     antigravity_tool_uses: HashSet<String>,
     antigravity_text_emitted: bool,
+    // cursor-agent turn bookkeeping (parity: `cursorTextSoFar` /
+    // `cursorTurnStart`). A terminal replay carries only the current turn, so
+    // recovery is measured from `cursorTurnStart`, not from the buffer start.
+    pub cursor_text_so_far: String,
+    pub cursor_turn_start: usize,
 }
 
 /// Whether `json-event-stream.ts` has a ported handler for `kind` (parity:
@@ -1538,7 +1543,10 @@ struct JsonParserState {
 /// plain stdout lane by the pump rather than losing every line to a bare raw
 /// event.
 pub fn json_event_kind_supported(kind: &str) -> bool {
-    matches!(kind, "opencode" | "gemini" | "antigravity" | "kimi")
+    matches!(
+        kind,
+        "opencode" | "gemini" | "antigravity" | "kimi" | "cursor-agent"
+    )
 }
 
 impl JsonEventParser {
@@ -1584,6 +1592,7 @@ impl JsonEventParser {
             "gemini" => handle_gemini_event(&mut self.state, &obj, line, on_event),
             "antigravity" => handle_antigravity_event(&mut self.state, &obj, line, on_event),
             "kimi" => handle_kimi_event(&obj, on_event),
+            "cursor-agent" => handle_cursor_event(&mut self.state, &obj, on_event),
             _ => false,
         };
         if handled {
@@ -2718,6 +2727,156 @@ fn handle_kimi_event(obj: &Value, on_event: &mut dyn FnMut(StreamEvent)) -> bool
     false
 }
 
+/// JavaScript truthiness for a JSON value, for the handful of TS guards that
+/// test a field directly rather than by type (`if (obj.message)`).
+fn js_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_f64().map(|number| number != 0.0).unwrap_or(true),
+        Value::String(text) => !text.is_empty(),
+        // Objects and arrays are always truthy in JS.
+        _ => true,
+    }
+}
+
+/// Parity: `extractCursorText` (`json-event-stream.ts:578`) — concatenate the
+/// `text` blocks of an assistant message.
+fn extract_cursor_text(message: &Value) -> String {
+    let Some(blocks) = message
+        .as_object()
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return String::new();
+    };
+    blocks
+        .iter()
+        .filter_map(|block| {
+            let block = block.as_object()?;
+            if block.get("type").and_then(Value::as_str) != Some("text") {
+                return None;
+            }
+            block.get("text").and_then(Value::as_str)
+        })
+        .collect()
+}
+
+/// Parity: `emitCursorTextDelta` (`json-event-stream.ts:737`). Timestamped
+/// assistant events without a `model_call_id` are cursor-agent's real-time
+/// incremental deltas; each is emitted verbatim, never deduped by content,
+/// because a legitimately repeated fragment is real output.
+fn emit_cursor_text_delta(
+    text: &str,
+    state: &mut JsonParserState,
+    on_event: &mut dyn FnMut(StreamEvent),
+) {
+    if text.is_empty() {
+        return;
+    }
+    state.cursor_text_so_far.push_str(text);
+    on_event(StreamEvent::Json(json!({ "type": "text_delta", "delta": text })));
+}
+
+/// Parity: `reconcileCursorTurnReplay` (`json-event-stream.ts:767`). A terminal
+/// replay carries the full text for the CURRENT turn, so it is compared against
+/// `cursorTextSoFar[cursorTurnStart..]`; only a verified prefix permits suffix
+/// recovery, and the turn boundary always advances.
+fn reconcile_cursor_turn_replay(
+    text: &str,
+    state: &mut JsonParserState,
+    on_event: &mut dyn FnMut(StreamEvent),
+) {
+    let suffix = {
+        let emitted_turn = &state.cursor_text_so_far[state.cursor_turn_start..];
+        if !text.is_empty() && text != emitted_turn && text.starts_with(emitted_turn) {
+            Some(text[emitted_turn.len()..].to_string())
+        } else {
+            None
+        }
+    };
+    if let Some(suffix) = suffix {
+        if !suffix.is_empty() {
+            on_event(StreamEvent::Json(json!({ "type": "text_delta", "delta": suffix })));
+        }
+        state.cursor_text_so_far.push_str(&suffix);
+    }
+    state.cursor_turn_start = state.cursor_text_so_far.len();
+}
+
+/// Parity: `handleCursorEvent` (`json-event-stream.ts:777`).
+fn handle_cursor_event(
+    state: &mut JsonParserState,
+    obj: &Value,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> bool {
+    let Some(obj) = obj.as_object() else {
+        return false;
+    };
+    let ty = obj.get("type").and_then(Value::as_str).unwrap_or("");
+
+    if ty == "system" && obj.get("subtype").and_then(Value::as_str) == Some("init") {
+        let mut frame = serde_json::Map::new();
+        frame.insert("type".to_string(), json!("status"));
+        frame.insert("label".to_string(), json!("initializing"));
+        if let Some(model) = obj.get("model").and_then(Value::as_str) {
+            frame.insert("model".to_string(), json!(model));
+        }
+        on_event(StreamEvent::Json(Value::Object(frame)));
+        return true;
+    }
+
+    if ty == "assistant" && obj.get("message").is_some_and(js_truthy) {
+        let message = obj.get("message").unwrap_or(&Value::Null);
+        // Cursor sends a final assistant message that replays the full text for
+        // the current turn — either tagged with `model_call_id`, or (fallback)
+        // as a non-timestamped terminal assistant message. Both are reconciled
+        // against the current turn's emitted text.
+        if obj.get("model_call_id").is_some_and(Value::is_string) {
+            let text = extract_cursor_text(message);
+            reconcile_cursor_turn_replay(&text, state, on_event);
+            return true;
+        }
+        let text = extract_cursor_text(message);
+        if text.is_empty() {
+            return false;
+        }
+        if obj.get("timestamp_ms").is_some_and(Value::is_number) {
+            // Incremental streaming chunk within a turn.
+            emit_cursor_text_delta(&text, state, on_event);
+            return true;
+        }
+        reconcile_cursor_turn_replay(&text, state, on_event);
+        return true;
+    }
+
+    if ty == "result" && obj.get("usage").is_some_and(Value::is_object) {
+        let empty = serde_json::Map::new();
+        let raw_usage = obj.get("usage").and_then(Value::as_object).unwrap_or(&empty);
+        let mut usage = serde_json::Map::new();
+        for (source, target) in [
+            ("inputTokens", "input_tokens"),
+            ("outputTokens", "output_tokens"),
+            ("cacheReadTokens", "cached_read_tokens"),
+            ("cacheWriteTokens", "cached_write_tokens"),
+        ] {
+            if let Some(value) = raw_usage.get(source).filter(|value| value.is_number()) {
+                usage.insert(target.to_string(), value.clone());
+            }
+        }
+        let mut frame = serde_json::Map::new();
+        frame.insert("type".to_string(), json!("usage"));
+        frame.insert("usage".to_string(), Value::Object(usage));
+        if let Some(duration) = obj.get("duration_ms").filter(|value| value.is_number()) {
+            frame.insert("durationMs".to_string(), duration.clone());
+        }
+        on_event(StreamEvent::Json(Value::Object(frame)));
+        return true;
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod json_event_tests {
     use super::*;
@@ -3568,6 +3727,168 @@ mod json_event_tests {
             vec![
                 json!({"type": "status", "label": "initializing", "model": "gemini-3.5-flash"}),
                 json!({"type": "text_delta", "delta": "Hello from Antigravity."}),
+            ]
+        );
+    }
+
+    /// A cursor-agent assistant frame. `timestamp_ms` marks a real-time
+    /// incremental delta; `model_call_id` marks a terminal full-turn replay.
+    fn cursor_assistant(text: &str, timestamp_ms: Option<i64>, model_call_id: Option<&str>) -> Value {
+        let mut frame = serde_json::Map::new();
+        frame.insert("type".to_string(), json!("assistant"));
+        if let Some(timestamp) = timestamp_ms {
+            frame.insert("timestamp_ms".to_string(), json!(timestamp));
+        }
+        if let Some(call) = model_call_id {
+            frame.insert("model_call_id".to_string(), json!(call));
+        }
+        frame.insert(
+            "message".to_string(),
+            json!({"role": "assistant", "content": [{"type": "text", "text": text}]}),
+        );
+        Value::Object(frame)
+    }
+
+    /// Parity: `json-event-stream.test.ts:908`.
+    #[test]
+    fn cursor_emits_partial_text_once_and_usage() {
+        let mut probe = Probe::new("cursor-agent");
+        probe.feed(&frame_line(&json!({"type": "system", "subtype": "init", "model": "GPT-5 Mini"})));
+        probe.feed(&frame_line(&cursor_assistant("OD", Some(1), None)));
+        probe.feed(&frame_line(&cursor_assistant("_OK", Some(2), None)));
+        probe.feed(&frame_line(&cursor_assistant("OD_OK", None, None)));
+        probe.feed(&frame_line(&json!({
+            "type": "result",
+            "duration_ms": 120,
+            "usage": {"inputTokens": 5, "outputTokens": 2, "cacheReadTokens": 1, "cacheWriteTokens": 0},
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "status", "label": "initializing", "model": "GPT-5 Mini"}),
+                json!({"type": "text_delta", "delta": "OD"}),
+                json!({"type": "text_delta", "delta": "_OK"}),
+                json!({
+                    "type": "usage",
+                    "usage": {
+                        "input_tokens": 5,
+                        "output_tokens": 2,
+                        "cached_read_tokens": 1,
+                        "cached_write_tokens": 0,
+                    },
+                    "durationMs": 120,
+                }),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:950`.
+    #[test]
+    fn cursor_emits_suffix_when_the_final_assistant_extends_partial_text() {
+        let mut probe = Probe::new("cursor-agent");
+        probe.feed(&frame_line(&cursor_assistant("hello", Some(1), None)));
+        probe.feed(&frame_line(&cursor_assistant("hello world", None, None)));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "text_delta", "delta": "hello"}),
+                json!({"type": "text_delta", "delta": " world"}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:973` — a repeated fragment is real
+    /// output and must not be deduped by content.
+    #[test]
+    fn cursor_concatenates_independent_timestamped_fragments_verbatim() {
+        let mut probe = Probe::new("cursor-agent");
+        probe.feed(&frame_line(&cursor_assistant("hello", Some(1), None)));
+        probe.feed(&frame_line(&cursor_assistant(" world", Some(2), None)));
+        probe.feed(&frame_line(&cursor_assistant(" world", Some(3), None)));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "text_delta", "delta": "hello"}),
+                json!({"type": "text_delta", "delta": " world"}),
+                json!({"type": "text_delta", "delta": " world"}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:1011`.
+    #[test]
+    fn cursor_skips_a_model_call_id_replay_to_avoid_duplicate_content() {
+        let mut probe = Probe::new("cursor-agent");
+        probe.feed(&frame_line(&cursor_assistant("hello", Some(1), None)));
+        probe.feed(&frame_line(&cursor_assistant(" world", Some(2), None)));
+        probe.feed(&frame_line(&cursor_assistant("hello world", Some(3), Some("call-1"))));
+        probe.feed(&frame_line(&cursor_assistant("second", Some(4), None)));
+        probe.feed(&frame_line(&cursor_assistant(" turn", Some(5), None)));
+        probe.feed(&frame_line(&cursor_assistant("second turn", Some(6), Some("call-2"))));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "text_delta", "delta": "hello"}),
+                json!({"type": "text_delta", "delta": " world"}),
+                json!({"type": "text_delta", "delta": "second"}),
+                json!({"type": "text_delta", "delta": " turn"}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:1097` — a dropped chunk is recovered
+    /// from the replay of the SECOND turn, because the replay is reconciled
+    /// against that turn's text, not the whole buffer.
+    #[test]
+    fn cursor_emits_the_missing_suffix_from_a_second_turn_replay() {
+        let mut probe = Probe::new("cursor-agent");
+        probe.feed(&frame_line(&cursor_assistant("hello world", Some(1), None)));
+        probe.feed(&frame_line(&cursor_assistant("hello world", Some(2), Some("call-1"))));
+        probe.feed(&frame_line(&cursor_assistant("second", Some(3), None)));
+        probe.feed(&frame_line(&cursor_assistant("second turn", Some(4), Some("call-2"))));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "text_delta", "delta": "hello world"}),
+                json!({"type": "text_delta", "delta": "second"}),
+                json!({"type": "text_delta", "delta": " turn"}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:1190`.
+    #[test]
+    fn cursor_does_not_duplicate_output_across_two_fallback_terminated_turns() {
+        let mut probe = Probe::new("cursor-agent");
+        probe.feed(&frame_line(&cursor_assistant("hello", Some(1), None)));
+        probe.feed(&frame_line(&cursor_assistant("hello world", None, None)));
+        probe.feed(&frame_line(&cursor_assistant("second", Some(2), None)));
+        probe.feed(&frame_line(&cursor_assistant("second turn", None, None)));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "text_delta", "delta": "hello"}),
+                json!({"type": "text_delta", "delta": " world"}),
+                json!({"type": "text_delta", "delta": "second"}),
+                json!({"type": "text_delta", "delta": " turn"}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:1287` — when a middle fragment was
+    /// dropped the emitted text is not a replay prefix, so nothing is appended
+    /// rather than re-showing an already-visible suffix.
+    #[test]
+    fn cursor_leaves_an_unverifiable_replay_alone() {
+        let mut probe = Probe::new("cursor-agent");
+        probe.feed(&frame_line(&cursor_assistant("hello", Some(1), None)));
+        probe.feed(&frame_line(&cursor_assistant(" world", Some(2), None)));
+        probe.feed(&frame_line(&cursor_assistant("hello brave world", None, None)));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "text_delta", "delta": "hello"}),
+                json!({"type": "text_delta", "delta": " world"}),
             ]
         );
     }
