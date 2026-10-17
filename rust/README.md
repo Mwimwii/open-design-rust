@@ -171,7 +171,7 @@ Tracked with beads (`bd list`); the epic is `open_design_rust-7c7`.
 | MCP routes (`apps/daemon/src/mcp.ts`) | done |
 | Chat + BYOK routes | done (feedback, provider models, connection tests, proxies, critique) |
 | Agent launch/spawn parity, chat runtime registry | done |
-| Per-runtime protocol adapters beyond copilot/claude (`json-event-stream`, `qoder-stream`, `plain-stream`) | `open_design_rust-lhe` complete: `qoder-stream` and every `json-event-stream` kind (`opencode`/`gemini`/`antigravity`/`kimi`/`cursor-agent`/`codex`) are wired in the pump, and `plain_stream.rs` ports the plain-lane artifact extraction with its markdown-context rules. `createCodexFrameHandler` is exercised by the unported `agent-protocol/codex-app-server` transport; persisting extracted plain-lane artifacts needs the project-file write API (`open_design_rust-lhe.2`) |
+| Per-runtime protocol adapters beyond copilot/claude (`json-event-stream`, `qoder-stream`, `plain-stream`) | `open_design_rust-lhe` complete: `qoder-stream` and every `json-event-stream` kind (`opencode`/`gemini`/`antigravity`/`kimi`/`cursor-agent`/`codex`) are wired in the pump, and `plain_stream.rs` ports the plain-lane artifact extraction with its markdown-context rules. `createCodexFrameHandler` is exercised by the unported `agent-protocol/codex-app-server` transport; persisting extracted plain-lane artifacts needs the project-file write API (`open_design_rust-j6p`) |
 | Media executors and tool-loop proxies | not started (`open_design_rust-fma`) |
 | Agent-mode connection tests | not started (`open_design_rust-bn6`) |
 | Proxy guard and telemetry parity | not started (`open_design_rust-ut9`) |

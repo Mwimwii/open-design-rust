@@ -25,13 +25,18 @@ const STRING_LADDER_MIN_BYTES: usize = 256;
 pub enum StreamEvent {
     Status {
         label: String,
-        model: Option<String>,
-        /// Claude/Qoder `session_id` as the wire carries it (parity: the
-        /// `sessionId` field on the TS `status` event).
-        session_id: Option<String>,
-        /// Qoder's `qodercli_version` (parity: the `qodercliVersion` field on
-        /// the TS `status` event; only the Qoder parser sets it).
-        qodercli_version: Option<String>,
+        /// `None` omits the key; `Some(Value::Null)` emits an explicit null.
+        /// TS is not uniform here: Claude's init writes `model: obj.model ??
+        /// null` (key always present), while the Copilot/Qoder init statuses
+        /// write the key only when the wire carried it.
+        model: Option<Value>,
+        /// Parity: the `sessionId` field on the TS `status` event.
+        session_id: Option<Value>,
+        /// Parity: the `qodercliVersion` field on the TS `status` event (only
+        /// the Qoder parser sets it).
+        qodercli_version: Option<Value>,
+        /// Parity: the `ttftMs` field Claude's `streaming` status carries.
+        ttft_ms: Option<i64>,
     },
     ThinkingDelta { delta: String },
     TextDelta { delta: String },
@@ -85,24 +90,27 @@ impl StreamEvent {
                 model,
                 session_id,
                 qodercli_version,
+                ttft_ms,
             } => {
                 let mut event = serde_json::Map::new();
                 event.insert("type".to_string(), Value::String("status".to_string()));
                 event.insert("label".to_string(), Value::String(label.clone()));
-                // `model` stays present-but-null for parity with the TS
-                // parsers that always emit the key.
-                event.insert(
-                    "model".to_string(),
-                    model.clone().map(Value::String).unwrap_or(Value::Null),
-                );
+                // Each key is inserted only when the TS frame that produced it
+                // carries it — see the field docs on the variant.
+                if let Some(model) = model {
+                    event.insert("model".to_string(), model.clone());
+                }
                 if let Some(session_id) = session_id {
-                    event.insert("sessionId".to_string(), Value::String(session_id.clone()));
+                    event.insert("sessionId".to_string(), session_id.clone());
                 }
                 if let Some(qodercli_version) = qodercli_version {
                     event.insert(
                         "qodercliVersion".to_string(),
-                        Value::String(qodercli_version.clone()),
+                        qodercli_version.clone(),
                     );
+                }
+                if let Some(ttft_ms) = ttft_ms {
+                    event.insert("ttftMs".to_string(), Value::from(*ttft_ms));
                 }
                 Value::Object(event)
             }
@@ -315,9 +323,10 @@ impl CopilotParser {
                 if let Some(model) = get("model").and_then(Value::as_str) {
                     on_event(StreamEvent::Status {
                         label: "initializing".to_string(),
-                        model: Some(model.to_string()),
+                        model: Some(Value::String(model.to_string())),
                         session_id: None,
                         qodercli_version: None,
+                        ttft_ms: None,
                     });
                 }
             }
@@ -326,6 +335,7 @@ impl CopilotParser {
                 model: None,
                 session_id: None,
                 qodercli_version: None,
+                ttft_ms: None,
             }),
             "assistant.reasoning_delta" => {
                 if let Some(delta) = get("deltaContent").and_then(Value::as_str) {
@@ -419,15 +429,17 @@ mod tests {
             vec![
                 StreamEvent::Status {
                     label: "initializing".to_string(),
-                    model: Some("gpt-5.2".to_string()),
+                    model: Some(json!("gpt-5.2")),
                     session_id: None,
                     qodercli_version: None,
+                    ttft_ms: None,
                 },
                 StreamEvent::Status {
                     label: "streaming".to_string(),
                     model: None,
                     session_id: None,
                     qodercli_version: None,
+                    ttft_ms: None,
                 },
                 StreamEvent::ThinkingDelta {
                     delta: "hmm".to_string()
@@ -631,17 +643,24 @@ impl ClaudeParser {
         if obj_type == "system" {
             match obj.get("subtype").and_then(Value::as_str).unwrap_or("") {
                 "init" => {
+                    // TS: `model: obj.model ?? null, sessionId: obj.session_id ??
+                    // null` — both keys are always present, null when absent.
                     on_event(StreamEvent::Status {
                         label: "initializing".to_string(),
-                        model: obj
-                            .get("model")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        session_id: obj
-                            .get("session_id")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
+                        model: Some(
+                            obj.get("model")
+                                .and_then(Value::as_str)
+                                .map(|model| json!(model))
+                                .unwrap_or(Value::Null),
+                        ),
+                        session_id: Some(
+                            obj.get("session_id")
+                                .and_then(Value::as_str)
+                                .map(|session| json!(session))
+                                .unwrap_or(Value::Null),
+                        ),
                         qodercli_version: None,
+                        ttft_ms: None,
                     });
                     return;
                 }
@@ -655,6 +674,7 @@ impl ClaudeParser {
                         model: None,
                         session_id: None,
                         qodercli_version: None,
+                        ttft_ms: None,
                     });
                     return;
                 }
@@ -1000,13 +1020,14 @@ impl ClaudeParser {
             self.current_message_streamed_text = false;
             self.current_message_streamed_thinking = false;
             if let Some(ttft) = event.get("ttft_ms").and_then(Value::as_i64) {
-                let mut data = serde_json::Map::new();
-                data.insert("type".to_string(), Value::String("status".to_string()));
-                data.insert("label".to_string(), Value::String("streaming".to_string()));
-                data.insert("ttftMs".to_string(), Value::from(ttft));
-                on_event(StreamEvent::Raw {
-                    line: Value::Object(data).to_string(),
-                    truncated_original_bytes: None,
+                // Parity: `onEvent({ type: 'status', label: 'streaming',
+                // ttftMs: ev.ttft_ms })` — a status frame, never a raw one.
+                on_event(StreamEvent::Status {
+                    label: "streaming".to_string(),
+                    model: None,
+                    session_id: None,
+                    qodercli_version: None,
+                    ttft_ms: Some(ttft),
                 });
             }
             return;
@@ -1199,17 +1220,24 @@ impl QoderParser {
         let obj_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
 
         if obj_type == "system" && obj.get("subtype").and_then(Value::as_str) == Some("init") {
+            // TS: `model: typeof obj.model === 'string' ? obj.model : undefined`
+            // (and the same for sessionId / qodercliVersion) — the key is
+            // omitted, not null, when the wire did not carry a string.
             on_event(StreamEvent::Status {
                 label: "initializing".to_string(),
-                model: obj.get("model").and_then(Value::as_str).map(str::to_string),
+                model: obj
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(|model| json!(model)),
                 session_id: obj
                     .get("session_id")
                     .and_then(Value::as_str)
-                    .map(str::to_string),
+                    .map(|session| json!(session)),
                 qodercli_version: obj
                     .get("qodercli_version")
                     .and_then(Value::as_str)
-                    .map(str::to_string),
+                    .map(|version| json!(version)),
+                ttft_ms: None,
             });
             return;
         }
@@ -1928,6 +1956,18 @@ mod qoder_tests {
     }
 
     #[test]
+    fn system_init_omits_absent_keys_instead_of_nulling_them() {
+        // TS: `model: typeof obj.model === 'string' ? obj.model : undefined` —
+        // an absent field drops the key, it does not become null.
+        let events = collect("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"session-1\"}\n");
+        let json = events[0].to_json();
+        assert_eq!(json["label"], "initializing");
+        assert_eq!(json["sessionId"], "session-1");
+        assert!(json.get("model").is_none(), "json: {json}");
+        assert!(json.get("qodercliVersion").is_none(), "json: {json}");
+    }
+
+    #[test]
     fn assistant_content_blocks_map_to_text_and_thinking() {
         let events = collect(concat!(
             "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Hello\"},{\"type\":\"text\",\"text\":\" world\"}]}}\n",
@@ -2089,6 +2129,32 @@ mod claude_tests {
                 StreamEvent::Json(_) => "json",
             })
             .collect()
+    }
+
+    #[test]
+    fn status_frames_carry_exactly_the_keys_typescript_writes() {
+        // TS `system/init` writes `model: obj.model ?? null` and
+        // `sessionId: obj.session_id ?? null`: both keys present, null when the
+        // wire had nothing.
+        let events = collect("{\"type\":\"system\",\"subtype\":\"init\"}\n");
+        assert_eq!(
+            events[0].to_json(),
+            json!({"type": "status", "label": "initializing", "model": null, "sessionId": null})
+        );
+        // A `system/status` frame has neither key.
+        let events = collect("{\"type\":\"system\",\"subtype\":\"status\",\"status\":\"working\"}\n");
+        assert_eq!(
+            events[0].to_json(),
+            json!({"type": "status", "label": "working"})
+        );
+        // The TTFT status is a status frame, not a raw line.
+        let events = collect(
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\",\"message\":{\"id\":\"m1\"},\"ttft_ms\":1234}}\n",
+        );
+        assert_eq!(
+            events[0].to_json(),
+            json!({"type": "status", "label": "streaming", "ttftMs": 1234})
+        );
     }
 
     #[test]
