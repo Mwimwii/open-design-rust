@@ -3412,13 +3412,27 @@ async fn pump_child(
                 });
             }
         } else if let Some(stdout) = stdout {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                runs_for_out.push_external_event(
-                    &out_id,
-                    "stdout",
-                    serde_json::json!({ "runId": out_id, "text": line }),
-                );
+            // The plain/BYOK lane streams the child's stdout to the renderer.
+            // Parity: `packages/contracts` `ChatSseChunkPayload` is `{ chunk }`
+            // and `apps/web` reads `event.data.chunk`, so the field must be
+            // `chunk`; read whole lines (newline included) so a plain adapter's
+            // output does not lose its line breaks.
+            let mut reader = BufReader::new(stdout);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let chunk = String::from_utf8_lossy(&buf).into_owned();
+                        runs_for_out.push_external_event(
+                            &out_id,
+                            "stdout",
+                            serde_json::json!({ "runId": out_id, "chunk": chunk }),
+                        );
+                    }
+                    Err(_) => break,
+                }
             }
         }
     });

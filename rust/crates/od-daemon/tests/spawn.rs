@@ -149,6 +149,13 @@ async fn spawned_shim_runs_to_succeeded_with_stdout_events() {
     assert_eq!(status, "succeeded", "run did not succeed");
     let (_, events) = get_events(addr, &run_id).await;
     assert!(events.contains("hello-from-shim"), "events: {events}");
+    // Parity: the plain lane's stdout payload is `{ chunk }`
+    // (packages/contracts `ChatSseChunkPayload`). The web client reads
+    // `event.data.chunk`, so naming it `text` silently drops every plain chunk.
+    assert!(
+        events.contains("\"chunk\""),
+        "stdout payload lacks the contract's chunk field: {events}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
