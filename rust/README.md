@@ -141,7 +141,10 @@ repository-root `AGENTS.md` and follow it.
   per-kind (an OpenCode `usage` frame carries `costUsd` but no
   `stopReason`/`durationMs`; a Claude one carries all three), so a shared shape
   would add or drop keys. The typed variants encode the Claude/Copilot/Qoder
-  shapes only.
+  shapes only. The pump resolves the kind the way TS does —
+  `def.eventParser || def.id` — and routes it through
+  `protocol::json_event_kind_supported`; a kind without a ported handler stays on
+  the plain lane instead of losing every line to a bare raw event.
 - Every route registers in `routes.rs` **before** the `/api/{*rest}`
   catch-all.
 - Filesystem access goes through the containment helpers in
@@ -168,7 +171,7 @@ Tracked with beads (`bd list`); the epic is `open_design_rust-7c7`.
 | MCP routes (`apps/daemon/src/mcp.ts`) | done |
 | Chat + BYOK routes | done (feedback, provider models, connection tests, proxies, critique) |
 | Agent launch/spawn parity, chat runtime registry | done |
-| Per-runtime protocol adapters beyond copilot/claude (`json-event-stream`, `qoder-stream`, `plain-stream`) | in progress (`open_design_rust-lhe`): `qoder-stream` landed; `json-event-stream` has the OpenCode kind (`opencode`/`byok-opencode`/`mimo`), wired in the pump — `gemini`/`antigravity`/`kimi`/`cursor-agent`/`codex` kinds and `plain-stream` remain |
+| Per-runtime protocol adapters beyond copilot/claude (`json-event-stream`, `qoder-stream`, `plain-stream`) | in progress (`open_design_rust-lhe`): `qoder-stream` landed; `json-event-stream` has the `opencode`/`gemini`/`antigravity`/`kimi` kinds wired in the pump — the `cursor-agent` and `codex` kinds and `plain-stream` remain |
 | Media executors and tool-loop proxies | not started (`open_design_rust-fma`) |
 | Agent-mode connection tests | not started (`open_design_rust-bn6`) |
 | Proxy guard and telemetry parity | not started (`open_design_rust-ut9`) |

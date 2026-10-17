@@ -1521,6 +1521,24 @@ struct JsonParserState {
     open_code_tool_events: OpenCodeToolEvents,
     open_code_tool_uses: HashSet<String>,
     open_code_tool_results: HashSet<String>,
+    // Artifact-suppression state (parity: the four `artifact*`/
+    // `suppress*ArtifactText` fields of `ParserState`). A file-writing tool
+    // call is followed by the CLI echoing the written content back; the echo
+    // is dropped so the artifact is not shown twice.
+    suppress_next_artifact_text: bool,
+    suppress_duplicate_artifact_text: bool,
+    artifact_open_candidate: String,
+    pending_artifact_text: String,
+    antigravity_tool_uses: HashSet<String>,
+    antigravity_text_emitted: bool,
+}
+
+/// Whether `json-event-stream.ts` has a ported handler for `kind` (parity:
+/// `createJsonEventStreamHandler(kind, …)`). An unported kind is routed to the
+/// plain stdout lane by the pump rather than losing every line to a bare raw
+/// event.
+pub fn json_event_kind_supported(kind: &str) -> bool {
+    matches!(kind, "opencode" | "gemini" | "antigravity" | "kimi")
 }
 
 impl JsonEventParser {
@@ -1553,6 +1571,7 @@ impl JsonEventParser {
         if self.kind == "opencode" {
             self.state.open_code_tool_events.flush(on_event);
         }
+        flush_pending_artifact_text(&mut self.state, on_event);
     }
 
     fn handle_line(&mut self, line: &str, on_event: &mut dyn FnMut(StreamEvent)) {
@@ -1560,7 +1579,14 @@ impl JsonEventParser {
             on_event(bound_raw_line(line));
             return;
         };
-        if self.kind == "opencode" && self.handle_opencode(&obj, line, on_event) {
+        let handled = match self.kind {
+            "opencode" => self.handle_opencode(&obj, line, on_event),
+            "gemini" => handle_gemini_event(&mut self.state, &obj, line, on_event),
+            "antigravity" => handle_antigravity_event(&mut self.state, &obj, line, on_event),
+            "kimi" => handle_kimi_event(&obj, on_event),
+            _ => false,
+        };
+        if handled {
             return;
         }
         on_event(bound_raw_line(line));
@@ -2115,6 +2141,583 @@ mod claude_tests {
     }
 }
 
+/// `String(value)` for the JSON scalars a frame carries (parity: the
+/// `String(x ?? '')` casts in `json-event-stream.ts`).
+fn stringify_scalar(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// Parity: `normalizeTodoStatus` (`json-event-stream.ts:587`).
+fn normalize_todo_status(value: Option<&Value>) -> String {
+    let status = match value.and_then(Value::as_str) {
+        Some(text) => {
+            static SEPARATORS: OnceLock<Regex> = OnceLock::new();
+            let separators = SEPARATORS.get_or_init(|| Regex::new(r"[-\s]+").expect("todo status regex"));
+            separators
+                .replace_all(&text.trim().to_lowercase(), "_")
+                .to_string()
+        }
+        None => String::new(),
+    };
+    if matches!(status.as_str(), "completed" | "complete" | "done") || status.starts_with("completed") {
+        return "completed".to_string();
+    }
+    if matches!(status.as_str(), "in_progress" | "doing" | "active") || status.starts_with("in_progress") {
+        return "in_progress".to_string();
+    }
+    if matches!(
+        status.as_str(),
+        "stopped" | "failed" | "blocked" | "canceled" | "cancelled"
+    ) || status.starts_with("stopped")
+        || status.starts_with("failed")
+        || status.starts_with("blocked")
+        || status.starts_with("canceled")
+        || status.starts_with("cancelled")
+    {
+        return "stopped".to_string();
+    }
+    "pending".to_string()
+}
+
+/// Parity: `todoWriteInputFromItems` (`json-event-stream.ts:614`).
+fn todo_write_input_from_items(items: &Value) -> Option<Value> {
+    let items = items.as_array()?;
+    let mut todos = Vec::new();
+    for raw in items {
+        let Some(raw) = raw.as_object() else { continue };
+        let content = raw
+            .get("content")
+            .and_then(Value::as_str)
+            .or_else(|| raw.get("label").and_then(Value::as_str))
+            .or_else(|| raw.get("description").and_then(Value::as_str))
+            .or_else(|| raw.get("text").and_then(Value::as_str))
+            .unwrap_or("");
+        if content.is_empty() {
+            continue;
+        }
+        let status = if raw.get("completed").and_then(Value::as_bool) == Some(true) {
+            "completed".to_string()
+        } else {
+            normalize_todo_status(raw.get("status"))
+        };
+        todos.push(json!({ "content": content, "status": status }));
+    }
+    if todos.is_empty() {
+        return None;
+    }
+    Some(json!({ "todos": todos }))
+}
+
+/// Parity: `todoWriteInputFromParsedValue` (`json-event-stream.ts:640`).
+fn todo_write_input_from_parsed_value(value: &Value) -> Option<Value> {
+    if value.is_array() {
+        return todo_write_input_from_items(value);
+    }
+    let value = value.as_object()?;
+    for key in ["todos", "todo"] {
+        if let Some(items) = value.get(key).filter(|items| items.is_array()) {
+            return todo_write_input_from_items(items);
+        }
+    }
+    None
+}
+
+/// Parity: `artifactOpenCandidateLength` (`json-event-stream.ts:686`) — how
+/// many trailing bytes could be the start of the artifact open tag.
+fn artifact_open_candidate_length(text: &str, open_tag: &str) -> usize {
+    let max = (open_tag.len() - 1).min(text.len());
+    let mut len = max;
+    while len > 0 {
+        if text.is_char_boundary(text.len() - len) && open_tag.starts_with(&text[text.len() - len..]) {
+            return len;
+        }
+        len -= 1;
+    }
+    0
+}
+
+/// Parity: `stripDuplicateArtifactText` (`json-event-stream.ts:648`) — drop the
+/// text a file-writing tool already wrote to disk.
+fn strip_duplicate_artifact_text(text: &str, state: &mut JsonParserState) -> String {
+    const OPEN_TAG: &str = "<artifact";
+    const CLOSE_TAG: &str = "</artifact>";
+    if !state.suppress_next_artifact_text
+        && !state.suppress_duplicate_artifact_text
+        && state.artifact_open_candidate.is_empty()
+    {
+        return text.to_string();
+    }
+    let current = format!("{}{}", state.artifact_open_candidate, text);
+    state.artifact_open_candidate = String::new();
+    if state.suppress_duplicate_artifact_text {
+        let Some(close_index) = current.find(CLOSE_TAG) else {
+            return String::new();
+        };
+        state.suppress_duplicate_artifact_text = false;
+        state.suppress_next_artifact_text = false;
+        return strip_duplicate_artifact_text(&current[close_index + CLOSE_TAG.len()..], state);
+    }
+    let Some(open_index) = current.find(OPEN_TAG) else {
+        let candidate_length = artifact_open_candidate_length(&current, OPEN_TAG);
+        if state.suppress_next_artifact_text && candidate_length > 0 {
+            state.artifact_open_candidate = current[current.len() - candidate_length..].to_string();
+            return current[..current.len() - candidate_length].to_string();
+        }
+        if state.suppress_next_artifact_text {
+            state.suppress_next_artifact_text = false;
+        }
+        return current;
+    };
+    state.suppress_duplicate_artifact_text = true;
+    state.suppress_next_artifact_text = false;
+    let prefix = format!("{}{}", state.pending_artifact_text, &current[..open_index]);
+    state.pending_artifact_text = String::new();
+    format!(
+        "{}{}",
+        prefix,
+        strip_duplicate_artifact_text(&current[open_index..], state)
+    )
+}
+
+/// Parity: `flushPendingArtifactText` (`json-event-stream.ts:694`).
+fn flush_pending_artifact_text(state: &mut JsonParserState, on_event: &mut dyn FnMut(StreamEvent)) {
+    let delta = format!("{}{}", state.pending_artifact_text, state.artifact_open_candidate);
+    if delta.is_empty() {
+        return;
+    }
+    state.pending_artifact_text = String::new();
+    state.artifact_open_candidate = String::new();
+    state.suppress_next_artifact_text = false;
+    on_event(StreamEvent::Json(json!({ "type": "text_delta", "delta": delta })));
+}
+
+/// Parity: `isFileWriteToolUse` (`json-event-stream.ts:703`).
+fn is_file_write_tool_use(tool_name: &str, input: Option<&Value>) -> bool {
+    let Some(input) = input.and_then(Value::as_object) else {
+        return false;
+    };
+    let path = input
+        .get("file_path")
+        .and_then(Value::as_str)
+        .or_else(|| input.get("path").and_then(Value::as_str))
+        .unwrap_or("");
+    if !matches!(tool_name, "write_file" | "write" | "replace" | "edit") {
+        return false;
+    }
+    static SOURCE_FILE: OnceLock<Regex> = OnceLock::new();
+    let source_file = SOURCE_FILE.get_or_init(|| {
+        Regex::new(r"(?i)\.(html|htm|css|js|jsx|ts|tsx|md)$").expect("file-write extension regex")
+    });
+    if source_file.is_match(path) {
+        return true;
+    }
+    input.get("content").and_then(Value::as_str).is_some()
+        || input.get("new_string").and_then(Value::as_str).is_some()
+}
+
+/// Parity: the frame text TS re-serializes for a `raw` field
+/// (`stringifyContent(obj)`). We echo the original line instead: for the
+/// compact frames these wires emit the two are byte-identical, and echoing
+/// cannot reorder keys the way a map round-trip can.
+fn frame_raw(line: &str) -> Option<String> {
+    Some(line.to_string())
+}
+
+/// Parity: `handleGeminiEvent` (`json-event-stream.ts:307`).
+fn handle_gemini_event(
+    state: &mut JsonParserState,
+    obj: &Value,
+    line: &str,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> bool {
+    let Some(obj) = obj.as_object() else {
+        return false;
+    };
+    let ty = obj.get("type").and_then(Value::as_str).unwrap_or("");
+    let role = obj.get("role").and_then(Value::as_str).unwrap_or("");
+    let content = obj.get("content").and_then(Value::as_str);
+    let is_assistant_text =
+        ty == "message" && role == "assistant" && content.is_some_and(|text| !text.is_empty());
+    if !is_assistant_text {
+        flush_pending_artifact_text(state, on_event);
+    }
+
+    if ty == "init" {
+        let mut frame = serde_json::Map::new();
+        frame.insert("type".to_string(), json!("status"));
+        frame.insert("label".to_string(), json!("initializing"));
+        if let Some(model) = obj.get("model").and_then(Value::as_str) {
+            frame.insert("model".to_string(), json!(model));
+        }
+        on_event(StreamEvent::Json(Value::Object(frame)));
+        return true;
+    }
+
+    if ty == "message" && role == "user" {
+        return true;
+    }
+
+    if is_assistant_text {
+        let delta = strip_duplicate_artifact_text(content.unwrap_or(""), state);
+        if !delta.is_empty() {
+            on_event(StreamEvent::Json(json!({ "type": "text_delta", "delta": delta })));
+        }
+        return true;
+    }
+
+    if ty == "tool_use" {
+        let tool_id = obj.get("tool_id").and_then(Value::as_str);
+        let tool_name = obj.get("tool_name").and_then(Value::as_str);
+        if let (Some(tool_id), Some(tool_name)) = (tool_id, tool_name) {
+            let parameters = obj.get("parameters");
+            let input = parameters
+                .and_then(safe_parse_json)
+                .or_else(|| parameters.cloned())
+                .unwrap_or(Value::Null);
+            if tool_name == "write_todos" {
+                if let Some(todo_input) = todo_write_input_from_parsed_value(&input) {
+                    on_event(StreamEvent::Json(json!({
+                        "type": "tool_use",
+                        "id": format!("{tool_id}:todo-native"),
+                        "name": "TodoWrite",
+                        "input": todo_input,
+                    })));
+                    return true;
+                }
+            }
+            if is_file_write_tool_use(tool_name, Some(&input)) {
+                state.suppress_next_artifact_text = true;
+            }
+            on_event(StreamEvent::Json(json!({
+                "type": "tool_use",
+                "id": tool_id,
+                "name": tool_name,
+                "input": input,
+            })));
+            return true;
+        }
+    }
+
+    if ty == "tool_result" {
+        if let Some(tool_id) = obj.get("tool_id").and_then(Value::as_str) {
+            let error = obj.get("error").filter(|error| error.is_object());
+            let error_message = error.map(|error| extract_error_message(error, "")).unwrap_or_default();
+            let output = match obj.get("output") {
+                Some(Value::String(text)) => text.clone(),
+                _ if !error_message.is_empty() => error_message,
+                other => stringify_content(other),
+            };
+            on_event(StreamEvent::Json(json!({
+                "type": "tool_result",
+                "toolUseId": tool_id,
+                "content": output,
+                "isError": obj.get("status").and_then(Value::as_str) == Some("error") || error.is_some(),
+            })));
+            return true;
+        }
+    }
+
+    if ty == "error" {
+        let severity = obj
+            .get("severity")
+            .and_then(Value::as_str)
+            .map(str::to_lowercase)
+            .unwrap_or_default();
+        let fallback = if severity == "warning" {
+            "Gemini CLI warning"
+        } else {
+            "Gemini CLI error"
+        };
+        let source = obj.get("message").or_else(|| obj.get("error")).unwrap_or(&Value::Null);
+        let message = extract_error_message(source, fallback);
+        if severity == "warning" {
+            on_event(StreamEvent::Json(
+                json!({ "type": "status", "label": "warning", "detail": message }),
+            ));
+        } else {
+            on_event(StreamEvent::Error {
+                message,
+                code: None,
+                raw: frame_raw(line),
+            });
+        }
+        return true;
+    }
+
+    if ty == "result" {
+        let failed = obj.get("status").and_then(Value::as_str) == Some("error")
+            || obj.get("error").is_some_and(|error| error.is_object());
+        if failed {
+            on_event(StreamEvent::Error {
+                message: extract_error_message(obj.get("error").unwrap_or(&Value::Null), "Gemini CLI error"),
+                code: None,
+                raw: frame_raw(line),
+            });
+            return true;
+        }
+        let Some(stats) = obj.get("stats").filter(|stats| stats.is_object()) else {
+            return true;
+        };
+        let mut usage = serde_json::Map::new();
+        for (source, target) in [
+            ("input_tokens", "input_tokens"),
+            ("output_tokens", "output_tokens"),
+            ("cached", "cached_read_tokens"),
+        ] {
+            if let Some(value) = stats.get(source).filter(|value| value.is_number()) {
+                usage.insert(target.to_string(), value.clone());
+            }
+        }
+        let mut frame = serde_json::Map::new();
+        frame.insert("type".to_string(), json!("usage"));
+        frame.insert("usage".to_string(), Value::Object(usage));
+        if let Some(duration) = stats.get("duration_ms").filter(|value| value.is_number()) {
+            frame.insert("durationMs".to_string(), duration.clone());
+        }
+        on_event(StreamEvent::Json(Value::Object(frame)));
+        return true;
+    }
+
+    false
+}
+
+/// Parity: `handleAntigravityEvent` (`json-event-stream.ts:435`). Frames
+/// without an `event` discriminator fall back to the Gemini-CLI JSONL branch,
+/// which some agy-compatible builds print.
+fn handle_antigravity_event(
+    state: &mut JsonParserState,
+    obj: &Value,
+    line: &str,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> bool {
+    let Some(obj) = obj.as_object() else {
+        return false;
+    };
+    let Some(event) = obj.get("event").and_then(Value::as_str) else {
+        return handle_gemini_event(state, &Value::Object(obj.clone()), line, on_event);
+    };
+
+    if event == "init" {
+        on_event(StreamEvent::Json(json!({
+            "type": "status",
+            "label": "initializing",
+            "sessionId": obj.get("conversation_id").and_then(Value::as_str),
+        })));
+        return true;
+    }
+
+    if event == "step_update" {
+        let Some(step) = obj.get("step_update").and_then(Value::as_object) else {
+            return false;
+        };
+        let step_type = step.get("step_type").and_then(Value::as_str).unwrap_or("");
+        if step_type == "agent_response" {
+            if let Some(delta) = step
+                .get("text_delta")
+                .and_then(Value::as_str)
+                .filter(|delta| !delta.is_empty())
+            {
+                state.antigravity_text_emitted = true;
+                on_event(StreamEvent::Json(json!({ "type": "text_delta", "delta": delta })));
+            }
+            return true;
+        }
+        if step_type == "tool" {
+            let empty = serde_json::Map::new();
+            let tool_info = step
+                .get("tool_info")
+                .and_then(Value::as_object)
+                .unwrap_or(&empty);
+            let name = tool_info
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| step.get("tool_name").and_then(Value::as_str))
+                .unwrap_or("tool");
+            let conversation = step
+                .get("conversation_id")
+                .filter(|value| !value.is_null())
+                .or_else(|| obj.get("conversation_id").filter(|value| !value.is_null()))
+                .map(stringify_scalar)
+                .unwrap_or_default();
+            let step_index = step
+                .get("step_index")
+                .filter(|value| !value.is_null())
+                .map(stringify_scalar)
+                .unwrap_or_default();
+            let id = format!("{conversation}:{step_index}");
+            if !state.antigravity_tool_uses.contains(&id) {
+                state.antigravity_tool_uses.insert(id.clone());
+                on_event(StreamEvent::Json(json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": tool_info.get("parameters").cloned().unwrap_or(Value::Null),
+                })));
+            }
+            let step_state = step.get("state").and_then(Value::as_str).unwrap_or("");
+            if step_state == "DONE" || step_state == "ERROR" {
+                let content = match tool_info.get("output") {
+                    Some(Value::String(text)) => text.clone(),
+                    other => stringify_content(other),
+                };
+                on_event(StreamEvent::Json(json!({
+                    "type": "tool_result",
+                    "toolUseId": id,
+                    "content": content,
+                    "isError": step_state == "ERROR",
+                })));
+            }
+            return true;
+        }
+        // user_input echoes the prompt; checkpoint / subagent / error_message
+        // carry no user-visible payload (an error's message arrives on the
+        // terminal result).
+        return true;
+    }
+
+    if event == "result" {
+        let Some(result) = obj.get("result").and_then(Value::as_object) else {
+            return false;
+        };
+        if result.get("status").and_then(Value::as_str) != Some("SUCCESS") {
+            let message = result
+                .get("error")
+                .and_then(Value::as_str)
+                .filter(|error| !error.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!(
+                        "Antigravity run ended with status {}",
+                        result
+                            .get("status")
+                            .filter(|status| !status.is_null())
+                            .map(stringify_scalar)
+                            .unwrap_or_else(|| "unknown".to_string())
+                    )
+                });
+            on_event(StreamEvent::Error {
+                message,
+                code: None,
+                raw: frame_raw(line),
+            });
+            return true;
+        }
+        if !state.antigravity_text_emitted {
+            if let Some(response) = result
+                .get("response")
+                .and_then(Value::as_str)
+                .filter(|response| !response.is_empty())
+            {
+                state.antigravity_text_emitted = true;
+                on_event(StreamEvent::Json(
+                    json!({ "type": "text_delta", "delta": response }),
+                ));
+            }
+        }
+        let empty = serde_json::Map::new();
+        let raw_usage = result.get("usage").and_then(Value::as_object).unwrap_or(&empty);
+        let mut usage = serde_json::Map::new();
+        for (source, target) in [
+            ("input_tokens", "input_tokens"),
+            ("output_tokens", "output_tokens"),
+            ("thinking_tokens", "thought_tokens"),
+            ("cache_read_tokens", "cached_read_tokens"),
+        ] {
+            if let Some(value) = raw_usage.get(source).filter(|value| value.is_number()) {
+                usage.insert(target.to_string(), value.clone());
+            }
+        }
+        let mut frame = serde_json::Map::new();
+        frame.insert("type".to_string(), json!("usage"));
+        frame.insert("usage".to_string(), Value::Object(usage));
+        if let Some(seconds) = result
+            .get("duration_seconds")
+            .filter(|value| value.is_number())
+            .and_then(Value::as_f64)
+        {
+            frame.insert("durationMs".to_string(), json!((seconds * 1000.0).round() as i64));
+        }
+        on_event(StreamEvent::Json(Value::Object(frame)));
+        return true;
+    }
+
+    false
+}
+
+/// Parity: `handleKimiEvent` (`json-event-stream.ts:528`).
+fn handle_kimi_event(obj: &Value, on_event: &mut dyn FnMut(StreamEvent)) -> bool {
+    let Some(obj) = obj.as_object() else {
+        return false;
+    };
+    let role = obj.get("role").and_then(Value::as_str).unwrap_or("");
+
+    if role == "assistant" {
+        if let Some(tool_calls) = obj.get("tool_calls").filter(|calls| calls.is_array()) {
+            for raw_call in tool_calls.as_array().map(Vec::as_slice).unwrap_or(&[]) {
+                let Some(call) = raw_call.as_object() else { continue };
+                let function = call.get("function").and_then(Value::as_object);
+                let id = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty());
+                let name = function
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty());
+                let (Some(id), Some(name)) = (id, name) else { continue };
+                let arguments = function.and_then(|function| function.get("arguments"));
+                let input = arguments
+                    .and_then(safe_parse_json)
+                    .or_else(|| arguments.cloned())
+                    .unwrap_or(Value::Null);
+                on_event(StreamEvent::Json(json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": input,
+                })));
+            }
+            return true;
+        }
+    }
+
+    if role == "tool" {
+        if let Some(call_id) = obj
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|call_id| !call_id.is_empty())
+        {
+            on_event(StreamEvent::Json(json!({
+                "type": "tool_result",
+                "toolUseId": call_id,
+                "content": stringify_content(obj.get("content")),
+                "isError": false,
+            })));
+            return true;
+        }
+    }
+
+    if role == "assistant" {
+        if let Some(content) = obj.get("content").and_then(Value::as_str).filter(|text| !text.is_empty()) {
+            on_event(StreamEvent::Json(json!({ "type": "text_delta", "delta": content })));
+            return true;
+        }
+    }
+
+    if role == "meta" && obj.get("type").and_then(Value::as_str) == Some("session.resume_hint") {
+        return true;
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod json_event_tests {
     use super::*;
@@ -2510,11 +3113,462 @@ mod json_event_tests {
     /// the same shape TS produces for a frame its handler does not recognise.
     #[test]
     fn unported_kinds_fall_through_to_raw() {
-        let mut probe = Probe::new("gemini");
+        let mut probe = Probe::new("unknown-kind");
         probe.feed("{\"type\":\"init\",\"session_id\":\"gm-1\"}\n");
         assert_eq!(
             probe.events,
             vec![json!({"type": "raw", "line": "{\"type\":\"init\",\"session_id\":\"gm-1\"}"})]
+        );
+    }
+
+    /// Serializes a frame the way the wire carries it, so `raw` expectations
+    /// are exactly the fed text.
+    fn frame_line(frame: &Value) -> String {
+        format!("{}\n", serde_json::to_string(frame).expect("frame json"))
+    }
+
+    fn gemini_write_file(file_path: &str, content: &str) -> Value {
+        json!({
+            "type": "tool_use",
+            "tool_name": "write_file",
+            "tool_id": "write_file__1",
+            "parameters": { "file_path": file_path, "content": content },
+        })
+    }
+
+    /// Parity: `json-event-stream.test.ts:408`.
+    #[test]
+    fn gemini_emits_init_text_and_usage() {
+        let mut probe = Probe::new("gemini");
+        probe.feed(&frame_line(
+            &json!({"type": "init", "session_id": "gm-1", "model": "gemini-3-flash-preview"}),
+        ));
+        probe.feed(&frame_line(
+            &json!({"type": "message", "role": "assistant", "content": "hello", "delta": true}),
+        ));
+        probe.feed(&frame_line(&json!({
+            "type": "result",
+            "status": "success",
+            "stats": {"input_tokens": 9, "output_tokens": 4, "cached": 2, "duration_ms": 321},
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "status", "label": "initializing", "model": "gemini-3-flash-preview"}),
+                json!({"type": "text_delta", "delta": "hello"}),
+                json!({
+                    "type": "usage",
+                    "usage": {"input_tokens": 9, "output_tokens": 4, "cached_read_tokens": 2},
+                    "durationMs": 321,
+                }),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:494`.
+    #[test]
+    fn gemini_handles_real_user_tool_and_error_frames() {
+        let mut probe = Probe::new("gemini");
+        let fatal = json!({
+            "type": "result",
+            "status": "error",
+            "error": {"type": "FatalAuthenticationError", "message": "Authentication failed"},
+            "stats": {"input_tokens": 11, "output_tokens": 0, "cached": 0, "duration_ms": 42},
+        });
+        probe.feed(&frame_line(
+            &json!({"type": "message", "role": "user", "content": "make a video"}),
+        ));
+        probe.feed(&frame_line(&json!({
+            "type": "tool_use",
+            "tool_name": "write_file",
+            "tool_id": "tool-1",
+            "parameters": {"path": "timeline.json"},
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "tool_result",
+            "tool_id": "tool-1",
+            "status": "success",
+            "output": "wrote timeline.json",
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "error",
+            "severity": "warning",
+            "message": "Agent execution blocked: retrying without shell",
+        })));
+        probe.feed(&frame_line(&fatal));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "tool_use", "id": "tool-1", "name": "write_file", "input": {"path": "timeline.json"}}),
+                json!({"type": "tool_result", "toolUseId": "tool-1", "content": "wrote timeline.json", "isError": false}),
+                json!({"type": "status", "label": "warning", "detail": "Agent execution blocked: retrying without shell"}),
+                json!({"type": "error", "message": "Authentication failed", "raw": fatal.to_string()}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:606` — a file write suppresses the
+    /// echoed artifact the CLI prints next.
+    #[test]
+    fn gemini_suppresses_duplicate_artifact_text_after_a_file_write() {
+        let mut probe = Probe::new("gemini");
+        probe.feed(&frame_line(&gemini_write_file(
+            "index.html",
+            "<!doctype html><html></html>",
+        )));
+        probe.feed(&frame_line(&json!({
+            "type": "message",
+            "role": "assistant",
+            "content": "Done.\n\n<artifact identifier=\"page\" type=\"text/html\">\n<!doctype html><html></html>\n</artifact>",
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({
+                    "type": "tool_use",
+                    "id": "write_file__1",
+                    "name": "write_file",
+                    "input": {"file_path": "index.html", "content": "<!doctype html><html></html>"},
+                }),
+                json!({"type": "text_delta", "delta": "Done.\n\n"}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:645` — the open tag is split across
+    /// two frames, so its prefix must be held until the rest arrives.
+    #[test]
+    fn gemini_suppresses_artifact_text_split_across_frames() {
+        let mut probe = Probe::new("gemini");
+        probe.feed(&frame_line(&gemini_write_file(
+            "index.html",
+            "<!doctype html><html></html>",
+        )));
+        probe.feed(&frame_line(&json!({
+            "type": "message",
+            "role": "assistant",
+            "content": "Done.\n\n<",
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "message",
+            "role": "assistant",
+            "content": "artifact identifier=\"page\" type=\"text/html\">\n<!doctype html><html></html>\n</artifact>Tail",
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({
+                    "type": "tool_use",
+                    "id": "write_file__1",
+                    "name": "write_file",
+                    "input": {"file_path": "index.html", "content": "<!doctype html><html></html>"},
+                }),
+                json!({"type": "text_delta", "delta": "Done.\n\n"}),
+                json!({"type": "text_delta", "delta": "Tail"}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:826` — only the first (echoed)
+    /// artifact is dropped; a later one is real output.
+    #[test]
+    fn gemini_preserves_a_later_artifact_after_suppressing_the_echo() {
+        let mut probe = Probe::new("gemini");
+        probe.feed(&frame_line(&gemini_write_file(
+            "helper.html",
+            "<!doctype html><html>helper</html>",
+        )));
+        probe.feed(&frame_line(&json!({
+            "type": "message",
+            "role": "assistant",
+            "content": "Helper written.\n\n<artifact identifier=\"helper\" type=\"text/html\">\n<!doctype html><html>helper</html>\n</artifact>",
+        })));
+        let final_text = "Final artifact:\n\n<artifact identifier=\"final\" type=\"text/html\">\n<!doctype html><html>final</html>\n</artifact>";
+        probe.feed(&frame_line(&json!({
+            "type": "message",
+            "role": "assistant",
+            "content": final_text,
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({
+                    "type": "tool_use",
+                    "id": "write_file__1",
+                    "name": "write_file",
+                    "input": {"file_path": "helper.html", "content": "<!doctype html><html>helper</html>"},
+                }),
+                json!({"type": "text_delta", "delta": "Helper written.\n\n"}),
+                json!({"type": "text_delta", "delta": final_text}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:743` — prose after a file write with
+    /// no artifact following is emitted unchanged.
+    #[test]
+    fn gemini_keeps_prose_after_a_file_write_with_no_artifact() {
+        let mut probe = Probe::new("gemini");
+        probe.feed(&frame_line(&gemini_write_file("index.html", "<html></html>")));
+        probe.feed(&frame_line(&json!({
+            "type": "message",
+            "role": "assistant",
+            "content": "Prose only.",
+        })));
+        assert_eq!(
+            probe.events.last(),
+            Some(&json!({"type": "text_delta", "delta": "Prose only."}))
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:782` — a trailing partial open tag is
+    /// held, then flushed as prose when the stream ends.
+    #[test]
+    fn gemini_flushes_a_trailing_partial_artifact_opener_as_prose() {
+        let mut probe = Probe::new("gemini");
+        probe.feed(&frame_line(&gemini_write_file("index.html", "<html></html>")));
+        probe.feed(&frame_line(&json!({
+            "type": "message",
+            "role": "assistant",
+            "content": "Tail <art",
+        })));
+        probe.flush();
+        let deltas: Vec<&Value> = probe
+            .events
+            .iter()
+            .filter(|event| event["type"] == "text_delta")
+            .collect();
+        assert_eq!(
+            deltas,
+            vec![
+                &json!({"type": "text_delta", "delta": "Tail "}),
+                &json!({"type": "text_delta", "delta": "<art"}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:875` — a non-warning `error` frame is
+    /// fatal regardless of severity vocabulary.
+    #[test]
+    fn gemini_treats_terminal_error_frames_as_errors() {
+        let terminal = json!({"type": "error", "severity": "error", "message": "Maximum session turns exceeded"});
+        let unknown = json!({"type": "error", "severity": "critical", "error": {"message": "Invalid stream: malformed tool call"}});
+        let mut probe = Probe::new("gemini");
+        probe.feed(&frame_line(&terminal));
+        probe.feed(&frame_line(&unknown));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "error", "message": "Maximum session turns exceeded", "raw": terminal.to_string()}),
+                json!({"type": "error", "message": "Invalid stream: malformed tool call", "raw": unknown.to_string()}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:433`.
+    #[test]
+    fn kimi_emits_tool_calls_results_and_text() {
+        let mut probe = Probe::new("kimi");
+        probe.feed(&frame_line(&json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "type": "function",
+                "id": "tool-1",
+                "function": {"name": "Write", "arguments": "{\"path\":\"index.html\",\"content\":\"<html></html>\"}"},
+            }],
+        })));
+        probe.feed(&frame_line(&json!({
+            "role": "tool",
+            "tool_call_id": "tool-1",
+            "content": "Wrote 13 bytes to index.html",
+        })));
+        probe.feed(&frame_line(&json!({"role": "assistant", "content": "Done."})));
+        probe.feed(&frame_line(&json!({
+            "role": "meta",
+            "type": "session.resume_hint",
+            "session_id": "session-1",
+            "content": "To resume this session: kimi -r session-1",
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "tool_use", "id": "tool-1", "name": "Write", "input": {"path": "index.html", "content": "<html></html>"}}),
+                json!({"type": "tool_result", "toolUseId": "tool-1", "content": "Wrote 13 bytes to index.html", "isError": false}),
+                json!({"type": "text_delta", "delta": "Done."}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:2391`.
+    #[test]
+    fn antigravity_maps_text_tool_steps_and_usage() {
+        let mut probe = Probe::new("antigravity");
+        probe.feed(&frame_line(&json!({
+            "event": "init",
+            "conversation_id": "c3b66b04-872b-4fbe-a3a4-058a026ef20a",
+        })));
+        probe.feed(&frame_line(&json!({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "conversation_id": "edb1c8c1-50ba-4f3f-87eb-412d0e9d47c3",
+                "step_index": 4,
+                "tool_name": "run_command",
+                "state": "DONE",
+                "tool_info": {
+                    "name": "run_command",
+                    "parameters": {"CommandLine": "echo hello_headless_demo"},
+                    "output": "hello_headless_demo\r\n",
+                },
+            },
+        })));
+        probe.feed(&frame_line(&json!({
+            "event": "step_update",
+            "step_update": {"step_type": "agent_response", "text_delta": "Git rebase..."},
+        })));
+        probe.feed(&frame_line(&json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "duration_seconds": 6.88,
+                "usage": {
+                    "input_tokens": 10418,
+                    "output_tokens": 589,
+                    "thinking_tokens": 551,
+                    "cache_read_tokens": 8113,
+                },
+            },
+        })));
+        probe.flush();
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "status", "label": "initializing", "sessionId": "c3b66b04-872b-4fbe-a3a4-058a026ef20a"}),
+                json!({
+                    "type": "tool_use",
+                    "id": "edb1c8c1-50ba-4f3f-87eb-412d0e9d47c3:4",
+                    "name": "run_command",
+                    "input": {"CommandLine": "echo hello_headless_demo"},
+                }),
+                json!({
+                    "type": "tool_result",
+                    "toolUseId": "edb1c8c1-50ba-4f3f-87eb-412d0e9d47c3:4",
+                    "content": "hello_headless_demo\r\n",
+                    "isError": false,
+                }),
+                json!({"type": "text_delta", "delta": "Git rebase..."}),
+                json!({
+                    "type": "usage",
+                    "usage": {
+                        "input_tokens": 10418,
+                        "output_tokens": 589,
+                        "thought_tokens": 551,
+                        "cached_read_tokens": 8113,
+                    },
+                    "durationMs": 6880,
+                }),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:2429` — a non-SUCCESS result is one
+    /// error event, and no unrecognised frame leaks through as `raw`.
+    #[test]
+    fn antigravity_surfaces_an_error_result() {
+        let mut probe = Probe::new("antigravity");
+        probe.feed(&frame_line(&json!({
+            "event": "result",
+            "result": {"status": "ERROR", "error": "Individual quota reached for this model"},
+        })));
+        probe.flush();
+        let errors: Vec<&Value> = probe
+            .events
+            .iter()
+            .filter(|event| event["type"] == "error")
+            .collect();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Individual quota reached")));
+        assert!(!probe.events.iter().any(|event| event["type"] == "text_delta"));
+        assert!(!probe.events.iter().any(|event| event["type"] == "raw"));
+    }
+
+    /// Parity: `json-event-stream.test.ts:2443`.
+    #[test]
+    fn antigravity_falls_back_to_the_result_response() {
+        let mut probe = Probe::new("antigravity");
+        probe.feed(&frame_line(&json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "Only in the result.",
+                "duration_seconds": 1,
+                "usage": {
+                    "input_tokens": 3,
+                    "output_tokens": 4,
+                    "thinking_tokens": 0,
+                    "cache_read_tokens": 0,
+                },
+            },
+        })));
+        probe.flush();
+        let deltas: Vec<&Value> = probe
+            .events
+            .iter()
+            .filter(|event| event["type"] == "text_delta")
+            .collect();
+        assert_eq!(deltas, vec![&json!({"type": "text_delta", "delta": "Only in the result."})]);
+    }
+
+    /// Replays the recorded agy success transcript the TS test reads
+    /// (`apps/daemon/tests/fixtures/antigravity-stream-json/docs-success.stdout.ndjson`),
+    /// so the Rust parser is exercised against the same bytes as TS rather
+    /// than a hand-built approximation.
+    #[test]
+    fn antigravity_replays_the_recorded_success_transcript() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../apps/daemon/tests/fixtures/antigravity-stream-json/docs-success.stdout.ndjson",
+        );
+        let transcript = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let mut probe = Probe::new("antigravity");
+        probe.feed(&transcript);
+        probe.flush();
+        // The `user_input` echo carries nothing, and the terminal `result`
+        // response is not re-emitted once text has streamed.
+        let types: Vec<&str> = probe.events.iter().filter_map(|event| event["type"].as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["status", "tool_use", "tool_result", "text_delta", "usage"]
+        );
+        assert_eq!(probe.events[1]["id"], "edb1c8c1-50ba-4f3f-87eb-412d0e9d47c3:4");
+        assert_eq!(probe.events[2]["content"], "hello_headless_demo\r\n");
+        assert_eq!(probe.events[3]["delta"], "Git rebase...");
+        assert_eq!(probe.events[4]["usage"]["input_tokens"], 10418);
+        assert_eq!(probe.events[4]["usage"]["thought_tokens"], 551);
+        assert_eq!(probe.events[4]["durationMs"], 6880);
+    }
+
+    /// Parity: `json-event-stream.test.ts:2456` — frames without an `event`
+    /// discriminator take the Gemini-CLI branch.
+    #[test]
+    fn antigravity_falls_back_to_the_gemini_branch() {
+        let mut probe = Probe::new("antigravity");
+        probe.feed(&frame_line(&json!({"type": "init", "session_id": "agy-1", "model": "gemini-3.5-flash"})));
+        probe.feed(&frame_line(&json!({
+            "type": "message",
+            "role": "assistant",
+            "content": "Hello from Antigravity.",
+            "delta": true,
+        })));
+        probe.flush();
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "status", "label": "initializing", "model": "gemini-3.5-flash"}),
+                json!({"type": "text_delta", "delta": "Hello from Antigravity."}),
+            ]
         );
     }
 }

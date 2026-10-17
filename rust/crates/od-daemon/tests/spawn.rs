@@ -61,6 +61,20 @@ fn shim_dir() -> std::path::PathBuf {
             "exit 0\n",
         ),
     );
+    // Emits one agy JSONL turn, then exits: proves the `antigravity` kind is
+    // dispatched by the pump rather than falling through to the plain lane.
+    // (`agy` is the Antigravity bin name.)
+    write_shim(
+        &dir,
+        "agy",
+        concat!(
+            "#!/bin/sh\n",
+            "cat > /dev/null\n",
+            "echo '{\"event\":\"step_update\",\"step_update\":{\"step_type\":\"agent_response\",\"text_delta\":\"hey\"}}'\n",
+            "echo '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":1,\"cache_read_tokens\":0},\"duration_seconds\":0.5}}'\n",
+            "exit 0\n",
+        ),
+    );
     dir
 }
 
@@ -347,5 +361,49 @@ async fn opencode_jsonl_maps_to_lane_events() {
     assert!(
         !events.contains("event: stdout"),
         "an opencode run must not fall through to the plain lane: {events}"
+    );
+}
+
+/// The agy (`antigravity`) kind of the same `json-event-stream` lane must map
+/// to parsed events too: the pump dispatches on the resolved kind, not on a
+/// fixed runtime name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn antigravity_jsonl_maps_to_lane_events() {
+    ensure_shim_on_path();
+    let daemon = RunningDaemon::start(config(temp_paths("antigravity")))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+    let (head, body) = post_run(addr, r#"{"agentId":"antigravity","prompt":"hi"}"#).await;
+    assert!(head.contains("202"), "head: {head} body: {body}");
+    let run_id: String = serde_json::from_str::<serde_json::Value>(&body)
+        .expect("json")
+        .get("runId")
+        .and_then(|v| v.as_str())
+        .expect("runId")
+        .to_string();
+    let mut status = String::new();
+    for _ in 0..100 {
+        let (_, body) = get_run(addr, &run_id).await;
+        status = serde_json::from_str::<serde_json::Value>(&body)
+            .expect("json")
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if matches!(status.as_str(), "succeeded" | "failed" | "canceled") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(status, "succeeded", "run did not succeed");
+    let (_, events) = get_events(addr, &run_id).await;
+    assert!(events.contains("event: agent"), "events: {events}");
+    assert!(events.contains("text_delta"), "events: {events}");
+    assert!(events.contains("hey"), "events: {events}");
+    assert!(events.contains("\"usage\""), "events: {events}");
+    assert!(
+        !events.contains("event: stdout"),
+        "an antigravity run must not fall through to the plain lane: {events}"
     );
 }

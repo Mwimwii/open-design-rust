@@ -3206,6 +3206,14 @@ async fn setup_and_spawn(setup: SpawnSetup) {
             return;
         }
     }
+    // Parity: `createJsonEventStreamHandler(def.eventParser || def.id, …)`.
+    // A runtime on the JSONL format whose def carries no `eventParser` (the
+    // Gemini-CLI shape) keys its parser off its own id.
+    let json_kind = if def.stream_format == "json-event-stream" {
+        Some(def.event_parser.unwrap_or(def.id))
+    } else {
+        None
+    };
     pump_child(
         runs,
         run_id,
@@ -3213,7 +3221,7 @@ async fn setup_and_spawn(setup: SpawnSetup) {
         stdin_bytes,
         prompt_file,
         def.stream_format,
-        def.event_parser,
+        json_kind,
     )
     .await;
 }
@@ -3339,7 +3347,7 @@ async fn pump_child(
     stdin_bytes: Option<Vec<u8>>,
     prompt_file: Option<String>,
     stream_format: &'static str,
-    event_parser: Option<&'static str>,
+    json_kind: Option<&'static str>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     if let Some(bytes) = stdin_bytes {
@@ -3411,13 +3419,14 @@ async fn pump_child(
                     push_lane_event(&runs_for_out, &out_id, event);
                 });
             }
-        } else if stream_format == "json-event-stream" && event_parser == Some("opencode") {
-            // The multi-runtime JSONL lane. Only the OpenCode kind is ported so
-            // far; any other `event_parser` on this format falls through to the
-            // plain lane below, so an unported runtime keeps streaming its
-            // stdout rather than losing every line to a bare raw event.
+        } else if let Some(kind) = json_kind.filter(|kind| crate::protocol::json_event_kind_supported(kind))
+        {
+            // The multi-runtime JSONL lane. Kinds without a ported handler fall
+            // through to the plain lane below, so an unported runtime keeps
+            // streaming its stdout rather than losing every line to a bare raw
+            // event.
             if let Some(stdout) = stdout {
-                let mut parser = crate::protocol::JsonEventParser::new("opencode");
+                let mut parser = crate::protocol::JsonEventParser::new(kind);
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     let mut events = Vec::new();
