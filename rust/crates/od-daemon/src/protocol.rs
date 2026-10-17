@@ -1534,8 +1534,15 @@ struct JsonParserState {
     // cursor-agent turn bookkeeping (parity: `cursorTextSoFar` /
     // `cursorTurnStart`). A terminal replay carries only the current turn, so
     // recovery is measured from `cursorTurnStart`, not from the buffer start.
-    pub cursor_text_so_far: String,
-    pub cursor_turn_start: usize,
+    cursor_text_so_far: String,
+    cursor_turn_start: usize,
+    // Codex bookkeeping (parity: the `codex*` fields of `ParserState`).
+    codex_reasoning_emitted_by_item: HashMap<String, usize>,
+    codex_reasoning_emitted_any: bool,
+    codex_tool_uses: HashSet<String>,
+    codex_error_emitted: bool,
+    codex_previous_event_was_agent_message: bool,
+    codex_last_agent_message_ended_with_newline: bool,
 }
 
 /// Whether `json-event-stream.ts` has a ported handler for `kind` (parity:
@@ -1545,7 +1552,7 @@ struct JsonParserState {
 pub fn json_event_kind_supported(kind: &str) -> bool {
     matches!(
         kind,
-        "opencode" | "gemini" | "antigravity" | "kimi" | "cursor-agent"
+        "opencode" | "gemini" | "antigravity" | "kimi" | "cursor-agent" | "codex"
     )
 }
 
@@ -1593,6 +1600,7 @@ impl JsonEventParser {
             "antigravity" => handle_antigravity_event(&mut self.state, &obj, line, on_event),
             "kimi" => handle_kimi_event(&obj, on_event),
             "cursor-agent" => handle_cursor_event(&mut self.state, &obj, on_event),
+            "codex" => handle_codex_event(&mut self.state, &obj, on_event),
             _ => false,
         };
         if handled {
@@ -2877,6 +2885,657 @@ fn handle_cursor_event(
     false
 }
 
+/// Parity: `parseJsonObjectsFromContent` (`json-event-stream.ts:73`).
+fn parse_json_objects_from_content(value: &str) -> Vec<Value> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let direct = safe_parse_json(&Value::String(trimmed.to_string()));
+    if let Some(direct) = direct.filter(|direct| direct.is_object()) {
+        return vec![direct];
+    }
+    let mut objects = Vec::new();
+    for line in trimmed.lines() {
+        let parsed = safe_parse_json(&Value::String(line.trim().to_string()));
+        if let Some(parsed) = parsed.filter(|parsed| parsed.is_object()) {
+            objects.push(parsed);
+        }
+    }
+    objects
+}
+
+/// Parity: `extractConnectorApiError` (`json-event-stream.ts:86`).
+fn extract_connector_api_error(value: &serde_json::Map<String, Value>) -> Option<Value> {
+    let error = value.get("error")?.as_object()?;
+    if error.get("code").and_then(Value::as_str).is_some() {
+        return Some(Value::Object(error.clone()));
+    }
+    let wrapped = error
+        .get("data")
+        .and_then(Value::as_object)
+        .and_then(|data| data.get("error"))
+        .and_then(Value::as_object)?;
+    if wrapped.get("code").and_then(Value::as_str).is_some() {
+        return Some(Value::Object(wrapped.clone()));
+    }
+    None
+}
+
+/// Parity: `connectorToolSelectionErrorMessage` (`json-event-stream.ts:97`).
+fn connector_tool_selection_error_message(content: &str) -> Option<String> {
+    if !content.contains("CONNECTOR_TOOL_NOT_FOUND") {
+        return None;
+    }
+    let mut error = None;
+    for parsed in parse_json_objects_from_content(content) {
+        let Some(parsed_error) = parsed.as_object().and_then(extract_connector_api_error) else {
+            continue;
+        };
+        if parsed_error.get("code").and_then(Value::as_str) == Some("CONNECTOR_TOOL_NOT_FOUND") {
+            error = Some(parsed_error);
+            break;
+        }
+    }
+    let error = error?;
+    let empty = serde_json::Map::new();
+    let details = error
+        .get("details")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    let connector_id = details
+        .get("connectorId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
+    let tool_name = details
+        .get("toolName")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("the requested connector tool");
+    let target = match connector_id {
+        Some(connector_id) => format!(
+            "Connector tool {tool_name} is not allowed for connector {connector_id}."
+        ),
+        None => format!("Connector tool {tool_name} is not allowed."),
+    };
+    Some(format!(
+        "{target} Re-list the connector catalog and choose one of the currently allowed read-only tools."
+    ))
+}
+
+/// Parity: `recoverableCodexReconnectProgress` (`json-event-stream.ts:147`) —
+/// codex reports its own upstream reconnect loop as error-shaped JSONL.
+fn recoverable_codex_reconnect_progress(message: &str) -> Option<(i64, i64)> {
+    if !message.contains("timeout waiting for child process to exit")
+        && !message.contains("stream disconnected before completion")
+    {
+        return None;
+    }
+    static PROGRESS: OnceLock<Regex> = OnceLock::new();
+    let progress = PROGRESS.get_or_init(|| {
+        Regex::new(r"^Reconnecting\.\.\.\s+(\d+)/(\d+)\b").expect("codex reconnect regex")
+    });
+    let captures = progress.captures(message)?;
+    let attempt: i64 = captures.get(1)?.as_str().parse().ok()?;
+    let max: i64 = captures.get(2)?.as_str().parse().ok()?;
+    if attempt <= 0 || max <= 0 {
+        return None;
+    }
+    Some((attempt, max))
+}
+
+/// Parity: `codexTodoListInput` (`json-event-stream.ts:719`).
+fn codex_todo_list_input(item: &serde_json::Map<String, Value>) -> Option<Value> {
+    if item.get("type").and_then(Value::as_str) != Some("todo_list") {
+        return None;
+    }
+    let items = item.get("items").filter(|items| items.is_array())?;
+    todo_write_input_from_items(items)
+}
+
+/// Parity: `emitCodexTodoList` (`json-event-stream.ts:724`).
+fn emit_codex_todo_list(
+    item: &serde_json::Map<String, Value>,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> bool {
+    let Some(id) = item.get("id").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(input) = codex_todo_list_input(item) else {
+        return false;
+    };
+    on_event(StreamEvent::Json(
+        json!({ "type": "tool_use", "id": id, "name": "TodoWrite", "input": input }),
+    ));
+    true
+}
+
+/// Parity: `codexChangeDiffStat` (`json-event-stream.ts:968`). Counts a codex
+/// change the way `diffStat` counts the equivalent Claude call, so the two
+/// agents cannot disagree about the same edit.
+fn codex_change_diff_stat(kind: &str, diff: Option<&Value>) -> Option<Value> {
+    let diff = diff.and_then(Value::as_str).filter(|diff| !diff.is_empty())?;
+    if kind == "add" {
+        return Some(json!({ "added": diff.split('\n').count(), "removed": 0 }));
+    }
+    if kind != "update" {
+        return None;
+    }
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in diff.split('\n') {
+        // `+++`/`---` are file headers, not content.
+        if line.starts_with('+') && !line.starts_with("+++") {
+            added += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            removed += 1;
+        }
+    }
+    if added == 0 && removed == 0 {
+        None
+    } else {
+        Some(json!({ "added": added, "removed": removed }))
+    }
+}
+
+/// One file a codex `file_change` item changed (parity: `CodexFileChange`).
+struct CodexFileChange {
+    id: String,
+    name: String,
+    path: String,
+    stat: Option<Value>,
+}
+
+/// Parity: `codexFileChanges` (`json-event-stream.ts:996`). Returns `None` for
+/// a partially recognised item on purpose: emitting the recognised half would
+/// silently drop the rest, whereas `None` keeps the whole line visible as
+/// `raw`. The patch text is read and not kept — only its two line counts.
+fn codex_file_changes(item: &serde_json::Map<String, Value>) -> Option<Vec<CodexFileChange>> {
+    if item.get("type").and_then(Value::as_str) != Some("file_change") {
+        return None;
+    }
+    let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+    if item_id.is_empty() {
+        return None;
+    }
+    let changes = item.get("changes").and_then(Value::as_array)?;
+    if changes.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for (index, change) in changes.iter().enumerate() {
+        let change = change.as_object()?;
+        let file_path = change.get("path").and_then(Value::as_str).unwrap_or("");
+        let kind = change.get("kind").and_then(Value::as_str).unwrap_or("");
+        let name = match kind {
+            "add" => "Write",
+            "update" => "Edit",
+            // A deletion (or any unknown kind) stays `raw`: the record has no
+            // delete verb, and calling it 「新建」/「改写」 would be a lie.
+            _ => return None,
+        };
+        if file_path.is_empty() {
+            return None;
+        }
+        out.push(CodexFileChange {
+            id: format!("{item_id}#{index}"),
+            name: name.to_string(),
+            path: file_path.to_string(),
+            stat: codex_change_diff_stat(kind, change.get("diff")),
+        });
+    }
+    Some(out)
+}
+
+/// Parity: `emitCodexFileChangeToolUses` (`json-event-stream.ts:1029`). Each
+/// change is its own call under `<item id>#<index>`, because the chat row model
+/// is one file per row and the web dedupes `tool_use` by id.
+fn emit_codex_file_change_tool_uses(
+    changes: &[CodexFileChange],
+    state: &mut JsonParserState,
+    on_event: &mut dyn FnMut(StreamEvent),
+) {
+    for change in changes {
+        if state.codex_tool_uses.contains(&change.id) {
+            continue;
+        }
+        state.codex_tool_uses.insert(change.id.clone());
+        // `od_diff_stat` is absent, not null, when there is nothing to report:
+        // an input that keeps its single-key shape is byte-identical to what
+        // `exec --json` produced before this existed.
+        let input = match &change.stat {
+            Some(stat) => json!({ "file_path": change.path, "od_diff_stat": stat }),
+            None => json!({ "file_path": change.path }),
+        };
+        on_event(StreamEvent::Json(
+            json!({ "type": "tool_use", "id": change.id, "name": change.name, "input": input }),
+        ));
+    }
+}
+
+/// Parity: `codexMcpToolName` (`json-event-stream.ts:1074`).
+fn codex_mcp_tool_name(item: &serde_json::Map<String, Value>) -> Option<String> {
+    if item.get("type").and_then(Value::as_str) != Some("mcp_tool_call") {
+        return None;
+    }
+    let server = item.get("server").and_then(Value::as_str).unwrap_or("");
+    let tool = item.get("tool").and_then(Value::as_str).unwrap_or("");
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some(format!("mcp__{server}__{tool}"))
+}
+
+/// Parity: `emitCodexMcpToolUse` (`json-event-stream.ts:1092`).
+fn emit_codex_mcp_tool_use(
+    item: &serde_json::Map<String, Value>,
+    id: &str,
+    name: &str,
+    state: &mut JsonParserState,
+    on_event: &mut dyn FnMut(StreamEvent),
+) {
+    if state.codex_tool_uses.contains(id) {
+        return;
+    }
+    state.codex_tool_uses.insert(id.to_string());
+    let input = item
+        .get("arguments")
+        .and_then(Value::as_object)
+        .map(|arguments| Value::Object(arguments.clone()))
+        .unwrap_or_else(|| json!({}));
+    on_event(StreamEvent::Json(
+        json!({ "type": "tool_use", "id": id, "name": name, "input": input }),
+    ));
+}
+
+/// Parity: `codexMcpToolResult` (`json-event-stream.ts:1120`).
+fn codex_mcp_tool_result(item: &serde_json::Map<String, Value>) -> (String, bool) {
+    let error = item.get("error").and_then(Value::as_object);
+    let is_error = item.get("status").and_then(Value::as_str) == Some("failed") || error.is_some();
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let content = if message.is_empty() {
+        stringify_content(item.get("result"))
+    } else {
+        message.to_string()
+    };
+    (content, is_error)
+}
+
+/// Parity: `codexWebSearchQuery` (`json-event-stream.ts:1153`). Only
+/// `action.type === "search"` is recognised; calling a page fetch a 「搜索」
+/// would be the same class of lie as calling a deletion 「新建」.
+fn codex_web_search_query(item: &serde_json::Map<String, Value>) -> Option<String> {
+    if item.get("type").and_then(Value::as_str) != Some("web_search") {
+        return None;
+    }
+    let action = item.get("action").and_then(Value::as_object)?;
+    if action.get("type").and_then(Value::as_str) != Some("search") {
+        return None;
+    }
+    let query = item.get("query").and_then(Value::as_str).unwrap_or("");
+    if query.is_empty() {
+        None
+    } else {
+        Some(query.to_string())
+    }
+}
+
+/// Parity: `emitCodexReasoningItem` (`json-event-stream.ts:844`). Codex streams
+/// reasoning summary text accumulated on `item.text`; emit the unseen suffix so
+/// the web's collapsible thinking block has real content, joining distinct
+/// items with a blank line.
+fn emit_codex_reasoning_item(
+    obj: &serde_json::Map<String, Value>,
+    state: &mut JsonParserState,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> bool {
+    let ty = obj.get("type").and_then(Value::as_str).unwrap_or("");
+    if !matches!(ty, "item.started" | "item.updated" | "item.completed") {
+        return false;
+    }
+    let Some(item) = obj.get("item").and_then(Value::as_object) else {
+        return false;
+    };
+    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return false;
+    }
+    let key = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+    let emitted = state
+        .codex_reasoning_emitted_by_item
+        .get(&key)
+        .copied()
+        .unwrap_or(0);
+    if text.len() > emitted {
+        // `emitted` indexes an earlier revision of this same item's text, so
+        // the offset is normally a stable prefix boundary; a boundary that no
+        // longer lands on a char edge falls back to the whole text rather than
+        // panicking on the slice.
+        let suffix = text.get(emitted..).unwrap_or(text);
+        let delta = if emitted == 0 && state.codex_reasoning_emitted_any {
+            format!("\n\n{suffix}")
+        } else {
+            suffix.to_string()
+        };
+        on_event(StreamEvent::Json(json!({ "type": "thinking_delta", "delta": delta })));
+        state
+            .codex_reasoning_emitted_by_item
+            .insert(key, text.len());
+        state.codex_reasoning_emitted_any = true;
+    }
+    true
+}
+
+/// Parity: `handleCodexEvent` (`json-event-stream.ts:1161`).
+fn handle_codex_event(
+    state: &mut JsonParserState,
+    obj: &Value,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> bool {
+    let Some(obj) = obj.as_object() else {
+        return false;
+    };
+    let ty = obj.get("type").and_then(Value::as_str).unwrap_or("");
+
+    if ty == "error" {
+        let message = extract_error_message(
+            obj.get("message").or_else(|| obj.get("error")).unwrap_or(&Value::Null),
+            "Codex error",
+        );
+        // Normalize codex's own reconnect loop into an ephemeral machine status
+        // rather than letting the raw SDK sentence reach assistant history.
+        if let Some((attempt, max)) = recoverable_codex_reconnect_progress(&message) {
+            on_event(StreamEvent::Json(json!({
+                "type": "status",
+                "label": "agent_reconnecting",
+                "detail": format!("{attempt}/{max}"),
+            })));
+            return true;
+        }
+        if !state.codex_error_emitted {
+            state.codex_error_emitted = true;
+            on_event(StreamEvent::Error {
+                message,
+                code: None,
+                raw: None,
+            });
+        }
+        return true;
+    }
+
+    if ty == "turn.failed" {
+        if !state.codex_error_emitted {
+            state.codex_error_emitted = true;
+            on_event(StreamEvent::Error {
+                message: extract_error_message(
+                    obj.get("error").or_else(|| obj.get("message")).unwrap_or(&Value::Null),
+                    "Codex turn failed",
+                ),
+                code: None,
+                raw: None,
+            });
+        }
+        return true;
+    }
+
+    if ty == "thread.started" {
+        // `thread_id` is codex's own session handle, surfaced on the same
+        // `sessionId` status channel claude uses.
+        let thread_id = obj
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        on_event(StreamEvent::Json(json!({
+            "type": "status",
+            "label": "initializing",
+            "sessionId": thread_id,
+        })));
+        return true;
+    }
+
+    if ty == "turn.started" {
+        state.codex_previous_event_was_agent_message = false;
+        state.codex_last_agent_message_ended_with_newline = false;
+        on_event(StreamEvent::Json(json!({ "type": "status", "label": "thinking" })));
+        return true;
+    }
+
+    if emit_codex_reasoning_item(obj, state, on_event) {
+        return true;
+    }
+
+    if ty == "item.started" {
+        if let Some(item) = obj.get("item").and_then(Value::as_object) {
+            if emit_codex_todo_list(item, on_event) {
+                state.codex_previous_event_was_agent_message = false;
+                state.codex_last_agent_message_ended_with_newline = false;
+                return true;
+            }
+            if item.get("type").and_then(Value::as_str) == Some("command_execution") {
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    state.codex_previous_event_was_agent_message = false;
+                    state.codex_last_agent_message_ended_with_newline = false;
+                    if !state.codex_tool_uses.contains(id) {
+                        state.codex_tool_uses.insert(id.to_string());
+                        on_event(StreamEvent::Json(json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": "Bash",
+                            "input": { "command": item.get("command").and_then(Value::as_str).unwrap_or("") },
+                        })));
+                    }
+                    return true;
+                }
+            }
+            // Called from `item.started` so the row gets a real duration.
+            if let Some(changes) = codex_file_changes(item) {
+                state.codex_previous_event_was_agent_message = false;
+                state.codex_last_agent_message_ended_with_newline = false;
+                emit_codex_file_change_tool_uses(&changes, state, on_event);
+                return true;
+            }
+            if let Some(name) = codex_mcp_tool_name(item) {
+                if let Some(id) = item.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+                    state.codex_previous_event_was_agent_message = false;
+                    state.codex_last_agent_message_ended_with_newline = false;
+                    emit_codex_mcp_tool_use(item, id, &name, state, on_event);
+                    return true;
+                }
+            }
+            if item.get("type").and_then(Value::as_str) == Some("web_search") {
+                // The started frame's `query` really is always empty; `id` is
+                // the id AFTER `JSON.parse` deduplicates codex's twice-
+                // serialised `id` key, and the completed frame resolves to the
+                // same one, so this early row retires into the settled one.
+                if let Some(id) = item.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+                    state.codex_previous_event_was_agent_message = false;
+                    state.codex_last_agent_message_ended_with_newline = false;
+                    on_event(StreamEvent::Json(json!({
+                        "type": "tool_in_flight",
+                        "id": id,
+                        "name": "web_search",
+                        "input": {},
+                    })));
+                }
+                return true;
+            }
+        }
+    }
+
+    if ty == "item.updated" {
+        if let Some(item) = obj.get("item").and_then(Value::as_object) {
+            if emit_codex_todo_list(item, on_event) {
+                state.codex_previous_event_was_agent_message = false;
+                state.codex_last_agent_message_ended_with_newline = false;
+                return true;
+            }
+        }
+    }
+
+    if ty == "item.completed" {
+        if let Some(item) = obj.get("item").and_then(Value::as_object) {
+            if emit_codex_todo_list(item, on_event) {
+                state.codex_previous_event_was_agent_message = false;
+                state.codex_last_agent_message_ended_with_newline = false;
+                return true;
+            }
+            // Non-fatal in-stream notices (e.g. the skills context-budget
+            // warning) arrive as `error` ITEMS while the turn keeps running;
+            // surface them as a warning pill instead of raw noise.
+            if item.get("type").and_then(Value::as_str) == Some("error") {
+                if let Some(message) = item
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.is_empty())
+                {
+                    on_event(StreamEvent::Json(
+                        json!({ "type": "status", "label": "warning", "detail": message }),
+                    ));
+                    return true;
+                }
+            }
+            if item.get("type").and_then(Value::as_str) == Some("command_execution") {
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    state.codex_previous_event_was_agent_message = false;
+                    state.codex_last_agent_message_ended_with_newline = false;
+                    if !state.codex_tool_uses.contains(id) {
+                        state.codex_tool_uses.insert(id.to_string());
+                        on_event(StreamEvent::Json(json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": "Bash",
+                            "input": { "command": item.get("command").and_then(Value::as_str).unwrap_or("") },
+                        })));
+                    }
+                    let content = stringify_content(item.get("aggregated_output"));
+                    on_event(StreamEvent::Json(json!({
+                        "type": "tool_result",
+                        "toolUseId": id,
+                        "content": content,
+                        "isError": match item.get("exit_code").and_then(Value::as_i64) {
+                            Some(exit_code) => exit_code != 0,
+                            None => item.get("status").and_then(Value::as_str) == Some("failed"),
+                        },
+                    })));
+                    if let Some(connector_error) = connector_tool_selection_error_message(&content) {
+                        if !state.codex_error_emitted {
+                            state.codex_error_emitted = true;
+                            on_event(StreamEvent::Error {
+                                message: connector_error,
+                                code: None,
+                                raw: None,
+                            });
+                        }
+                    }
+                    return true;
+                }
+            }
+            if let Some(changes) = codex_file_changes(item) {
+                state.codex_previous_event_was_agent_message = false;
+                state.codex_last_agent_message_ended_with_newline = false;
+                emit_codex_file_change_tool_uses(&changes, state, on_event);
+                // The result carries no content: a patch belongs on the row as
+                // `+N −M`, not in the terminal panel a `tool_result` opens.
+                let is_error = item.get("status").and_then(Value::as_str) == Some("failed");
+                for change in &changes {
+                    on_event(StreamEvent::Json(json!({
+                        "type": "tool_result",
+                        "toolUseId": change.id,
+                        "content": "",
+                        "isError": is_error,
+                    })));
+                }
+                return true;
+            }
+            if let Some(name) = codex_mcp_tool_name(item) {
+                if let Some(id) = item.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+                    state.codex_previous_event_was_agent_message = false;
+                    state.codex_last_agent_message_ended_with_newline = false;
+                    emit_codex_mcp_tool_use(item, id, &name, state, on_event);
+                    let (content, is_error) = codex_mcp_tool_result(item);
+                    on_event(StreamEvent::Json(json!({
+                        "type": "tool_result",
+                        "toolUseId": id,
+                        "content": content,
+                        "isError": is_error,
+                    })));
+                    return true;
+                }
+            }
+            if let Some(query) = codex_web_search_query(item) {
+                if let Some(id) = item.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+                    state.codex_previous_event_was_agent_message = false;
+                    state.codex_last_agent_message_ended_with_newline = false;
+                    if !state.codex_tool_uses.contains(id) {
+                        state.codex_tool_uses.insert(id.to_string());
+                        on_event(StreamEvent::Json(json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": "web_search",
+                            "input": { "query": query },
+                        })));
+                    }
+                    // No content: the row shows 「搜索 <query>」 without a
+                    // fabricated 「N 处」. A hit count would be invented, not
+                    // read — measure the wire before changing this.
+                    on_event(StreamEvent::Json(json!({
+                        "type": "tool_result",
+                        "toolUseId": id,
+                        "content": "",
+                        "isError": false,
+                    })));
+                    return true;
+                }
+            }
+            if item.get("type").and_then(Value::as_str) == Some("agent_message") {
+                if let Some(text) = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    let needs_boundary = state.codex_previous_event_was_agent_message
+                        && !state.codex_last_agent_message_ended_with_newline
+                        && !text.starts_with('\n');
+                    let delta = if needs_boundary {
+                        format!("\n{text}")
+                    } else {
+                        text.to_string()
+                    };
+                    on_event(StreamEvent::Json(json!({ "type": "text_delta", "delta": delta })));
+                    state.codex_previous_event_was_agent_message = true;
+                    state.codex_last_agent_message_ended_with_newline = text.ends_with('\n');
+                    return true;
+                }
+            }
+        }
+    }
+
+    if ty == "turn.completed" && obj.get("usage").is_some_and(Value::is_object) {
+        let empty = serde_json::Map::new();
+        let raw_usage = obj.get("usage").and_then(Value::as_object).unwrap_or(&empty);
+        let mut usage = serde_json::Map::new();
+        for (source, target) in [
+            ("input_tokens", "input_tokens"),
+            ("output_tokens", "output_tokens"),
+            ("reasoning_output_tokens", "thought_tokens"),
+            ("cached_input_tokens", "cached_read_tokens"),
+        ] {
+            if let Some(value) = raw_usage.get(source).filter(|value| value.is_number()) {
+                usage.insert(target.to_string(), value.clone());
+            }
+        }
+        on_event(StreamEvent::Json(
+            json!({ "type": "usage", "usage": Value::Object(usage) }),
+        ));
+        return true;
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod json_event_tests {
     use super::*;
@@ -3890,6 +4549,766 @@ mod json_event_tests {
                 json!({"type": "text_delta", "delta": "hello"}),
                 json!({"type": "text_delta", "delta": " world"}),
             ]
+        );
+    }
+
+    // ── codex (`codex exec --json` / the app-server's normalised frames) ──
+
+    /// Concatenates the `text_delta` frames, the way the chat panel does.
+    fn joined_text(events: &[Value]) -> String {
+        events
+            .iter()
+            .filter(|event| event["type"] == "text_delta")
+            .filter_map(|event| event["delta"].as_str())
+            .collect()
+    }
+
+    /// Parity: `json-event-stream.test.ts:1325`.
+    #[test]
+    fn codex_emits_status_text_and_usage() {
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({"type": "thread.started", "thread_id": "thr-1"})));
+        probe.feed(&frame_line(&json!({"type": "turn.started"})));
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {"id": "item-1", "type": "agent_message", "text": "hello"},
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "turn.completed",
+            "usage": {"input_tokens": 12, "cached_input_tokens": 4, "output_tokens": 3},
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "status", "label": "initializing", "sessionId": "thr-1"}),
+                json!({"type": "status", "label": "thinking"}),
+                json!({"type": "text_delta", "delta": "hello"}),
+                json!({"type": "usage", "usage": {"input_tokens": 12, "output_tokens": 3, "cached_read_tokens": 4}}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:1351` and `:1361` — the thread id is
+    /// the capture-style resume handle, and its absence must stay `null` rather
+    /// than becoming a spurious capture.
+    #[test]
+    fn codex_thread_started_surfaces_the_thread_id_or_null() {
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({
+            "type": "thread.started",
+            "thread_id": "019eef4f-7409-7c82-bebe-30504eed3959",
+        })));
+        probe.feed(&frame_line(&json!({"type": "thread.started"})));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "status", "label": "initializing", "sessionId": "019eef4f-7409-7c82-bebe-30504eed3959"}),
+                json!({"type": "status", "label": "initializing", "sessionId": null}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:1369`.
+    #[test]
+    fn codex_emits_thinking_status_and_reasoning_token_usage() {
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({"type": "turn.started"})));
+        probe.feed(&frame_line(&json!({
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 12,
+                "cached_input_tokens": 4,
+                "output_tokens": 3,
+                "reasoning_output_tokens": 8,
+            },
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "status", "label": "thinking"}),
+                json!({
+                    "type": "usage",
+                    "usage": {
+                        "input_tokens": 12,
+                        "output_tokens": 3,
+                        "thought_tokens": 8,
+                        "cached_read_tokens": 4,
+                    },
+                }),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:1400` — a distinct reasoning item
+    /// starts a new summary paragraph, which the parser owns.
+    #[test]
+    fn codex_emits_thinking_deltas_from_reasoning_items() {
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({"type": "turn.started"})));
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {"id": "item_0", "type": "reasoning", "text": "**Scoping the deck**\nPick 10 slides."},
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {"id": "item_2", "type": "reasoning", "text": "**Choosing a palette**"},
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "status", "label": "thinking"}),
+                json!({"type": "thinking_delta", "delta": "**Scoping the deck**\nPick 10 slides."}),
+                json!({"type": "thinking_delta", "delta": "\n\n**Choosing a palette**"}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:1424` — repeated lifecycle events for
+    /// one item emit only the unseen suffix.
+    #[test]
+    fn codex_emits_only_the_unseen_reasoning_suffix() {
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({
+            "type": "item.started",
+            "item": {"id": "item_0", "type": "reasoning", "text": ""},
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "item.updated",
+            "item": {"id": "item_0", "type": "reasoning", "text": "Reading the brief"},
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {"id": "item_0", "type": "reasoning", "text": "Reading the brief, then drafting."},
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "thinking_delta", "delta": "Reading the brief"}),
+                json!({"type": "thinking_delta", "delta": ", then drafting."}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:1439` — a non-fatal error ITEM is a
+    /// visible warning, not a fatal error: two sibling runs in the incident
+    /// bundle carried it and completed successfully.
+    #[test]
+    fn codex_surfaces_non_fatal_error_items_as_a_warning() {
+        let message = "Skill descriptions were shortened to fit the 2% skills context budget. \
+                       Codex can still see every skill, but some descriptions are shorter.";
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {"id": "item_0", "type": "error", "message": message},
+        })));
+        assert_eq!(
+            probe.events,
+            vec![json!({"type": "status", "label": "warning", "detail": message})]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:1457` and `:1487`.
+    #[test]
+    fn codex_preserves_line_boundaries_between_agent_messages() {
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({"type": "turn.started"})));
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {"id": "item-1", "type": "agent_message", "text": "English: one"},
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {"id": "item-2", "type": "agent_message", "text": "Chinese: 一"},
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {"id": "item-3", "type": "agent_message", "text": "English: two"},
+        })));
+        assert_eq!(joined_text(&probe.events), "English: one\nChinese: 一\nEnglish: two");
+
+        // An existing trailing newline is not doubled.
+        let mut probe = Probe::new("codex");
+        for (id, text) in [
+            ("item-1", "English: one\n"),
+            ("item-2", "Chinese: 一"),
+            ("item-3", "\nEnglish: two"),
+        ] {
+            probe.feed(&frame_line(&json!({
+                "type": "item.completed",
+                "item": {"id": id, "type": "agent_message", "text": text},
+            })));
+        }
+        assert_eq!(joined_text(&probe.events), "English: one\nChinese: 一\nEnglish: two");
+    }
+
+    /// Parity: `json-event-stream.test.ts:1516` — the first fatal error wins.
+    #[test]
+    fn codex_emits_structured_errors_once() {
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({
+            "type": "error",
+            "message": json!({"detail": "The 'gpt-5.5' model requires a newer version of Codex."}).to_string(),
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "turn.failed",
+            "error": {"message": "plain failure"},
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "error", "message": "The 'gpt-5.5' model requires a newer version of Codex."}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:1542`.
+    #[test]
+    fn codex_emits_command_execution_tool_events() {
+        let command = "/bin/zsh -lc 'echo hello-from-codex'";
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({
+            "type": "item.started",
+            "item": {
+                "id": "item-1",
+                "type": "command_execution",
+                "command": command,
+                "aggregated_output": "",
+                "exit_code": null,
+                "status": "in_progress",
+            },
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item-1",
+                "type": "command_execution",
+                "command": command,
+                "aggregated_output": "hello-from-codex\n",
+                "exit_code": 0,
+                "status": "completed",
+            },
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "tool_use", "id": "item-1", "name": "Bash", "input": {"command": command}}),
+                json!({"type": "tool_result", "toolUseId": "item-1", "content": "hello-from-codex\n", "isError": false}),
+            ]
+        );
+    }
+
+    const ADDED_HTML: &str = "/project/ai-design-judgment.html";
+    const ADDED_MD: &str = "/project/brand-spec.md";
+    const UPDATED_HTML: &str = "/project/trustworthy-design-one-pager.html";
+
+    /// Parity: `json-event-stream.test.ts:1609` and `:1622` — one row per
+    /// changed file, because the chat row model is one file per row and the web
+    /// dedupes `tool_use` by id.
+    #[test]
+    fn codex_emits_a_tool_row_per_changed_file() {
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({
+            "type": "item.started",
+            "item": {
+                "id": "item_3",
+                "type": "file_change",
+                "changes": [
+                    {"path": ADDED_HTML, "kind": "add"},
+                    {"path": ADDED_MD, "kind": "add"},
+                ],
+                "status": "in_progress",
+            },
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_3",
+                "type": "file_change",
+                "changes": [
+                    {"path": ADDED_HTML, "kind": "add"},
+                    {"path": ADDED_MD, "kind": "add"},
+                ],
+                "status": "completed",
+            },
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "tool_use", "id": "item_3#0", "name": "Write", "input": {"file_path": ADDED_HTML}}),
+                json!({"type": "tool_use", "id": "item_3#1", "name": "Write", "input": {"file_path": ADDED_MD}}),
+                json!({"type": "tool_result", "toolUseId": "item_3#0", "content": "", "isError": false}),
+                json!({"type": "tool_result", "toolUseId": "item_3#1", "content": "", "isError": false}),
+            ]
+        );
+
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({
+            "type": "item.started",
+            "item": {
+                "id": "item_9",
+                "type": "file_change",
+                "changes": [{"path": UPDATED_HTML, "kind": "update"}],
+                "status": "in_progress",
+            },
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_9",
+                "type": "file_change",
+                "changes": [{"path": UPDATED_HTML, "kind": "update"}],
+                "status": "completed",
+            },
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "tool_use", "id": "item_9#0", "name": "Edit", "input": {"file_path": UPDATED_HTML}}),
+                json!({"type": "tool_result", "toolUseId": "item_9#0", "content": "", "isError": false}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:1641` — the `tool_use` leaves the
+    /// parser at `item.started` so the row has a real duration.
+    #[test]
+    fn codex_emits_the_file_change_tool_use_at_item_started() {
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({
+            "type": "item.started",
+            "item": {
+                "id": "item_9",
+                "type": "file_change",
+                "changes": [{"path": UPDATED_HTML, "kind": "update"}],
+                "status": "in_progress",
+            },
+        })));
+        assert_eq!(
+            probe.events,
+            vec![json!({"type": "tool_use", "id": "item_9#0", "name": "Edit", "input": {"file_path": UPDATED_HTML}})]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:1677`, `:1688` and `:1709`.
+    #[test]
+    fn codex_file_change_completed_only_failed_and_unknown_kinds() {
+        // Completed-only still emits the pair.
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_9",
+                "type": "file_change",
+                "changes": [{"path": UPDATED_HTML, "kind": "update"}],
+                "status": "completed",
+            },
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "tool_use", "id": "item_9#0", "name": "Edit", "input": {"file_path": UPDATED_HTML}}),
+                json!({"type": "tool_result", "toolUseId": "item_9#0", "content": "", "isError": false}),
+            ]
+        );
+
+        // `status: 'failed'` is the only failure signal on the item.
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_9",
+                "type": "file_change",
+                "changes": [{"path": UPDATED_HTML, "kind": "update"}],
+                "status": "failed",
+            },
+        })));
+        assert_eq!(
+            probe.events.last(),
+            Some(&json!({"type": "tool_result", "toolUseId": "item_9#0", "content": "", "isError": true}))
+        );
+
+        // A deletion stays raw: the record has no delete verb.
+        let unknown = json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_9",
+                "type": "file_change",
+                "changes": [{"path": UPDATED_HTML, "kind": "delete"}],
+                "status": "completed",
+            },
+        });
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&unknown));
+        assert_eq!(
+            probe.events,
+            vec![json!({"type": "raw", "line": unknown.to_string()})]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:968` — a patch's two line counts ride
+    /// along under `od_diff_stat` and the patch itself is dropped.
+    #[test]
+    fn codex_file_change_carries_a_diff_stat_instead_of_the_patch() {
+        let patch = "@@ -2,3 +2,4 @@\n beta\n-gamma\n+GAMMA-1\n+GAMMA-2\n delta\n";
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_7",
+                "type": "file_change",
+                "changes": [{"path": "note.md", "kind": {"type": "update", "move_path": null}, "diff": patch}],
+                "status": "completed",
+            },
+        })));
+        // A structured `kind` object is not a string, so the change is not
+        // recognised and the whole line stays raw.
+        assert_eq!(probe.events.len(), 1);
+        assert_eq!(probe.events[0]["type"], "raw");
+
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_7",
+                "type": "file_change",
+                "changes": [{"path": "note.md", "kind": "update", "diff": patch}],
+                "status": "completed",
+            },
+        })));
+        assert_eq!(
+            probe.events[0],
+            json!({
+                "type": "tool_use",
+                "id": "item_7#0",
+                "name": "Edit",
+                "input": {"file_path": "note.md", "od_diff_stat": {"added": 2, "removed": 1}},
+            })
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:1758`.
+    #[test]
+    fn codex_emits_todo_write_from_todo_list_items() {
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({
+            "type": "item.started",
+            "item": {
+                "id": "item-0",
+                "type": "todo_list",
+                "items": [
+                    {"text": "Inspect workspace", "completed": false},
+                    {"text": "Write prototype", "completed": false},
+                ],
+            },
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "item.updated",
+            "item": {
+                "id": "item-0",
+                "type": "todo_list",
+                "items": [
+                    {"text": "Inspect workspace", "completed": true},
+                    {"text": "Write prototype", "completed": false},
+                ],
+            },
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({
+                    "type": "tool_use",
+                    "id": "item-0",
+                    "name": "TodoWrite",
+                    "input": {"todos": [
+                        {"content": "Inspect workspace", "status": "pending"},
+                        {"content": "Write prototype", "status": "pending"},
+                    ]},
+                }),
+                json!({
+                    "type": "tool_use",
+                    "id": "item-0",
+                    "name": "TodoWrite",
+                    "input": {"todos": [
+                        {"content": "Inspect workspace", "status": "completed"},
+                        {"content": "Write prototype", "status": "pending"},
+                    ]},
+                }),
+            ]
+        );
+    }
+
+    fn codex_connector_command() -> &'static str {
+        "od tools connectors execute --connector github --tool github.github_list_notifications --input .daily-digest-tmp/notifications.json"
+    }
+
+    /// Feeds a `command_execution` pair whose completed output is `output`.
+    fn feed_connector_command(probe: &mut Probe, id: &str, output: &str) {
+        probe.feed(&frame_line(&json!({
+            "type": "item.started",
+            "item": {
+                "id": id,
+                "type": "command_execution",
+                "command": codex_connector_command(),
+                "aggregated_output": "",
+                "exit_code": null,
+                "status": "in_progress",
+            },
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {
+                "id": id,
+                "type": "command_execution",
+                "command": codex_connector_command(),
+                "aggregated_output": output,
+                "exit_code": 1,
+                "status": "failed",
+            },
+        })));
+    }
+
+    const CONNECTOR_ERROR_MESSAGE: &str = "Connector tool github.github_list_notifications is not allowed \
+         for connector github. Re-list the connector catalog and choose one of the currently allowed \
+         read-only tools.";
+
+    /// Parity: `json-event-stream.test.ts:1814` and `:1878` — a disallowed
+    /// connector tool selection becomes terminal, even after noise output.
+    #[test]
+    fn codex_surfaces_a_disallowed_connector_tool_selection() {
+        let direct = json!({
+            "ok": false,
+            "status": 404,
+            "error": {
+                "code": "CONNECTOR_TOOL_NOT_FOUND",
+                "message": "connector tool is not allowed",
+                "details": {
+                    "connectorId": "github",
+                    "toolName": "github.github_list_notifications",
+                },
+            },
+        })
+        .to_string();
+        let mut probe = Probe::new("codex");
+        feed_connector_command(&mut probe, "item-connector", &format!("{direct}\n"));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "tool_use", "id": "item-connector", "name": "Bash", "input": {"command": codex_connector_command()}}),
+                json!({"type": "tool_result", "toolUseId": "item-connector", "content": format!("{direct}\n"), "isError": true}),
+                json!({"type": "error", "message": CONNECTOR_ERROR_MESSAGE}),
+            ]
+        );
+
+        let noise = json!({"event": "running", "message": "starting connector call"}).to_string();
+        let mut probe = Probe::new("codex");
+        feed_connector_command(
+            &mut probe,
+            "item-connector",
+            &format!("{noise}\n{direct}\n"),
+        );
+        assert_eq!(
+            probe.events.last(),
+            Some(&json!({"type": "error", "message": CONNECTOR_ERROR_MESSAGE}))
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:1946` — the API's wrapped error shape.
+    #[test]
+    fn codex_surfaces_a_wrapped_connector_tool_selection() {
+        let wrapped = json!({
+            "error": {
+                "data": {
+                    "error": {
+                        "code": "CONNECTOR_TOOL_NOT_FOUND",
+                        "message": "connector tool is not allowed",
+                        "details": {
+                            "connectorId": "github",
+                            "toolName": "github.github_list_notifications",
+                        },
+                    },
+                },
+            },
+        })
+        .to_string();
+        let mut probe = Probe::new("codex");
+        feed_connector_command(&mut probe, "item-connector-wrapped", &format!("{wrapped}\n"));
+        assert_eq!(
+            probe.events.last(),
+            Some(&json!({"type": "error", "message": CONNECTOR_ERROR_MESSAGE}))
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:2019`, `:2039`, `:2062` and `:2076` —
+    /// codex's own reconnect loop is a status, while a real error stays fatal
+    /// even after one, and reconnect text inside a real error changes nothing.
+    #[test]
+    fn codex_normalizes_reconnect_errors_but_keeps_real_ones_fatal() {
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({
+            "type": "error",
+            "message": "Reconnecting... 2/5 (timeout waiting for child process to exit)",
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "error",
+            "message": "Reconnecting... 2/5 (stream disconnected before completion: Connection reset by peer (os error 54))",
+        })));
+        probe.feed(&frame_line(&json!({
+            "type": "error",
+            "message": "Authentication failed: invalid API key",
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "status", "label": "agent_reconnecting", "detail": "2/5"}),
+                json!({"type": "status", "label": "agent_reconnecting", "detail": "2/5"}),
+                json!({"type": "error", "message": "Authentication failed: invalid API key"}),
+            ]
+        );
+
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({
+            "type": "error",
+            "message": "Authentication failed after Reconnecting... stream disconnected before completion",
+        })));
+        assert_eq!(
+            probe.events,
+            vec![json!({
+                "type": "error",
+                "message": "Authentication failed after Reconnecting... stream disconnected before completion",
+            })]
+        );
+    }
+
+    const CODEX_MCP_TOOL_CALL_STARTED: &str = "{\"type\":\"item.started\",\"item\":{\"id\":\"item_2\",\"type\":\"mcp_tool_call\",\"server\":\"echofacts\",\"tool\":\"echo_fact\",\"arguments\":{\"topic\":\"orbital-mechanics\"},\"result\":null,\"error\":null,\"status\":\"in_progress\"}}";
+    const CODEX_MCP_TOOL_CALL_FAILED: &str = "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_2\",\"type\":\"mcp_tool_call\",\"server\":\"echofacts\",\"tool\":\"echo_fact\",\"arguments\":{\"topic\":\"orbital-mechanics\"},\"result\":null,\"error\":{\"message\":\"MCP tool call requires approval, but approval policy is never\"},\"status\":\"failed\"}}";
+    const CODEX_WEB_SEARCH_STARTED: &str = "{\"type\":\"item.started\",\"item\":{\"id\":\"item_2\",\"type\":\"web_search\",\"id\":\"exec-9fb8985e-4163-4af2-82a2-d499ab71d18b\",\"query\":\"\",\"action\":{\"type\":\"other\"}}}";
+    const CODEX_WEB_SEARCH_COMPLETED: &str = "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_2\",\"type\":\"web_search\",\"id\":\"exec-9fb8985e-4163-4af2-82a2-d499ab71d18b\",\"query\":\"OpenAI Codex CLI release notes\",\"action\":{\"type\":\"search\",\"query\":\"OpenAI Codex CLI release notes\"}}}";
+    /// Duplicate `id` key: a JSON parse keeps the last, so this is the tool id.
+    const CODEX_WEB_SEARCH_ID: &str = "exec-9fb8985e-4163-4af2-82a2-d499ab71d18b";
+    const CODEX_MCP_TOOL_NAME: &str = "mcp__echofacts__echo_fact";
+
+    /// Parity: `json-event-stream.test.ts:2127`, `:2156` and `:2171` — the row
+    /// leaves at `item.started` (so it has a duration), and the pair is
+    /// self-sufficient when only `item.completed` arrives.
+    #[test]
+    fn codex_emits_a_tool_row_for_an_mcp_tool_call() {
+        let expected_pair = vec![
+            json!({"type": "tool_use", "id": "item_2", "name": CODEX_MCP_TOOL_NAME, "input": {"topic": "orbital-mechanics"}}),
+            json!({"type": "tool_result", "toolUseId": "item_2", "content": "MCP tool call requires approval, but approval policy is never", "isError": true}),
+        ];
+
+        let mut probe = Probe::new("codex");
+        probe.feed(&format!("{CODEX_MCP_TOOL_CALL_STARTED}\n"));
+        assert_eq!(probe.events, vec![expected_pair[0].clone()]);
+
+        let mut probe = Probe::new("codex");
+        probe.feed(&format!("{CODEX_MCP_TOOL_CALL_STARTED}\n{CODEX_MCP_TOOL_CALL_FAILED}\n"));
+        assert_eq!(probe.events, expected_pair);
+
+        let mut probe = Probe::new("codex");
+        probe.feed(&format!("{CODEX_MCP_TOOL_CALL_FAILED}\n"));
+        assert_eq!(probe.events, expected_pair);
+    }
+
+    /// Parity: `json-event-stream.test.ts:2322` — a half-named call must not
+    /// become a row labelled `mcp____`.
+    #[test]
+    fn codex_leaves_a_half_named_mcp_tool_call_as_raw() {
+        let line = json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_2",
+                "type": "mcp_tool_call",
+                "server": "echofacts",
+                "arguments": {"topic": "orbital-mechanics"},
+                "result": null,
+                "error": null,
+                "status": "completed",
+            },
+        });
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&line));
+        assert_eq!(probe.events, vec![json!({"type": "raw", "line": line.to_string()})]);
+    }
+
+    /// Parity: `json-event-stream.test.ts:2352` — a non-failed call is not an
+    /// error, and the success payload shape is deliberately not pinned.
+    #[test]
+    fn codex_does_not_mark_a_non_failed_mcp_tool_call_as_an_error() {
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_2",
+                "type": "mcp_tool_call",
+                "server": "echofacts",
+                "tool": "echo_fact",
+                "arguments": {"topic": "orbital-mechanics"},
+                "result": null,
+                "error": null,
+                "status": "completed",
+            },
+        })));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "tool_use", "id": "item_2", "name": CODEX_MCP_TOOL_NAME, "input": {"topic": "orbital-mechanics"}}),
+                json!({"type": "tool_result", "toolUseId": "item_2", "content": "", "isError": false}),
+            ]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:2234` and `:2271` — the started frame
+    /// starts the clock through the generic early form, and the settled pair
+    /// still carries the term; the client retires one into the other by id.
+    #[test]
+    fn codex_emits_a_search_row_for_a_completed_web_search() {
+        let mut probe = Probe::new("codex");
+        probe.feed(&format!("{CODEX_WEB_SEARCH_STARTED}\n{CODEX_WEB_SEARCH_COMPLETED}\n"));
+        assert_eq!(
+            probe.events,
+            vec![
+                json!({"type": "tool_in_flight", "id": CODEX_WEB_SEARCH_ID, "name": "web_search", "input": {}}),
+                json!({"type": "tool_use", "id": CODEX_WEB_SEARCH_ID, "name": "web_search", "input": {"query": "OpenAI Codex CLI release notes"}}),
+                json!({"type": "tool_result", "toolUseId": CODEX_WEB_SEARCH_ID, "content": "", "isError": false}),
+            ]
+        );
+
+        let mut probe = Probe::new("codex");
+        probe.feed(&format!("{CODEX_WEB_SEARCH_STARTED}\n"));
+        assert_eq!(
+            probe.events,
+            vec![json!({"type": "tool_in_flight", "id": CODEX_WEB_SEARCH_ID, "name": "web_search", "input": {}})]
+        );
+    }
+
+    /// Parity: `json-event-stream.test.ts:2288` — codex's action taxonomy has
+    /// more members than `search`, so anything else stays raw.
+    #[test]
+    fn codex_leaves_a_non_search_web_search_as_raw() {
+        let line = json!({
+            "type": "item.completed",
+            "item": {
+                "id": CODEX_WEB_SEARCH_ID,
+                "type": "web_search",
+                "query": "OpenAI Codex CLI release notes",
+                "action": {"type": "other"},
+            },
+        });
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&line));
+        assert_eq!(probe.events, vec![json!({"type": "raw", "line": line.to_string()})]);
+    }
+
+    /// An unhandled codex frame falls back to raw (`json-event-stream.test.ts:2012`).
+    #[test]
+    fn codex_leaves_unhandled_events_as_raw() {
+        let line = json!({"type": "unhandled.event", "foo": "bar"});
+        let mut probe = Probe::new("codex");
+        probe.feed(&frame_line(&line));
+        assert_eq!(
+            probe.events,
+            vec![json!({"type": "raw", "line": line.to_string()})]
         );
     }
 }

@@ -75,6 +75,20 @@ fn shim_dir() -> std::path::PathBuf {
             "exit 0\n",
         ),
     );
+    // Emits one `codex exec --json` turn, then exits: proves the `codex` kind
+    // reaches the parsed lane.
+    write_shim(
+        &dir,
+        "codex",
+        concat!(
+            "#!/bin/sh\n",
+            "cat > /dev/null\n",
+            "echo '{\"type\":\"thread.started\",\"thread_id\":\"thr-1\"}'\n",
+            "echo '{\"type\":\"item.completed\",\"item\":{\"id\":\"item-1\",\"type\":\"agent_message\",\"text\":\"hey\"}}'\n",
+            "echo '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":11,\"output_tokens\":7}}'\n",
+            "exit 0\n",
+        ),
+    );
     dir
 }
 
@@ -405,5 +419,47 @@ async fn antigravity_jsonl_maps_to_lane_events() {
     assert!(
         !events.contains("event: stdout"),
         "an antigravity run must not fall through to the plain lane: {events}"
+    );
+}
+
+/// The `codex` kind of the same lane must map to parsed events too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_jsonl_maps_to_lane_events() {
+    ensure_shim_on_path();
+    let daemon = RunningDaemon::start(config(temp_paths("codex-jsonl")))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+    let (head, body) = post_run(addr, r#"{"agentId":"codex","prompt":"hi"}"#).await;
+    assert!(head.contains("202"), "head: {head} body: {body}");
+    let run_id: String = serde_json::from_str::<serde_json::Value>(&body)
+        .expect("json")
+        .get("runId")
+        .and_then(|v| v.as_str())
+        .expect("runId")
+        .to_string();
+    let mut status = String::new();
+    for _ in 0..100 {
+        let (_, body) = get_run(addr, &run_id).await;
+        status = serde_json::from_str::<serde_json::Value>(&body)
+            .expect("json")
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if matches!(status.as_str(), "succeeded" | "failed" | "canceled") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(status, "succeeded", "run did not succeed");
+    let (_, events) = get_events(addr, &run_id).await;
+    assert!(events.contains("event: agent"), "events: {events}");
+    assert!(events.contains("\"sessionId\":\"thr-1\""), "events: {events}");
+    assert!(events.contains("hey"), "events: {events}");
+    assert!(events.contains("\"usage\""), "events: {events}");
+    assert!(
+        !events.contains("event: stdout"),
+        "a codex run must not fall through to the plain lane: {events}"
     );
 }
