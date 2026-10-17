@@ -34,17 +34,45 @@
         if (od) {
           p('__od__.version', od.version);
           p('__od__.client', JSON.stringify(od.client));
-          // Every group `isOpenDesignHostBridge` validates, so a missing command
-          // shows up as `undefined` here rather than at the first real use.
-          p('__od__.shell.openExternal', typeof od.shell?.openExternal);
-          p('__od__.shell.openPath', typeof od.shell?.openPath);
-          p('__od__.browser.clearData', typeof od.browser?.clearData);
-          p('__od__.capture.page', typeof od.capture?.page);
-          p('__od__.project.pickWorkingDir', typeof od.project?.pickWorkingDir);
-          p('__od__.project.pickAndImport', typeof od.project?.pickAndImport);
-          p('__od__.pdf.print', typeof od.pdf?.print);
-          p('__od__.pet.setVisible', typeof od.pet?.setVisible);
-          p('__od__.updater.check', typeof od.updater?.check);
+          // Mirror `isOpenDesignHostBridge` (packages/host/src/detection.ts)
+          // check for check, so the probe reports the same verdict the app's
+          // `isOpenDesignHostAvailable()` computes: every required group and
+          // every required function of that group. A missing command shows up
+          // here rather than at the first real use.
+          const required = {
+            shell: ['openExternal', 'openPath'],
+            browser: ['clearData'],
+            capture: ['page'],
+            project: ['pickAndImport', 'pickAndReplaceWorkingDir'],
+            pdf: ['print'],
+            pet: ['setVisible'],
+            updater: [
+              'status',
+              'check',
+              'clear-cache',
+              'download',
+              'install',
+              'quit',
+              'setMenuLabels',
+              'subscribe',
+              'subscribeOpenDialog',
+            ],
+          };
+          const isRecord = (value) => typeof value === 'object' && value !== null;
+          const hasFunction = (scope, key) => isRecord(scope) && typeof scope[key] === 'function';
+          let verdict = od.version === 2;
+          if (!isRecord(od.client) || od.client.type !== 'desktop') verdict = false;
+          if (typeof od.client?.platform !== 'string' || typeof od.client?.osLocale !== 'string') {
+            verdict = false;
+          }
+          for (const [group, methods] of Object.entries(required)) {
+            for (const method of methods) {
+              const ok = hasFunction(od[group], method);
+              if (!ok) verdict = false;
+              p(`  ${group}.${method}`, ok ? 'function' : 'MISSING');
+            }
+          }
+          p('isOpenDesignHostBridge verdict', verdict);
         }
         // A real round trip, so the ACL is exercised and not merely declared:
         // these three commands are granted to the daemon origin in
@@ -56,6 +84,23 @@
           } catch (error) {
             p('invoke ' + cmd + ' ERROR', String(error));
           }
+        }
+        // A real round trip for a bridge method, not just a presence check:
+        // `capture.page` is non-interactive, so the headless harness can drive
+        // it and assert the shape of what came back. (`pickWorkingDir` and
+        // `pdf.print` open native dialogs, which a headless window cannot
+        // answer; the ACL round trips above stand in for their grant.)
+        try {
+          const shot = await od.capture.page();
+          const dataUrl = typeof shot === 'string' ? shot : shot?.dataUrl;
+          p(
+            'capture.page()',
+            dataUrl
+              ? 'dataUrl ' + dataUrl.slice(0, 30) + '… (' + dataUrl.length + ' chars)'
+              : JSON.stringify(shot).slice(0, 120),
+          );
+        } catch (error) {
+          p('capture.page() ERROR', String(error));
         }
         document.getElementById('out').textContent = lines.join('\n');
       })();
