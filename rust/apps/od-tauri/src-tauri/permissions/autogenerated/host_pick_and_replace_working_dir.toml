@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-host-pick-and-replace-working-dir"
+description = "Enables the host_pick_and_replace_working_dir command without any pre-configured scope."
+commands.allow = ["host_pick_and_replace_working_dir"]
+
+[[permission]]
+identifier = "deny-host-pick-and-replace-working-dir"
+description = "Denies the host_pick_and_replace_working_dir command without any pre-configured scope."
+commands.deny = ["host_pick_and_replace_working_dir"]

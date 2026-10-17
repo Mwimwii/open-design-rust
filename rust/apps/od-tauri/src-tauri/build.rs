@@ -13,6 +13,9 @@ fn main() {
             "open_external",
             "pick_workspace_folder",
             "host_open_path",
+            "host_pick_working_dir",
+            "host_pick_and_import",
+            "host_pick_and_replace_working_dir",
         ]),
     ))
     .expect("failed to run tauri-build");

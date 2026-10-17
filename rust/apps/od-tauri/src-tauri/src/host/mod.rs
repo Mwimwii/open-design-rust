@@ -23,9 +23,13 @@
 //! remote origin gets no command that is absent from either list.
 
 pub mod bridge;
+pub mod desktop_auth;
+pub mod project;
 pub mod shell;
 
 use serde_json::{json, Value};
+
+use desktop_auth::DESKTOP_IMPORT_TOKEN_HEADER;
 
 /// The wire failure envelope (`OpenDesignHostFailure` in `packages/host`).
 pub fn failure(reason: impl Into<String>) -> Value {
@@ -72,6 +76,42 @@ pub async fn daemon_get_project(daemon_url: &str, project_id: &str) -> Result<Va
         .json::<Value>()
         .await
         .map_err(|_| "daemon response was not JSON".to_string())
+}
+
+/// `POST <path>` on the embedded daemon with a desktop import token.
+///
+/// Answers `(status, body)` for every HTTP response, including error ones,
+/// because the bridge contract carries the daemon's status and body into the
+/// renderer's failure envelope. `Err` is reserved for "the daemon could not be
+/// reached at all" — the same split the Electron host uses.
+pub async fn daemon_post_json(
+    daemon_url: &str,
+    path: &str,
+    import_token: &str,
+    body: Value,
+    headers: Vec<(String, String)>,
+) -> Result<(u16, Value), String> {
+    let url = format!("{}{}", daemon_url.trim_end_matches('/'), path);
+    let mut request = reqwest::Client::new()
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header(DESKTOP_IMPORT_TOKEN_HEADER, import_token)
+        .json(&body);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|err| format!("daemon fetch failed: {err}"))?;
+    let status = response.status().as_u16();
+    let text = response
+        .text()
+        .await
+        .map_err(|err| format!("daemon fetch failed: {err}"))?;
+    // A non-JSON body (an HTML error page, say) is `null`, which the caller
+    // reports without `details` — parity with the Electron host.
+    Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
 }
 
 /// The daemon's project metadata, whichever shape the daemon serializes.

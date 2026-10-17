@@ -48,6 +48,9 @@ pub fn run() {
             commands::pick_workspace_folder,
             host::shell::open_external,
             host::shell::host_open_path,
+            host::project::host_pick_working_dir,
+            host::project::host_pick_and_import,
+            host::project::host_pick_and_replace_working_dir,
         ])
         .setup(|app| shell::setup(app))
         .build(tauri::generate_context!())

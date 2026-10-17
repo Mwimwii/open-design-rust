@@ -507,6 +507,24 @@
           "markdownDescription": "Enables the host_open_path command without any pre-configured scope."
         },
         {
+          "description": "Enables the host_pick_and_import command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-host-pick-and-import",
+          "markdownDescription": "Enables the host_pick_and_import command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the host_pick_and_replace_working_dir command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-host-pick-and-replace-working-dir",
+          "markdownDescription": "Enables the host_pick_and_replace_working_dir command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the host_pick_working_dir command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-host-pick-working-dir",
+          "markdownDescription": "Enables the host_pick_working_dir command without any pre-configured scope."
+        },
+        {
           "description": "Enables the open_external command without any pre-configured scope.",
           "type": "string",
           "const": "allow-open-external",
@@ -541,6 +559,24 @@
           "type": "string",
           "const": "deny-host-open-path",
           "markdownDescription": "Denies the host_open_path command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the host_pick_and_import command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-host-pick-and-import",
+          "markdownDescription": "Denies the host_pick_and_import command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the host_pick_and_replace_working_dir command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-host-pick-and-replace-working-dir",
+          "markdownDescription": "Denies the host_pick_and_replace_working_dir command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the host_pick_working_dir command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-host-pick-working-dir",
+          "markdownDescription": "Denies the host_pick_working_dir command without any pre-configured scope."
         },
         {
           "description": "Denies the open_external command without any pre-configured scope.",

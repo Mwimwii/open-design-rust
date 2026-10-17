@@ -14,6 +14,8 @@ use od_daemon::{DaemonConfig, RunningDaemon, StartError};
 use tauri::{App, AppHandle, Listener, Manager, WebviewUrl, WebviewWindowBuilder};
 use url::Url;
 
+use crate::host::desktop_auth::DesktopAuth;
+
 /// State handed to IPC commands.
 pub struct ShellState {
     /// Base URL of the embedded loopback daemon (e.g. `http://127.0.0.1:7456`).
@@ -22,6 +24,11 @@ pub struct ShellState {
     pub data_dir: PathBuf,
     /// The static web export the daemon serves; `None` means API-only.
     pub web_dist: Option<PathBuf>,
+    /// The per-process secret the project flows mint import tokens with. In
+    /// Electron this is also registered with the daemon over sidecar IPC; the
+    /// Rust daemon has neither import routes nor an auth gate yet, so there is
+    /// nothing to register it with.
+    pub desktop_auth: DesktopAuth,
     /// Kept for graceful shutdown on `RunEvent::Exit`.
     daemon: Mutex<Option<RunningDaemon>>,
 }
@@ -46,6 +53,7 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         daemon_url: daemon_url.clone(),
         data_dir,
         web_dist,
+        desktop_auth: DesktopAuth::generate(),
         daemon: Mutex::new(Some(daemon)),
     });
 
