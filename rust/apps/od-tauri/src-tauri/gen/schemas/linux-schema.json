@@ -507,6 +507,12 @@
           "markdownDescription": "Enables the host_capture_page command without any pre-configured scope."
         },
         {
+          "description": "Enables the host_clear_browser_data command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-host-clear-browser-data",
+          "markdownDescription": "Enables the host_clear_browser_data command without any pre-configured scope."
+        },
+        {
           "description": "Enables the host_open_path command without any pre-configured scope.",
           "type": "string",
           "const": "allow-host-open-path",
@@ -535,6 +541,24 @@
           "type": "string",
           "const": "allow-host-print-pdf",
           "markdownDescription": "Enables the host_print_pdf command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the host_set_pet_visible command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-host-set-pet-visible",
+          "markdownDescription": "Enables the host_set_pet_visible command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the host_set_theme command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-host-set-theme",
+          "markdownDescription": "Enables the host_set_theme command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the host_updater command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-host-updater",
+          "markdownDescription": "Enables the host_updater command without any pre-configured scope."
         },
         {
           "description": "Enables the open_external command without any pre-configured scope.",
@@ -573,6 +597,12 @@
           "markdownDescription": "Denies the host_capture_page command without any pre-configured scope."
         },
         {
+          "description": "Denies the host_clear_browser_data command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-host-clear-browser-data",
+          "markdownDescription": "Denies the host_clear_browser_data command without any pre-configured scope."
+        },
+        {
           "description": "Denies the host_open_path command without any pre-configured scope.",
           "type": "string",
           "const": "deny-host-open-path",
@@ -601,6 +631,24 @@
           "type": "string",
           "const": "deny-host-print-pdf",
           "markdownDescription": "Denies the host_print_pdf command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the host_set_pet_visible command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-host-set-pet-visible",
+          "markdownDescription": "Denies the host_set_pet_visible command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the host_set_theme command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-host-set-theme",
+          "markdownDescription": "Denies the host_set_theme command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the host_updater command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-host-updater",
+          "markdownDescription": "Denies the host_updater command without any pre-configured scope."
         },
         {
           "description": "Denies the open_external command without any pre-configured scope.",

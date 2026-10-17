@@ -25,9 +25,11 @@
 pub mod bridge;
 pub mod capture;
 pub mod desktop_auth;
+pub mod misc;
 pub mod pdf;
 pub mod project;
 pub mod shell;
+pub mod updater;
 
 use serde_json::{json, Value};
 

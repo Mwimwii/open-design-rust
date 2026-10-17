@@ -23,6 +23,10 @@
     "allow-host-pick-and-import",
     "allow-host-pick-and-replace-working-dir",
     "allow-host-capture-page",
-    "allow-host-print-pdf"
+    "allow-host-print-pdf",
+    "allow-host-updater",
+    "allow-host-clear-browser-data",
+    "allow-host-set-theme",
+    "allow-host-set-pet-visible"
   ]
 }

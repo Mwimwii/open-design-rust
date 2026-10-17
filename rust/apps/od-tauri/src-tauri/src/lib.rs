@@ -53,6 +53,10 @@ pub fn run() {
             host::project::host_pick_and_replace_working_dir,
             host::capture::host_capture_page,
             host::pdf::host_print_pdf,
+            host::updater::host_updater,
+            host::misc::host_clear_browser_data,
+            host::misc::host_set_theme,
+            host::misc::host_set_pet_visible,
         ])
         .setup(|app| shell::setup(app))
         .build(tauri::generate_context!())

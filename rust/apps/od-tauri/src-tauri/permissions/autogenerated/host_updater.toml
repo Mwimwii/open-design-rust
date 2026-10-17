@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-host-updater"
+description = "Enables the host_updater command without any pre-configured scope."
+commands.allow = ["host_updater"]
+
+[[permission]]
+identifier = "deny-host-updater"
+description = "Denies the host_updater command without any pre-configured scope."
+commands.deny = ["host_updater"]

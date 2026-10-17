@@ -18,6 +18,10 @@ fn main() {
             "host_pick_and_replace_working_dir",
             "host_capture_page",
             "host_print_pdf",
+            "host_updater",
+            "host_clear_browser_data",
+            "host_set_theme",
+            "host_set_pet_visible",
         ]),
     ))
     .expect("failed to run tauri-build");
