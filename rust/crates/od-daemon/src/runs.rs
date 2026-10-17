@@ -3391,6 +3391,23 @@ async fn pump_child(
                     runs_for_out.push_external_event(&out_id, "raw", event.to_json());
                 }
             }
+        } else if stream_format == "qoder-stream-json" {
+            if let Some(stdout) = stdout {
+                // Qoder's JSONL wire maps onto UI-lane events; anything else on
+                // a line is a bounded raw event.
+                let mut parser = crate::protocol::QoderParser::new();
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let mut events = Vec::new();
+                    parser.feed(&format!("{line}\n"), &mut |event| events.push(event));
+                    for event in events {
+                        push_lane_event(&runs_for_out, &out_id, event);
+                    }
+                }
+                parser.flush(&mut |event| {
+                    push_lane_event(&runs_for_out, &out_id, event);
+                });
+            }
         } else if let Some(stdout) = stdout {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {

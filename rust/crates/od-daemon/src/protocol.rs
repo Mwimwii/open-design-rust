@@ -19,29 +19,71 @@ const STRING_LADDER_MIN_BYTES: usize = 256;
 /// `tool_use`, `tool_result`, `usage`, `raw`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
-    Status { label: String, model: Option<String> },
+    Status {
+        label: String,
+        model: Option<String>,
+        /// Claude/Qoder `session_id` as the wire carries it (parity: the
+        /// `sessionId` field on the TS `status` event).
+        session_id: Option<String>,
+        /// Qoder's `qodercli_version` (parity: the `qodercliVersion` field on
+        /// the TS `status` event; only the Qoder parser sets it).
+        qodercli_version: Option<String>,
+    },
     ThinkingDelta { delta: String },
     TextDelta { delta: String },
     ToolUse { id: Option<String>, name: Option<String>, input: Value },
     ToolResult { tool_use_id: Option<String>, content: String, is_error: bool },
-    Usage { usage: Value, stop_reason: String, duration_ms: Option<i64> },
+    Usage {
+        usage: Value,
+        stop_reason: String,
+        duration_ms: Option<i64>,
+        /// Top-level `costUsd` (parity: `packages/contracts` `usage` event and
+        /// the TS parsers that emit it beside `usage`).
+        cost_usd: Option<Value>,
+        /// Qoder's `modelUsage` map, passed through unchanged.
+        model_usage: Option<Value>,
+        /// Set only when the run finished in error, so the renderer can tell a
+        /// failed usage frame from a clean one.
+        is_error: Option<bool>,
+    },
     Raw { line: String, truncated_original_bytes: Option<usize> },
     TurnEnd { stop_reason: String },
     ThinkingStart,
     ThinkingTokens { tokens: f64 },
     ToolInputDelta { id: String, name: String, delta: String },
     RequestUsage { request_id: String, usage: Value },
-    Error { message: String, code: Option<String> },
+    Error { message: String, code: Option<String>, raw: Option<String> },
 }
 
 impl StreamEvent {
     pub fn to_json(&self) -> Value {
         match self {
-            StreamEvent::Status { label, model } => json!({
-                "type": "status",
-                "label": label,
-                "model": model,
-            }),
+            StreamEvent::Status {
+                label,
+                model,
+                session_id,
+                qodercli_version,
+            } => {
+                let mut event = serde_json::Map::new();
+                event.insert("type".to_string(), Value::String("status".to_string()));
+                event.insert("label".to_string(), Value::String(label.clone()));
+                // `model` stays present-but-null for parity with the TS
+                // parsers that always emit the key.
+                event.insert(
+                    "model".to_string(),
+                    model.clone().map(Value::String).unwrap_or(Value::Null),
+                );
+                if let Some(session_id) = session_id {
+                    event.insert("sessionId".to_string(), Value::String(session_id.clone()));
+                }
+                if let Some(qodercli_version) = qodercli_version {
+                    event.insert(
+                        "qodercliVersion".to_string(),
+                        Value::String(qodercli_version.clone()),
+                    );
+                }
+                Value::Object(event)
+            }
             StreamEvent::ThinkingDelta { delta } => json!({
                 "type": "thinking_delta",
                 "delta": delta,
@@ -70,12 +112,32 @@ impl StreamEvent {
                 usage,
                 stop_reason,
                 duration_ms,
-            } => json!({
-                "type": "usage",
-                "usage": usage,
-                "stopReason": stop_reason,
-                "durationMs": duration_ms,
-            }),
+                cost_usd,
+                model_usage,
+                is_error,
+            } => {
+                let mut event = serde_json::Map::new();
+                event.insert("type".to_string(), Value::String("usage".to_string()));
+                event.insert("usage".to_string(), usage.clone());
+                event.insert(
+                    "stopReason".to_string(),
+                    Value::String(stop_reason.clone()),
+                );
+                event.insert(
+                    "durationMs".to_string(),
+                    duration_ms.map(Value::from).unwrap_or(Value::Null),
+                );
+                if let Some(cost) = cost_usd {
+                    event.insert("costUsd".to_string(), cost.clone());
+                }
+                if let Some(model_usage) = model_usage {
+                    event.insert("modelUsage".to_string(), model_usage.clone());
+                }
+                if let Some(is_error) = is_error {
+                    event.insert("isError".to_string(), Value::Bool(*is_error));
+                }
+                Value::Object(event)
+            }
             StreamEvent::TurnEnd { stop_reason } => json!({
                 "type": "turn_end",
                 "stopReason": stop_reason,
@@ -96,11 +158,18 @@ impl StreamEvent {
                 "requestId": request_id,
                 "usage": usage,
             }),
-            StreamEvent::Error { message, code } => json!({
-                "type": "error",
-                "message": message,
-                "code": code,
-            }),
+            StreamEvent::Error { message, code, raw } => {
+                let mut event = serde_json::Map::new();
+                event.insert("type".to_string(), Value::String("error".to_string()));
+                event.insert("message".to_string(), Value::String(message.clone()));
+                if let Some(code) = code {
+                    event.insert("code".to_string(), Value::String(code.clone()));
+                }
+                if let Some(raw) = raw {
+                    event.insert("raw".to_string(), Value::String(raw.clone()));
+                }
+                Value::Object(event)
+            }
             StreamEvent::Raw {
                 line,
                 truncated_original_bytes,
@@ -212,12 +281,16 @@ impl CopilotParser {
                     on_event(StreamEvent::Status {
                         label: "initializing".to_string(),
                         model: Some(model.to_string()),
+                        session_id: None,
+                        qodercli_version: None,
                     });
                 }
             }
             "assistant.turn_start" => on_event(StreamEvent::Status {
                 label: "streaming".to_string(),
                 model: None,
+                session_id: None,
+                qodercli_version: None,
             }),
             "assistant.reasoning_delta" => {
                 if let Some(delta) = get("deltaContent").and_then(Value::as_str) {
@@ -261,6 +334,9 @@ impl CopilotParser {
                         "error".to_string()
                     },
                     duration_ms,
+                    cost_usd: None,
+                    model_usage: None,
+                    is_error: None,
                 });
             }
             _ => {}
@@ -309,10 +385,14 @@ mod tests {
                 StreamEvent::Status {
                     label: "initializing".to_string(),
                     model: Some("gpt-5.2".to_string()),
+                    session_id: None,
+                    qodercli_version: None,
                 },
                 StreamEvent::Status {
                     label: "streaming".to_string(),
                     model: None,
+                    session_id: None,
+                    qodercli_version: None,
                 },
                 StreamEvent::ThinkingDelta {
                     delta: "hmm".to_string()
@@ -522,6 +602,11 @@ impl ClaudeParser {
                             .get("model")
                             .and_then(Value::as_str)
                             .map(str::to_string),
+                        session_id: obj
+                            .get("session_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        qodercli_version: None,
                     });
                     return;
                 }
@@ -533,6 +618,8 @@ impl ClaudeParser {
                             .unwrap_or("working")
                             .to_string(),
                         model: None,
+                        session_id: None,
+                        qodercli_version: None,
                     });
                     return;
                 }
@@ -696,6 +783,7 @@ impl ClaudeParser {
                             text
                         },
                         code: Some(error.to_string()),
+                        raw: None,
                     });
                 }
             }
@@ -784,6 +872,9 @@ impl ClaudeParser {
                 usage,
                 stop_reason: stop_reason.clone().unwrap_or_default(),
                 duration_ms: obj.get("duration_ms").and_then(Value::as_i64),
+                cost_usd: None,
+                model_usage: None,
+                is_error: None,
             });
             if is_error {
                 let message = obj
@@ -826,6 +917,7 @@ impl ClaudeParser {
                 on_event(StreamEvent::Error {
                     message,
                     code,
+                    raw: None,
                 });
             }
         }
@@ -1014,6 +1106,402 @@ impl ClaudeParser {
     }
 }
 
+/// Qoder CLI `--output-format stream-json` JSONL parser (parity:
+/// `createQoderStreamHandler` in `apps/daemon/src/runtimes/qoder-stream.ts`).
+///
+/// Qoder's top-level records are wrapper objects (`system`, `assistant`,
+/// `result`) with its own fields, so this stays separate from the Claude and
+/// Copilot parsers. Unrecognised records and unparseable lines become bounded
+/// `raw` events.
+#[derive(Debug, Default)]
+pub struct QoderParser {
+    buffer: String,
+    emitted_thinking_start: bool,
+}
+
+impl QoderParser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn feed(&mut self, chunk: &str, on_event: &mut dyn FnMut(StreamEvent)) {
+        self.buffer.push_str(chunk);
+        while let Some(pos) = self.buffer.find('\n') {
+            let line = self.buffer[..pos].trim().to_string();
+            self.buffer.drain(..pos + 1);
+            if line.is_empty() {
+                continue;
+            }
+            self.handle_line(&line, on_event);
+        }
+    }
+
+    pub fn flush(&mut self, on_event: &mut dyn FnMut(StreamEvent)) {
+        let rest = std::mem::take(&mut self.buffer).trim().to_string();
+        if rest.is_empty() {
+            return;
+        }
+        self.handle_line(&rest, on_event);
+    }
+
+    fn handle_line(&mut self, line: &str, on_event: &mut dyn FnMut(StreamEvent)) {
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) => self.handle_object(&value, line, on_event),
+            Err(_) => on_event(bound_raw_line(line)),
+        }
+    }
+
+    fn handle_object(
+        &mut self,
+        value: &Value,
+        raw_line: &str,
+        on_event: &mut dyn FnMut(StreamEvent),
+    ) {
+        let obj = match value.as_object() {
+            Some(obj) => obj,
+            None => return,
+        };
+        let obj_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
+
+        if obj_type == "system" && obj.get("subtype").and_then(Value::as_str) == Some("init") {
+            on_event(StreamEvent::Status {
+                label: "initializing".to_string(),
+                model: obj.get("model").and_then(Value::as_str).map(str::to_string),
+                session_id: obj
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                qodercli_version: obj
+                    .get("qodercli_version")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
+            return;
+        }
+
+        if obj_type == "assistant" {
+            // `qoder-stream.ts` requires `obj.message` to be a record; anything
+            // else falls through to the bounded raw event below.
+            let Some(message) = obj.get("message").and_then(Value::as_object) else {
+                on_event(bound_raw_line(raw_line));
+                return;
+            };
+            let content = message.get("content");
+            let mut emitted_text = false;
+            if let Some(blocks) = content.and_then(Value::as_array) {
+                for block in blocks {
+                    let text = qoder_text_from_content_block(block);
+                    if !text.is_empty() {
+                        emitted_text = true;
+                        on_event(StreamEvent::TextDelta { delta: text });
+                        continue;
+                    }
+                    if block.get("type").and_then(Value::as_str) == Some("thinking") {
+                        if let Some(thinking) = block.get("thinking").and_then(Value::as_str) {
+                            if !thinking.is_empty() {
+                                if !self.emitted_thinking_start {
+                                    self.emitted_thinking_start = true;
+                                    on_event(StreamEvent::ThinkingStart);
+                                }
+                                on_event(StreamEvent::ThinkingDelta {
+                                    delta: thinking.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            if !emitted_text {
+                if let Some(text) = content.and_then(Value::as_str) {
+                    on_event(StreamEvent::TextDelta {
+                        delta: text.to_string(),
+                    });
+                    emitted_text = true;
+                }
+            }
+            if let Some(error) = obj.get("error") {
+                if !error.is_null() && !emitted_text {
+                    on_event(StreamEvent::Error {
+                        message: qoder_message_from_error(error),
+                        code: None,
+                        raw: Some(raw_line.to_string()),
+                    });
+                }
+            }
+            return;
+        }
+
+        if obj_type == "result" {
+            let is_error = obj.get("is_error") == Some(&Value::Bool(true));
+            let usage = obj.get("usage").cloned().unwrap_or(Value::Null);
+            on_event(StreamEvent::Usage {
+                usage,
+                stop_reason: obj
+                    .get("stop_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                duration_ms: obj.get("duration_ms").and_then(Value::as_i64),
+                cost_usd: obj.get("total_cost_usd").cloned(),
+                model_usage: obj.get("modelUsage").cloned(),
+                is_error: Some(is_error),
+            });
+            if is_error {
+                on_event(StreamEvent::Error {
+                    message: qoder_message_from_result(obj),
+                    code: None,
+                    raw: Some(raw_line.to_string()),
+                });
+            }
+            return;
+        }
+
+        // An unrecognised record (e.g. the `user` echo carrying tool results):
+        // bounded at the source, like the other parsers.
+        on_event(bound_raw_line(raw_line));
+    }
+}
+
+/// `textFromContentBlock` in `qoder-stream.ts`: a block's own `text` when it is
+/// a `text` block (or carries a `text` field), otherwise nothing.
+fn qoder_text_from_content_block(block: &Value) -> String {
+    let Some(obj) = block.as_object() else {
+        return String::new();
+    };
+    if obj.get("type").and_then(Value::as_str) == Some("text") {
+        if let Some(text) = obj.get("text").and_then(Value::as_str) {
+            return text.to_string();
+        }
+    }
+    if let Some(text) = obj.get("text").and_then(Value::as_str) {
+        return text.to_string();
+    }
+    String::new()
+}
+
+/// `messageFromError` in `qoder-stream.ts`.
+fn qoder_message_from_error(error: &Value) -> String {
+    if let Some(message) = error
+        .as_object()
+        .and_then(|obj| obj.get("message"))
+        .and_then(Value::as_str)
+    {
+        return message.to_string();
+    }
+    if let Some(text) = error.as_str() {
+        if !text.is_empty() {
+            return text.to_string();
+        }
+    }
+    "Unknown Qoder error".to_string()
+}
+
+/// `messageFromResult` in `qoder-stream.ts`.
+fn qoder_message_from_result(obj: &serde_json::Map<String, Value>) -> String {
+    if let Some(error) = obj.get("error") {
+        if let Some(text) = error.as_str() {
+            if !text.is_empty() {
+                return text.to_string();
+            }
+        }
+        if let Some(message) = error
+            .as_object()
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+        {
+            if !message.is_empty() {
+                return message.to_string();
+            }
+        }
+    }
+    if let Some(message) = obj.get("message").and_then(Value::as_str) {
+        if !message.is_empty() {
+            return message.to_string();
+        }
+    }
+    if let Some(stop_reason) = obj.get("stop_reason").and_then(Value::as_str) {
+        if !stop_reason.is_empty() {
+            return format!("Qoder run failed: {stop_reason}");
+        }
+    }
+    "Qoder run failed".to_string()
+}
+
+#[cfg(test)]
+mod qoder_tests {
+    use super::*;
+
+    fn collect(feed: &str) -> Vec<StreamEvent> {
+        let mut parser = QoderParser::new();
+        let mut events = Vec::new();
+        parser.feed(feed, &mut |event| events.push(event));
+        parser.flush(&mut |event| events.push(event));
+        events
+    }
+
+    fn lane(events: &[StreamEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .map(|event| match event {
+                StreamEvent::Status { .. } => "status",
+                StreamEvent::ThinkingDelta { .. } => "thinking_delta",
+                StreamEvent::TextDelta { .. } => "text_delta",
+                StreamEvent::ToolUse { .. } => "tool_use",
+                StreamEvent::ToolResult { .. } => "tool_result",
+                StreamEvent::Usage { .. } => "usage",
+                StreamEvent::TurnEnd { .. } => "turn_end",
+                StreamEvent::ThinkingStart => "thinking_start",
+                StreamEvent::ThinkingTokens { .. } => "thinking_tokens",
+                StreamEvent::ToolInputDelta { .. } => "tool_input_delta",
+                StreamEvent::RequestUsage { .. } => "request_usage",
+                StreamEvent::Error { .. } => "error",
+                StreamEvent::Raw { .. } => "raw",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn system_init_maps_to_status_with_session_and_cli_version() {
+        let events = collect(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"qodercli_version\":\"0.2.6\",\"model\":\"auto\",\"session_id\":\"session-1\"}\n",
+        );
+        assert_eq!(lane(&events), vec!["status"]);
+        let json = events[0].to_json();
+        assert_eq!(json["label"], "initializing");
+        assert_eq!(json["model"], "auto");
+        assert_eq!(json["sessionId"], "session-1");
+        assert_eq!(json["qodercliVersion"], "0.2.6");
+    }
+
+    #[test]
+    fn assistant_content_blocks_map_to_text_and_thinking() {
+        let events = collect(concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Hello\"},{\"type\":\"text\",\"text\":\" world\"}]}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"Considering.\"}]}}\n",
+        ));
+        assert_eq!(
+            lane(&events),
+            vec![
+                "text_delta",
+                "text_delta",
+                "thinking_start",
+                "thinking_delta"
+            ]
+        );
+        assert_eq!(events[0].to_json()["delta"], "Hello");
+        assert_eq!(events[1].to_json()["delta"], " world");
+        assert_eq!(events[3].to_json()["delta"], "Considering.");
+    }
+
+    #[test]
+    fn assistant_thinking_start_is_emitted_once_per_stream() {
+        let events = collect(concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"one\"}]}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"two\"}]}}\n",
+        ));
+        assert_eq!(
+            lane(&events),
+            vec!["thinking_start", "thinking_delta", "thinking_delta"]
+        );
+    }
+
+    #[test]
+    fn assistant_string_content_maps_to_text_delta() {
+        let events = collect("{\"type\":\"assistant\",\"message\":{\"content\":\"plain\"}}\n");
+        assert_eq!(lane(&events), vec!["text_delta"]);
+        assert_eq!(events[0].to_json()["delta"], "plain");
+    }
+
+    #[test]
+    fn assistant_error_without_text_maps_to_error_with_raw() {
+        let line = "{\"type\":\"assistant\",\"message\":{\"content\":[]},\"error\":{\"message\":\"Qoder authentication expired\"}}";
+        let events = collect(&format!("{line}\n"));
+        assert_eq!(lane(&events), vec!["error"]);
+        let json = events[0].to_json();
+        assert_eq!(json["message"], "Qoder authentication expired");
+        assert_eq!(json["raw"], line);
+    }
+
+    #[test]
+    fn assistant_error_without_detail_uses_fallback_message() {
+        let events = collect(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[]},\"error\":{\"code\":\"E_QODER\"}}\n",
+        );
+        assert_eq!(lane(&events), vec!["error"]);
+        assert_eq!(events[0].to_json()["message"], "Unknown Qoder error");
+    }
+
+    #[test]
+    fn assistant_text_wins_over_a_trailing_error() {
+        let events = collect(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Partial answer\"}]},\"error\":{\"message\":\"Trailing Qoder warning\"}}\n",
+        );
+        assert_eq!(lane(&events), vec!["text_delta"]);
+    }
+
+    #[test]
+    fn result_maps_usage_fields_and_preserves_model_usage() {
+        let events = collect(
+            "{\"type\":\"result\",\"subtype\":\"success\",\"duration_ms\":10864,\"is_error\":false,\"stop_reason\":\"end_turn\",\"total_cost_usd\":0,\"usage\":{\"input_tokens\":10,\"output_tokens\":2},\"modelUsage\":{\"auto\":{\"costUSD\":0}}}\n",
+        );
+        assert_eq!(lane(&events), vec!["usage"]);
+        let json = events[0].to_json();
+        assert_eq!(json["stopReason"], "end_turn");
+        assert_eq!(json["durationMs"], 10864);
+        assert_eq!(json["costUsd"], 0);
+        assert_eq!(json["isError"], false);
+        assert_eq!(json["modelUsage"]["auto"]["costUSD"], 0);
+        assert_eq!(json["usage"]["input_tokens"], 10);
+    }
+
+    #[test]
+    fn result_is_error_maps_usage_then_error() {
+        let line = "{\"type\":\"result\",\"subtype\":\"error\",\"duration_ms\":10864,\"is_error\":true,\"stop_reason\":\"tool_use_failed\",\"total_cost_usd\":0,\"usage\":{\"input_tokens\":10}}";
+        let events = collect(&format!("{line}\n"));
+        assert_eq!(lane(&events), vec!["usage", "error"]);
+        assert_eq!(events[0].to_json()["isError"], true);
+        let json = events[1].to_json();
+        assert_eq!(json["message"], "Qoder run failed: tool_use_failed");
+        assert_eq!(json["raw"], line);
+    }
+
+    #[test]
+    fn unknown_and_malformed_lines_become_raw_events() {
+        let events = collect("{\"type\":\"unknown\",\"value\":1}\nnot json\n");
+        assert_eq!(lane(&events), vec!["raw", "raw"]);
+        assert_eq!(events[0].to_json()["line"], "{\"type\":\"unknown\",\"value\":1}");
+        assert_eq!(events[1].to_json()["line"], "not json");
+    }
+
+    #[test]
+    fn trailing_line_without_newline_is_flushed() {
+        let mut parser = QoderParser::new();
+        let mut events = Vec::new();
+        parser.feed(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"tail\"}]}}",
+            &mut |event| events.push(event),
+        );
+        assert!(events.is_empty(), "no newline yet");
+        parser.flush(&mut |event| events.push(event));
+        assert_eq!(lane(&events), vec!["text_delta"]);
+    }
+
+    #[test]
+    fn multibyte_text_survives_chunk_boundaries() {
+        // The bytes are split mid-character across two chunks; the Rust string
+        // API only sees valid UTF-8 boundaries, so the assembled line must
+        // still decode the full text.
+        let mut parser = QoderParser::new();
+        let mut events = Vec::new();
+        let line = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"\u{4f60}\u{597d}\"}]}}\n";
+        let (a, b) = line.split_at(line.find('\u{4f60}').unwrap() + 3);
+        parser.feed(a, &mut |event| events.push(event));
+        parser.feed(b, &mut |event| events.push(event));
+        assert_eq!(lane(&events), vec!["text_delta"]);
+        assert_eq!(events[0].to_json()["delta"], "\u{4f60}\u{597d}");
+    }
+}
+
 #[cfg(test)]
 mod claude_tests {
     use super::*;
@@ -1105,7 +1593,7 @@ mod claude_tests {
         let events = collect("{\"type\":\"result\",\"is_error\":true,\"subtype\":\"error_during_execution\",\"errors\":[\"boom\"]}\n");
         assert_eq!(lane(&events), vec!["usage", "error"]);
         match &events[1] {
-            StreamEvent::Error { message, code } => {
+            StreamEvent::Error { message, code, .. } => {
                 assert_eq!(message, "boom");
                 assert_eq!(code.as_deref(), Some("error_during_execution"));
             }
