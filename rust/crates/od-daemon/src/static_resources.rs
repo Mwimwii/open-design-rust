@@ -350,7 +350,7 @@ fn roots_for(data_dir: &Path, segment: &str) -> Vec<PathBuf> {
 /// (daemon-paths.ts:76). The TypeScript safe-base validation has no Rust
 /// counterpart (no project root exists here), and a relative value resolves
 /// against the current directory like `path.resolve`.
-fn resource_root() -> Option<PathBuf> {
+pub(crate) fn resource_root() -> Option<PathBuf> {
     let raw = std::env::var("OD_RESOURCE_ROOT").ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {

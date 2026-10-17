@@ -2,7 +2,7 @@
 //! (`apps/daemon/src/server.ts` + `src/routes/*`), core subset.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::{json, Value};
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 
 use crate::auth;
 use crate::config::DaemonConfig;
@@ -119,15 +119,88 @@ pub fn build_router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), api_auth));
 
     let web_dist = state.config.web_dist.clone();
-    let router = Router::new().merge(api);
+
+    // Static trees the web app links to. Mounted outside `/api` so they stay
+    // unauthenticated, exactly like `express.static` (server.ts:9272 for
+    // `/artifacts`, server.ts:9312 for `/frames`).
+    let mut router = Router::new()
+        .merge(api)
+        .nest_service("/artifacts", ServeDir::new(state.config.paths.artifacts_dir()));
+    if let Some(frames) = frames_dir() {
+        router = router.nest_service("/frames", ServeDir::new(frames));
+    }
+
     let router = match &web_dist {
         Some(dist) => {
-            let index = dist.join("index.html");
-            router.fallback_service(ServeDir::new(dist).fallback(ServeFile::new(index)))
+            // `ServeDir` serves the export's real files; its fallback decides
+            // what an unmatched path gets. The policy lives in
+            // `crate::static_spa` so a missing `/_next` asset stays a 404
+            // instead of becoming a 200 HTML shell. Non-GET/HEAD requests are
+            // routed to the same fallback so Express's `next()` → 404 shape is
+            // preserved instead of serving tower-http's 405.
+            let spa = Router::new()
+                .fallback(spa_fallback)
+                .with_state(SpaState { index: dist.join("index.html") });
+            router.fallback_service(
+                ServeDir::new(dist)
+                    .call_fallback_on_method_not_allowed(true)
+                    .fallback(spa),
+            )
         }
         None => router.fallback(not_found),
     };
     router.with_state(state)
+}
+
+/// State for the SPA shell fallback: the `index.html` to answer with.
+#[derive(Clone)]
+struct SpaState {
+    index: PathBuf,
+}
+
+/// `ServeDir`'s fallback: answer the shell for a deep link, 404 for everything
+/// else (parity: `registerStaticSpaFallback` in `apps/daemon/src/static-spa.ts`).
+async fn spa_fallback(State(spa): State<SpaState>, request: axum::extract::Request) -> Response {
+    let accept = request
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok());
+    let is_shell = crate::static_spa::is_static_spa_fallback_request(
+        &crate::static_spa::SpaFallbackRequest {
+            method: request.method(),
+            path: request.uri().path(),
+            accept,
+        },
+    );
+    if !is_shell {
+        return not_found().await;
+    }
+    match tokio::fs::read(&spa.index).await {
+        Ok(bytes) => (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            bytes,
+        )
+            .into_response(),
+        // A missing shell is a plain 404, exactly like
+        // `resolveStaticSpaFallbackPath` returning null.
+        Err(_) => not_found().await,
+    }
+}
+
+/// Parity: `FRAMES_DIR` (server.ts:1339) — `OD_RESOURCE_ROOT/frames` when a
+/// resource root is configured, else the checkout's `assets/frames`, which is
+/// the Rust counterpart of the TypeScript `PROJECT_ROOT/assets/frames`
+/// fallback (there is no project root here).
+///
+/// Mounting nothing when the directory cannot be resolved is equivalent to
+/// Express serving a directory that does not exist: `/frames/*` stays a 404
+/// either way, because the SPA fallback skips that prefix.
+fn frames_dir() -> Option<PathBuf> {
+    if let Some(root) = crate::static_resources::resource_root() {
+        return Some(root.join("frames"));
+    }
+    let checkout = StdPath::new(env!("CARGO_MANIFEST_DIR")).join("../../../assets/frames");
+    checkout.is_dir().then_some(checkout)
 }
 
 /// `GET /api/health` — same probe shape as the TypeScript daemon, including

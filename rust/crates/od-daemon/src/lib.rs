@@ -34,6 +34,7 @@ pub mod runs;
 pub mod server;
 pub mod spawn;
 pub mod static_resources;
+pub mod static_spa;
 pub mod storage;
 
 pub use config::DaemonConfig;

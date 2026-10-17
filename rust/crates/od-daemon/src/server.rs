@@ -42,6 +42,16 @@ impl RunningDaemon {
     /// otherwise), and start serving. `port = 0` binds an ephemeral port.
     pub async fn start(config: DaemonConfig) -> Result<Self, StartError> {
         let store = Store::open(&config.paths.db_file())?;
+        // Parity: `fs.mkdirSync(ARTIFACTS_DIR, { recursive: true })`
+        // (server.ts:2841). The data-root writability probe has already
+        // passed, so a failure here is worth a warning but not a failed boot.
+        if let Err(err) = std::fs::create_dir_all(config.paths.artifacts_dir()) {
+            tracing::warn!(
+                error = %err,
+                path = %config.paths.artifacts_dir().display(),
+                "could not create the artifacts directory"
+            );
+        }
         let state = AppState::new(config.clone(), store);
         let router = build_router(state.clone());
 
