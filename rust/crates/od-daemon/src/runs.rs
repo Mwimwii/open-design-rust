@@ -3387,8 +3387,11 @@ async fn pump_child(
                 }
                 let mut tail = Vec::new();
                 parser.flush(&mut |event| tail.push(event));
+                // The trailing line parses to whatever event it carries, not
+                // necessarily a raw one; label it the same way the Claude
+                // branch does rather than forcing the `raw` lane.
                 for event in tail {
-                    runs_for_out.push_external_event(&out_id, "raw", event.to_json());
+                    push_lane_event(&runs_for_out, &out_id, event);
                 }
             }
         } else if stream_format == "qoder-stream-json" {
