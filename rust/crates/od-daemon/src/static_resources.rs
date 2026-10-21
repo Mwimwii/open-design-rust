@@ -59,21 +59,102 @@ use axum::extract::{Path as PathExtractor, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
+use axum::{Json, Router};
+use serde_json::json;
 
 use crate::project_dir::{map_io, resolve_under, ProjectPathError};
 use crate::project_files::mime_for;
 use crate::routes::{api_error, internal_error, AppState};
+use crate::skill_catalog::{self, SkillInfo};
 
 /// Parity: the two static routes of `registerStaticResourceRoutes`
 /// (`server.ts:8983` mounts the router; every CRUD route is out of scope).
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/api/skills", get(list_skills))
+        .route("/api/skills/{id}", get(skill_detail))
         .route("/api/skills/{id}/example", get(skill_example))
         .route("/api/skills/{id}/assets/{*splat}", get(skill_asset))
+        .route("/api/design-templates", get(list_design_templates))
+        .route("/api/design-templates/{id}", get(design_template_detail))
 }
 
 // ---- routes ----------------------------------------------------------------
+
+/// `GET /api/skills` — the catalogue the shell requests once per launch and
+/// the create-project dialog lists (parity: `static-resource.ts:497`).
+async fn list_skills(State(state): State<AppState>) -> Response {
+    let data_dir = state.config.paths.data_dir().to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        let skills = skill_catalog::list_skills(&roots_for(&data_dir, "skills"));
+        json!({
+            "skills": skills.iter().map(SkillInfo::summary_json).collect::<Vec<_>>(),
+        })
+    })
+    .await
+    {
+        Ok(body) => Json(body).into_response(),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// `GET /api/skills/:id` — the full record including the composed body the
+/// web fetches lazily after the listing (parity: `static-resource.ts:522`).
+async fn skill_detail(
+    State(state): State<AppState>,
+    PathExtractor(id): PathExtractor<String>,
+) -> Response {
+    let data_dir = state.config.paths.data_dir().to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        let skills = skill_catalog::list_skills(&roots_for(&data_dir, "skills"));
+        skill_catalog::find_skill(&skills, &id).map(SkillInfo::detail_json)
+    })
+    .await;
+    match result {
+        Ok(Some(body)) => Json(body).into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "skill not found"),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// `GET /api/design-templates` — the rendering catalogue, same shape as the
+/// skill listing but rooted at the template roots (parity:
+/// `static-resource.ts:540`).
+async fn list_design_templates(State(state): State<AppState>) -> Response {
+    let data_dir = state.config.paths.data_dir().to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        let templates = skill_catalog::list_skills(&roots_for(&data_dir, "design-templates"));
+        json!({
+            "designTemplates": templates
+                .iter()
+                .map(SkillInfo::summary_json)
+                .collect::<Vec<_>>(),
+        })
+    })
+    .await
+    {
+        Ok(body) => Json(body).into_response(),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// `GET /api/design-templates/:id` (parity: `static-resource.ts:561`).
+async fn design_template_detail(
+    State(state): State<AppState>,
+    PathExtractor(id): PathExtractor<String>,
+) -> Response {
+    let data_dir = state.config.paths.data_dir().to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        let templates = skill_catalog::list_skills(&roots_for(&data_dir, "design-templates"));
+        skill_catalog::find_skill(&templates, &id).map(SkillInfo::detail_json)
+    })
+    .await;
+    match result {
+        Ok(Some(body)) => Json(body).into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "design template not found"),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
 
 async fn skill_example(State(state): State<AppState>, PathExtractor(id): PathExtractor<String>) -> Response {
     let data_dir = state.config.paths.data_dir().to_path_buf();
@@ -406,7 +487,7 @@ fn scan_roots(roots: &[PathBuf], seen: &mut HashSet<String>, out: &mut Vec<Skill
 
 /// `SKILL_ID_ALIASES` (skills.ts:28) — persisted ids can outlive a folder
 /// rename, so lookup ids are forwarded to their canonical form first.
-fn resolve_skill_id(id: &str) -> &str {
+pub(crate) fn resolve_skill_id(id: &str) -> &str {
     match id {
         "editorial-collage" => "open-design-landing",
         "editorial-collage-deck" => "open-design-landing-deck",

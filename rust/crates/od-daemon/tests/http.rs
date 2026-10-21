@@ -385,15 +385,88 @@ async fn http_get_stream_head(addr: SocketAddr, path: &str) -> String {
     tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
         .await
         .expect("write");
-    let mut buffer = vec![0u8; 1024];
-    let read = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        tokio::io::AsyncReadExt::read(&mut stream, &mut buffer),
+    // Headers and the first frames can arrive in separate packets, so read
+    // until the handshake shows up (or the deadline passes).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut collected = Vec::new();
+    let mut buffer = [0u8; 1024];
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let read = match tokio::time::timeout(
+            remaining,
+            tokio::io::AsyncReadExt::read(&mut stream, &mut buffer),
+        )
+        .await
+        {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(read)) => read,
+            Ok(Err(_)) => break,
+        };
+        collected.extend_from_slice(&buffer[..read]);
+        let text = String::from_utf8_lossy(&collected);
+        if text.contains("event: ready") || text.contains("404") {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&collected).into_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skill_catalog_serves_the_summary_and_detail_shapes() {
+    let daemon = RunningDaemon::start(config_with(temp_paths("catalog"), None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+    let data_dir = daemon.state.config.paths.data_dir().to_path_buf();
+    let skill_dir = data_dir.join("skills").join("hero");
+    std::fs::create_dir_all(skill_dir.join("examples")).expect("mkdir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: hero\ndescription: Build a hero section for a landing page.\nod:\n  mode: prototype\ntriggers:\n  - hero\n---\nbody text\n",
     )
-    .await
-    .expect("stream head timed out")
-    .expect("read");
-    String::from_utf8_lossy(&buffer[..read]).into_owned()
+    .expect("write");
+    std::fs::write(skill_dir.join("examples").join("one.html"), "<html></html>").expect("write");
+
+    // Listing: summaries only, with `hasBody` and the derived example card.
+    let (head, body) = http_get(addr, "/api/skills", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let skills = value["skills"].as_array().expect("skills");
+    let hero = skills
+        .iter()
+        .find(|skill| skill["id"] == "hero")
+        .expect("hero entry");
+    assert_eq!(hero["source"], "user");
+    assert_eq!(hero["mode"], "prototype");
+    assert_eq!(hero["hasBody"], true);
+    assert_eq!(hero["aggregatesExamples"], true);
+    assert!(hero.get("body").is_none(), "listing must not ship bodies");
+    assert!(hero.get("dir").is_none(), "listing must not ship paths");
+    assert!(
+        skills.iter().any(|skill| skill["id"] == "hero:one"),
+        "derived card: {body}"
+    );
+
+    // Detail: the composed body, still without the on-disk path.
+    let (head, body) = http_get(addr, "/api/skills/hero", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["id"], "hero");
+    assert!(value["body"].as_str().expect("body").contains("body text"));
+    assert!(value.get("dir").is_none(), "detail must not ship paths");
+    let (head, _) = http_get(addr, "/api/skills/missing", None).await;
+    assert!(head.contains("404"), "status: {head}");
+
+    // The template catalogue shares the shape and is empty here.
+    let (head, body) = http_get(addr, "/api/design-templates", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["designTemplates"], serde_json::json!([]));
+    let (head, _) = http_get(addr, "/api/design-templates/missing", None).await;
+    assert!(head.contains("404"), "status: {head}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
