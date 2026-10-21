@@ -24,6 +24,11 @@ pub struct DaemonConfig {
     /// Static SPA directory to serve (the TypeScript daemon serves the web
     /// build; the desktop shell supplies the packaged export).
     pub web_dist: Option<PathBuf>,
+    /// The desktop shell's per-process import-token secret. `Some` means a
+    /// desktop is driving this daemon, so the folder-import routes require a
+    /// token the desktop minted for the picked folder (parity:
+    /// `REGISTER_DESKTOP_AUTH` in the Electron pair).
+    pub desktop_auth_secret: Option<Vec<u8>>,
 }
 
 impl DaemonConfig {
@@ -40,6 +45,7 @@ impl DaemonConfig {
             api_token: nonempty_env("OD_API_TOKEN"),
             api_auth_disabled: truthy_env("OD_DISABLE_API_AUTH"),
             web_dist: nonempty_env("OD_WEB_DIST_DIR").map(PathBuf::from),
+            desktop_auth_secret: None,
         }
     }
 

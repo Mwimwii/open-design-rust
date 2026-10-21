@@ -64,11 +64,18 @@ pub struct AppState {
     /// Live diagnostics snapshots the export bundle drains (environment
     /// evidence, the renderer's chat-scroll capture, recent API failures).
     pub diagnostics: crate::diagnostics::SharedDiagnostics,
+    /// The desktop import-token gate: the secret the desktop shell minted at
+    /// startup, plus the consumed-nonce set that makes every token
+    /// single-use (parity: `apps/daemon/src/desktop-auth.ts`).
+    pub desktop_import: Arc<crate::desktop_import::DesktopImportGate>,
 }
 
 impl AppState {
     pub fn new(config: DaemonConfig, store: Store) -> Self {
         let resolved_port = Arc::new(AtomicU16::new(config.port));
+        let desktop_import = Arc::new(crate::desktop_import::DesktopImportGate::new(
+            config.desktop_auth_secret.clone(),
+        ));
         Self {
             config: Arc::new(config),
             store,
@@ -81,6 +88,7 @@ impl AppState {
             mcp_tokens_lock: Arc::new(tokio::sync::Mutex::new(())),
             mcp_pending_auth: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             diagnostics: Arc::new(crate::diagnostics::DiagnosticsState::new()),
+            desktop_import,
         }
     }
 }
@@ -115,6 +123,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/import/folder", post(import_folder))
         .route("/api/projects/{id}", get(get_project))
+        .route(
+            "/api/projects/{id}/working-dir",
+            post(replace_project_working_dir),
+        )
         .route(
             "/api/projects/{id}/workspace-scope",
             get(get_project_workspace_scope),
@@ -760,35 +772,37 @@ async fn create_project(State(state): State<AppState>, Json(body): Json<Value>) 
 }
 
 /// `POST /api/import/folder` — import an existing folder as a project
-/// (parity: `apps/daemon/src/import-export-routes.ts`). The desktop import
-/// token and workspace attribution are not ported; every import is treated as
-/// a headerless local create.
-async fn import_folder(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
-    let Some(base_dir) = body
-        .get("baseDir")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|dir| !dir.is_empty())
-    else {
+/// (parity: `apps/daemon/src/import-export-routes.ts`).
+///
+/// The desktop import token and the `orchestratorWorkspace` contract are
+/// ported; workspace attribution (`x-od-workspace-*`) is not — this daemon has
+/// no workspace identity, so every import is a headerless local create.
+async fn import_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    // The token is verified against the *raw* `baseDir` (the string the
+    // desktop minted it over) and the path is resolved from the trimmed one
+    // (parity: `import-export-routes.ts`).
+    let Some(base_dir) = body.get("baseDir").and_then(Value::as_str) else {
         return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "baseDir required");
     };
-    if !StdPath::new(base_dir).is_absolute() {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "baseDir must be absolute",
-        );
+    if base_dir.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "baseDir required");
     }
-    if body
-        .get("orchestratorWorkspace")
-        .is_some_and(|value| !value.is_null())
-    {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "orchestratorWorkspace is not supported by the Rust daemon",
-        );
-    }
+    let orchestrator_workspace =
+        match crate::project_create::parse_orchestrator_workspace(body.get("orchestratorWorkspace"))
+        {
+            Ok(value) => value,
+            Err(message) => {
+                return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", &message);
+            }
+        };
+    let trusted_picker = match desktop_import_gate(&state, &headers, base_dir) {
+        Ok(trusted) => trusted,
+        Err(response) => return *response,
+    };
     let name = body
         .get("name")
         .and_then(Value::as_str)
@@ -810,40 +824,37 @@ async fn import_folder(State(state): State<AppState>, Json(body): Json<Value>) -
     let result = tokio::task::spawn_blocking(move || {
         // Resolve symlinks once and persist the canonical path (parity: the
         // import route's realpath + lstat sequence).
-        let real_path = std::fs::canonicalize(&base_dir)
-            .map_err(|_| "folder not found".to_string())?;
-        let metadata =
-            std::fs::metadata(&real_path).map_err(|_| "folder not found".to_string())?;
-        if !metadata.is_dir() {
-            return Err("path must be a directory".to_string());
-        }
-        if real_path.parent().is_none() {
-            return Err("cannot import the filesystem root".to_string());
-        }
-        let canonical_data_dir = std::fs::canonicalize(&data_dir).unwrap_or(data_dir);
-        if real_path == canonical_data_dir || real_path.starts_with(&canonical_data_dir) {
-            return Err("cannot import the data directory".to_string());
-        }
-        if crate::project_create::blocked_project_root_reason(&real_path).is_some() {
-            return Err(
-                "cannot use a system or credential directory as a project root".to_string(),
-            );
-        }
+        let root = resolve_import_root(&base_dir, &data_dir, IMPORT_ROOT_MESSAGES)?;
+        let real_path = root.path;
+        let entry_file = root.entry_file;
         let project_name = name.unwrap_or_else(|| {
             real_path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "project".to_string())
         });
-        let entry_file = crate::project_create::detect_entry_file(&real_path);
         let now = crate::conversations::now_ms();
-        let metadata_json = json!({
-            "kind": "prototype",
-            "baseDir": real_path.to_string_lossy(),
-            "importedFrom": "folder",
-            "entryFile": entry_file,
-        })
-        .to_string();
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("kind".to_string(), Value::String("prototype".to_string()));
+        metadata.insert(
+            "baseDir".to_string(),
+            Value::String(real_path.to_string_lossy().into_owned()),
+        );
+        metadata.insert(
+            "importedFrom".to_string(),
+            Value::String("folder".to_string()),
+        );
+        metadata.insert(
+            "entryFile".to_string(),
+            entry_file.clone().map(Value::String).unwrap_or(Value::Null),
+        );
+        if let Some(workspace) = &orchestrator_workspace {
+            metadata.insert("orchestratorWorkspace".to_string(), workspace.to_json());
+        }
+        if trusted_picker {
+            metadata.insert("fromTrustedPicker".to_string(), Value::Bool(true));
+        }
+        let metadata_json = Value::Object(metadata).to_string();
         let project = store.insert_project(storage::NewProject {
             id: &project_id,
             name: &project_name,
@@ -886,6 +897,255 @@ async fn import_folder(State(state): State<AppState>, Json(body): Json<Value>) -
         }
         Ok(Err(err)) => api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", &err),
         Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// `POST /api/projects/:id/working-dir` — point an existing project at a
+/// different folder (parity: `apps/daemon/src/import-export-routes.ts`).
+///
+/// The route is the desktop's "replace working directory" flow: the shell
+/// picks a folder, mints an import token bound to it, and posts both. The
+/// token gate, the folder vetting and the `orchestratorWorkspace` contract are
+/// shared with `POST /api/import/folder`; workspace attribution is not
+/// ported (this daemon has no workspace identity).
+async fn replace_project_working_dir(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !storage::is_safe_id(&id) {
+        return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "invalid project id");
+    }
+    let existing = match state.store.get_project(&id) {
+        Ok(Some(project)) => project,
+        Ok(None) => {
+            return api_error(StatusCode::NOT_FOUND, "PROJECT_NOT_FOUND", "project not found");
+        }
+        Err(err) => return store_error_response(&err),
+    };
+    // The token is verified against the *raw* `baseDir` (the string the
+    // desktop minted it over) and the path is resolved from the trimmed one
+    // (parity: `import-export-routes.ts`).
+    let Some(base_dir) = body.get("baseDir").and_then(Value::as_str) else {
+        return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "baseDir required");
+    };
+    if base_dir.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "baseDir required");
+    }
+    let orchestrator_workspace =
+        match crate::project_create::parse_orchestrator_workspace(body.get("orchestratorWorkspace"))
+        {
+            Ok(value) => value,
+            Err(message) => {
+                return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", &message);
+            }
+        };
+    let trusted_picker = match desktop_import_gate(&state, &headers, base_dir) {
+        Ok(trusted) => trusted,
+        Err(response) => return *response,
+    };
+
+    let data_dir = state.config.paths.data_dir().to_path_buf();
+    let base_dir = base_dir.to_string();
+    let store = state.store.clone();
+    let existing_metadata = existing
+        .metadata_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| match value {
+            Value::Object(object) => Some(object),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let result = tokio::task::spawn_blocking(move || {
+        let root = resolve_import_root(&base_dir, &data_dir, WORKING_DIR_MESSAGES)?;
+        let real_path = root.path;
+        let entry_file = root.entry_file;
+        // Everything but the orchestrator workspace is preserved: the rebind
+        // changes where the project lives, not what it is.
+        let mut metadata = existing_metadata;
+        metadata.remove("orchestratorWorkspace");
+        metadata
+            .entry("kind".to_string())
+            .or_insert_with(|| Value::String("prototype".to_string()));
+        metadata.insert(
+            "baseDir".to_string(),
+            Value::String(real_path.to_string_lossy().into_owned()),
+        );
+        metadata.insert(
+            "importedFrom".to_string(),
+            Value::String("folder".to_string()),
+        );
+        metadata.insert(
+            "entryFile".to_string(),
+            entry_file.clone().map(Value::String).unwrap_or(Value::Null),
+        );
+        if let Some(workspace) = &orchestrator_workspace {
+            metadata.insert("orchestratorWorkspace".to_string(), workspace.to_json());
+        }
+        if trusted_picker {
+            metadata.insert("fromTrustedPicker".to_string(), Value::Bool(true));
+        }
+        let metadata_json = Value::Object(metadata).to_string();
+        let now = crate::conversations::now_ms();
+        let updated = store
+            .update_project_metadata(&id, &metadata_json, now)
+            .map_err(|err| err.to_string())?;
+        let Some(updated) = updated else {
+            return Err("project not found".to_string());
+        };
+        // Folder imports land on Design Files so the user picks from the
+        // imported artifacts instead of auto-opening the detected file.
+        store
+            .set_tabs(&id, &[], None, now)
+            .map_err(|err| err.to_string())?;
+        Ok::<_, String>((updated, real_path, entry_file))
+    })
+    .await;
+    match result {
+        Ok(Ok((project, real_path, entry_file))) => {
+            let mut project_json = project.to_api_json();
+            project_json["workspaceId"] = Value::Null;
+            Json(json!({
+                "project": project_json,
+                "baseDir": real_path.to_string_lossy(),
+                "entryFile": entry_file,
+            }))
+            .into_response()
+        }
+        Ok(Err(err)) if err == "project not found" => {
+            api_error(StatusCode::NOT_FOUND, "PROJECT_NOT_FOUND", "project not found")
+        }
+        Ok(Err(err)) => api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", &err),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// The two 400 messages the two import routes use for the same refusal.
+///
+/// Parity: `import-export-routes.ts` words the folder-import refusal
+/// ("cannot import the …") and the working-dir refusal ("cannot point at the
+/// …") differently, and the web app surfaces the message verbatim.
+struct ImportRootMessages {
+    fs_root: &'static str,
+    data_dir: &'static str,
+}
+
+/// Parity: the `POST /api/import/folder` wordings.
+const IMPORT_ROOT_MESSAGES: ImportRootMessages = ImportRootMessages {
+    fs_root: "cannot import the filesystem root",
+    data_dir: "cannot import the data directory",
+};
+
+/// Parity: the `POST /api/projects/:id/working-dir` wordings.
+const WORKING_DIR_MESSAGES: ImportRootMessages = ImportRootMessages {
+    fs_root: "cannot point at the filesystem root",
+    data_dir: "cannot point at the data directory",
+};
+
+/// The folder an import resolved to.
+struct ImportRoot {
+    /// The canonical (symlink-resolved) path.
+    path: PathBuf,
+    /// The file a freshly imported folder should open, if any.
+    entry_file: Option<String>,
+}
+
+/// Resolve and vet the folder a user picked (parity: the shared block of
+/// `POST /api/import/folder` and `POST /api/projects/:id/working-dir`).
+///
+/// The error string is the 400 message the route answers with.
+fn resolve_import_root(
+    base_dir: &str,
+    data_dir: &StdPath,
+    messages: ImportRootMessages,
+) -> Result<ImportRoot, String> {
+    let trimmed = base_dir.trim();
+    if !StdPath::new(trimmed).is_absolute() {
+        return Err("baseDir must be absolute".to_string());
+    }
+    // Resolve symlinks once and persist the canonical path. Without this, a
+    // user-controlled symlink (e.g. ~/sneaky → /etc) at baseDir would let
+    // writeProjectFile escape the project sandbox at every later call:
+    // resolveSafe checks the *literal* baseDir, but the OS follows the
+    // symlink at write time.
+    let real_path = std::fs::canonicalize(trimmed).map_err(|_| "folder not found".to_string())?;
+    // The canonical path resolved; re-check it is a real directory rather
+    // than another symlink (defence in depth).
+    let metadata =
+        std::fs::symlink_metadata(&real_path).map_err(|_| "folder not found".to_string())?;
+    if !metadata.is_dir() {
+        return Err("path must be a directory".to_string());
+    }
+    if real_path.parent().is_none() {
+        return Err(messages.fs_root.to_string());
+    }
+    // Compare against the canonical data dir: the import folder's realpath
+    // and the data dir may spell the same directory differently.
+    let canonical_data_dir =
+        std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    if real_path == canonical_data_dir || real_path.starts_with(&canonical_data_dir) {
+        return Err(messages.data_dir.to_string());
+    }
+    if crate::project_create::blocked_project_root_reason(&real_path).is_some() {
+        return Err("cannot use a system or credential directory as a project root".to_string());
+    }
+    let entry_file = crate::project_create::detect_entry_file(&real_path);
+    Ok(ImportRoot {
+        path: real_path,
+        entry_file,
+    })
+}
+
+/// The desktop import-token gate's verdict on one import request (parity: the
+/// `isDesktopAuthGateActive()` block shared by the two import routes).
+///
+/// `Ok(true)` means the request may import *and* the folder came from the
+/// desktop picker; `Ok(false)` means the gate is open but the folder was not
+/// picked through the desktop. The error case is already an HTTP response.
+fn desktop_import_gate(
+    state: &AppState,
+    headers: &HeaderMap,
+    base_dir: &str,
+) -> Result<bool, Box<Response>> {
+    let token = headers
+        .get(crate::desktop_import::DESKTOP_IMPORT_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok());
+    match state
+        .desktop_import
+        .authorize(base_dir, token, crate::desktop_import::now_ms())
+    {
+        crate::desktop_import::Decision::Open => Ok(false),
+        crate::desktop_import::Decision::Trusted => Ok(true),
+        crate::desktop_import::Decision::Pending => {
+            let mut details = serde_json::Map::new();
+            details.insert(
+                "hint".to_string(),
+                Value::String("restart desktop or wait for sidecar registration".to_string()),
+            );
+            let mut extra = serde_json::Map::new();
+            extra.insert("details".to_string(), Value::Object(details));
+            extra.insert("retryable".to_string(), Value::Bool(true));
+            Err(Box::new(api_error_with(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DESKTOP_AUTH_PENDING",
+                "desktop auth required but secret not yet registered",
+                extra,
+            )))
+        }
+        crate::desktop_import::Decision::Rejected(reason) => {
+            let mut details = serde_json::Map::new();
+            details.insert("reason".to_string(), Value::String(reason));
+            let mut extra = serde_json::Map::new();
+            extra.insert("details".to_string(), Value::Object(details));
+            Err(Box::new(api_error_with(
+                StatusCode::FORBIDDEN,
+                "FORBIDDEN",
+                "desktop import token rejected",
+                extra,
+            )))
+        }
     }
 }
 
@@ -1332,6 +1592,24 @@ pub(crate) fn api_error(status: StatusCode, code: &str, message: &str) -> Respon
         Json(json!({ "error": { "code": code, "message": message } })),
     )
         .into_response()
+}
+
+/// The API error envelope with the extra fields the TypeScript
+/// `sendApiError(res, …, init)` accepts (parity:
+/// `apps/daemon/src/http/api-errors.ts` — `details`, `retryable`, …).
+pub(crate) fn api_error_with(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    extra: serde_json::Map<String, Value>,
+) -> Response {
+    let mut error = serde_json::Map::new();
+    error.insert("code".to_string(), Value::String(code.to_string()));
+    error.insert("message".to_string(), Value::String(message.to_string()));
+    for (key, value) in extra {
+        error.insert(key, value);
+    }
+    (status, Json(json!({ "error": Value::Object(error) }))).into_response()
 }
 
 pub(crate) fn store_error_response(err: &StoreError) -> Response {

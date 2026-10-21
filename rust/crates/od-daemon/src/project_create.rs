@@ -8,12 +8,15 @@
 //!
 //! DOCUMENTED GAPS
 //!
-//! * Workspace attribution (`x-od-workspace-*`), the desktop import token, and
-//!   skill/design-system catalog validation are not ported; the Rust daemon has
-//!   no workspace identity or catalog surface yet. Ids pass through unchanged,
-//!   exactly like a headerless TypeScript create.
+//! * Workspace attribution (`x-od-workspace-*`) and skill/design-system
+//!   catalog validation are not ported; the Rust daemon has no workspace
+//!   identity or catalog surface yet. Ids pass through unchanged, exactly like
+//!   a headerless TypeScript create.
 //! * Plugin snapshot resolution is not ported, so the create response never
 //!   carries `appliedPluginSnapshotId`.
+//! * The sandbox-mode root refusal (`sandboxImportedProjectRootUnavailableReason`)
+//!   has no counterpart: this daemon has no sandbox mode, so every import is
+//!   an ordinary local import.
 
 use std::path::{Path, PathBuf};
 
@@ -122,6 +125,119 @@ pub fn detect_entry_file(dir: &Path) -> Option<String> {
     None
 }
 
+/// Parity: `ORCHESTRATOR_WORKSPACE_KIND`.
+const ORCHESTRATOR_WORKSPACE_KIND: &str = "scratch";
+
+/// Parity: `ORCHESTRATOR_WRITEBACK`.
+const ORCHESTRATOR_WRITEBACK: &str = "external";
+
+/// Parity: `ORCHESTRATOR_WORKSPACE_KEYS`.
+const ORCHESTRATOR_WORKSPACE_KEYS: &[&str] = &[
+    "kind",
+    "sourceLabel",
+    "sourceRef",
+    "baseRevision",
+    "writeback",
+];
+
+/// The parsed `orchestratorWorkspace` document (parity:
+/// `OrchestratorWorkspace`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorWorkspace {
+    pub kind: String,
+    pub writeback: String,
+    pub source_label: Option<String>,
+    pub source_ref: Option<String>,
+    pub base_revision: Option<String>,
+}
+
+impl OrchestratorWorkspace {
+    /// The metadata document the project row stores.
+    pub fn to_json(&self) -> Value {
+        let mut object = serde_json::Map::new();
+        object.insert("kind".to_string(), Value::String(self.kind.clone()));
+        object.insert(
+            "writeback".to_string(),
+            Value::String(self.writeback.clone()),
+        );
+        if let Some(label) = &self.source_label {
+            object.insert("sourceLabel".to_string(), Value::String(label.clone()));
+        }
+        if let Some(reference) = &self.source_ref {
+            object.insert("sourceRef".to_string(), Value::String(reference.clone()));
+        }
+        if let Some(revision) = &self.base_revision {
+            object.insert(
+                "baseRevision".to_string(),
+                Value::String(revision.clone()),
+            );
+        }
+        Value::Object(object)
+    }
+}
+
+/// Parity: `stringField` — a trimmed, non-empty string or nothing.
+fn string_field(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Parity: `parseOrchestratorWorkspace` — the scratch-workspace contract the
+/// import and working-dir routes validate.
+///
+/// `None` in means "no orchestrator workspace" (the field is absent or null);
+/// `Some(Err(message))` is the 400 the route answers with.
+pub fn parse_orchestrator_workspace(
+    value: Option<&Value>,
+) -> Result<Option<OrchestratorWorkspace>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(record) = value.as_object() else {
+        return Err("orchestratorWorkspace must be an object when provided".to_string());
+    };
+    if let Some(unknown) = record
+        .keys()
+        .find(|key| !ORCHESTRATOR_WORKSPACE_KEYS.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "orchestratorWorkspace contains unsupported field: {unknown}"
+        ));
+    }
+    if string_field(record.get("kind")).as_deref() != Some(ORCHESTRATOR_WORKSPACE_KIND) {
+        return Err("orchestratorWorkspace.kind must be \"scratch\"".to_string());
+    }
+    if let Some(writeback) = record.get("writeback") {
+        if !writeback.is_null()
+            && string_field(Some(writeback)).as_deref() != Some(ORCHESTRATOR_WRITEBACK)
+        {
+            return Err("orchestratorWorkspace.writeback must be \"external\"".to_string());
+        }
+    }
+    for key in ["sourceLabel", "sourceRef", "baseRevision"] {
+        if let Some(field) = record.get(key) {
+            if !field.is_null() && string_field(Some(field)).is_none() {
+                return Err(format!(
+                    "orchestratorWorkspace.{key} must be a non-empty string when provided"
+                ));
+            }
+        }
+    }
+    Ok(Some(OrchestratorWorkspace {
+        kind: ORCHESTRATOR_WORKSPACE_KIND.to_string(),
+        writeback: ORCHESTRATOR_WRITEBACK.to_string(),
+        source_label: string_field(record.get("sourceLabel")),
+        source_ref: string_field(record.get("sourceRef")),
+        base_revision: string_field(record.get("baseRevision")),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +290,56 @@ mod tests {
         std::fs::write(dir.join("index.html"), b"<html></html>").expect("write");
         assert_eq!(detect_entry_file(&dir).as_deref(), Some("index.html"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_orchestrator_workspace_contract_is_enforced() {
+        assert_eq!(parse_orchestrator_workspace(None), Ok(None));
+        assert_eq!(parse_orchestrator_workspace(Some(&Value::Null)), Ok(None));
+
+        let parsed = parse_orchestrator_workspace(Some(&json!({
+            "kind": "scratch",
+            "writeback": "external",
+            "sourceLabel": "  deck  ",
+            "sourceRef": "file-1",
+        })))
+        .expect("valid")
+        .expect("present");
+        assert_eq!(parsed.kind, "scratch");
+        assert_eq!(parsed.writeback, "external");
+        assert_eq!(parsed.source_label.as_deref(), Some("deck"));
+        assert_eq!(parsed.source_ref.as_deref(), Some("file-1"));
+        assert_eq!(parsed.base_revision, None);
+
+        assert_eq!(
+            parse_orchestrator_workspace(Some(&json!("scratch"))),
+            Err("orchestratorWorkspace must be an object when provided".to_string())
+        );
+        assert_eq!(
+            parse_orchestrator_workspace(Some(&json!({ "kind": "team" }))),
+            Err("orchestratorWorkspace.kind must be \"scratch\"".to_string())
+        );
+        assert_eq!(
+            parse_orchestrator_workspace(Some(&json!({
+                "kind": "scratch",
+                "writeback": "internal",
+            }))),
+            Err("orchestratorWorkspace.writeback must be \"external\"".to_string())
+        );
+        assert_eq!(
+            parse_orchestrator_workspace(Some(&json!({
+                "kind": "scratch",
+                "sourceLabel": 7,
+            }))),
+            Err("orchestratorWorkspace.sourceLabel must be a non-empty string when provided"
+                .to_string())
+        );
+        assert_eq!(
+            parse_orchestrator_workspace(Some(&json!({
+                "kind": "scratch",
+                "unknown": "x",
+            }))),
+            Err("orchestratorWorkspace contains unsupported field: unknown".to_string())
+        );
     }
 }

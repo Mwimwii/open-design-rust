@@ -25,6 +25,7 @@ fn config_with(paths: RuntimePaths, token: Option<&str>) -> DaemonConfig {
         api_token: token.map(str::to_string),
         api_auth_disabled: false,
         web_dist: None,
+        desktop_auth_secret: None,
     }
 }
 
@@ -50,6 +51,31 @@ async fn http_post(addr: SocketAddr, path: &str, body: &str) -> (String, String)
     let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
+        .await
+        .expect("write");
+    let mut response = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response)
+        .await
+        .expect("read");
+    let response = String::from_utf8_lossy(&response).into_owned();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap_or(("", ""));
+    (head.to_string(), body.to_string())
+}
+
+/// POST with one extra header line (the desktop import token).
+async fn http_post_with_header(
+    addr: SocketAddr,
+    path: &str,
+    body: &str,
+    name: &str,
+    value: &str,
+) -> (String, String) {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n{name}: {value}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
@@ -684,6 +710,202 @@ async fn agents_route_matches_the_web_contract() {
     );
     assert!(body.contains("event: agent\ndata: "), "body: {body}");
     assert!(body.contains("event: done\ndata: {}"), "body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_working_dir_route_rebinds_a_project_at_a_picked_folder() {
+    let paths = temp_paths("working-dir");
+    let daemon = RunningDaemon::start(config_with(paths, None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+
+    // A managed project with no folder yet.
+    let (head, body) = http_post(
+        addr,
+        "/api/projects",
+        r#"{"id":"p-rebind","name":"Rebind","metadata":{"kind":"prototype"}}"#,
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+
+    // A missing project is a 404, not a silent create.
+    let (head, body) = http_post(
+        addr,
+        "/api/projects/p-absent/working-dir",
+        r#"{"baseDir":"/tmp"}"#,
+    )
+    .await;
+    assert!(head.contains("404"), "status: {head}");
+    assert!(body.contains("PROJECT_NOT_FOUND"), "body: {body}");
+
+    // baseDir is required.
+    let (head, body) = http_post(addr, "/api/projects/p-rebind/working-dir", r#"{}"#).await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(body.contains("baseDir required"), "body: {body}");
+
+    // The orchestrator workspace contract is enforced.
+    let (head, body) = http_post(
+        addr,
+        "/api/projects/p-rebind/working-dir",
+        r#"{"baseDir":"/tmp","orchestratorWorkspace":{"kind":"team"}}"#,
+    )
+    .await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(
+        body.contains("orchestratorWorkspace.kind must be"),
+        "body: {body}"
+    );
+
+    // Rebind to a real folder: the canonical path, the entry file and the
+    // import marker land in the metadata, and the saved tab state resets.
+    let folder = std::env::temp_dir().join(format!("od-rebind-{}", std::process::id()));
+    std::fs::create_dir_all(&folder).expect("folder");
+    std::fs::write(folder.join("index.html"), b"<html>rebound</html>").expect("write");
+    let canonical = folder.canonicalize().expect("canonical");
+    let payload = serde_json::json!({
+        "baseDir": folder.to_string_lossy(),
+        "orchestratorWorkspace": { "kind": "scratch", "writeback": "external" },
+    })
+    .to_string();
+    let (head, body) = http_post(addr, "/api/projects/p-rebind/working-dir", &payload).await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["baseDir"], canonical.to_string_lossy().as_ref());
+    assert_eq!(value["entryFile"], "index.html");
+    assert_eq!(value["project"]["id"], "p-rebind");
+    assert_eq!(value["project"]["metadata"]["importedFrom"], "folder");
+    assert_eq!(
+        value["project"]["metadata"]["baseDir"],
+        canonical.to_string_lossy().as_ref()
+    );
+    assert_eq!(value["project"]["metadata"]["kind"], "prototype");
+    assert_eq!(
+        value["project"]["metadata"]["orchestratorWorkspace"]["kind"],
+        "scratch"
+    );
+    assert_eq!(
+        value["project"]["metadata"]["orchestratorWorkspace"]["writeback"],
+        "external"
+    );
+
+    // The rebind is durable: the project read carries the new folder.
+    let (_, body) = http_get(addr, "/api/projects/p-rebind", None).await;
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        value["project"]["metadata"]["baseDir"],
+        canonical.to_string_lossy().as_ref()
+    );
+
+    // The system roots are refused with the working-dir wording.
+    let (head, body) = http_post(
+        addr,
+        "/api/projects/p-rebind/working-dir",
+        r#"{"baseDir":"/etc"}"#,
+    )
+    .await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(
+        body.contains("system or credential directory"),
+        "body: {body}"
+    );
+    let (head, body) = http_post(
+        addr,
+        "/api/projects/p-rebind/working-dir",
+        r#"{"baseDir":"relative/dir"}"#,
+    )
+    .await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(body.contains("baseDir must be absolute"), "body: {body}");
+}
+
+/// The desktop import-token gate: once a desktop has registered a secret,
+/// the folder-import routes only accept a token bound to the picked folder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_desktop_import_gate_binds_a_token_to_one_folder() {
+    let secret = vec![0x5au8; 32];
+    let mut config = config_with(temp_paths("desktop-gate"), None);
+    config.desktop_auth_secret = Some(secret.clone());
+    let daemon = RunningDaemon::start(config).await.expect("start");
+    let addr = daemon.addr();
+
+    let folder = std::env::temp_dir().join(format!("od-gate-{}", std::process::id()));
+    std::fs::create_dir_all(&folder).expect("folder");
+    let other = std::env::temp_dir().join(format!("od-gate-other-{}", std::process::id()));
+    std::fs::create_dir_all(&other).expect("folder");
+
+    // No token at all: the gate refuses the import.
+    let payload = serde_json::json!({ "baseDir": folder.to_string_lossy() }).to_string();
+    let (head, body) = http_post_with_header(
+        addr,
+        "/api/import/folder",
+        &payload,
+        "x-od-desktop-import-token",
+        "",
+    )
+    .await;
+    assert!(head.contains("403"), "status: {head} body: {body}");
+    assert!(body.contains("desktop import token rejected"), "body: {body}");
+    assert!(body.contains("\"reason\""), "body: {body}");
+
+    // A token minted for another folder does not open this one.
+    let foreign = od_daemon::desktop_import::mint_import_token(
+        &secret,
+        &other.to_string_lossy(),
+        od_daemon::desktop_import::now_ms(),
+    );
+    let (head, body) = http_post_with_header(
+        addr,
+        "/api/import/folder",
+        &payload,
+        "x-od-desktop-import-token",
+        &foreign,
+    )
+    .await;
+    assert!(head.contains("403"), "status: {head} body: {body}");
+
+    // The token for this folder is accepted, and the import records that the
+    // folder came from the trusted picker.
+    let token = od_daemon::desktop_import::mint_import_token(
+        &secret,
+        &folder.to_string_lossy(),
+        od_daemon::desktop_import::now_ms(),
+    );
+    let (head, body) = http_post_with_header(
+        addr,
+        "/api/import/folder",
+        &payload,
+        "x-od-desktop-import-token",
+        &token,
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["project"]["metadata"]["fromTrustedPicker"], true);
+
+    // A token is single use: replaying it is refused.
+    let (head, body) = http_post_with_header(
+        addr,
+        "/api/import/folder",
+        &payload,
+        "x-od-desktop-import-token",
+        &token,
+    )
+    .await;
+    assert!(head.contains("403"), "status: {head} body: {body}");
+
+    // The working-dir route shares the gate.
+    let (head, body) = http_post(
+        addr,
+        "/api/projects",
+        r#"{"id":"p-gate","name":"Gate"}"#,
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let rebind = serde_json::json!({ "baseDir": folder.to_string_lossy() }).to_string();
+    let (head, body) = http_post(addr, "/api/projects/p-gate/working-dir", &rebind).await;
+    assert!(head.contains("403"), "status: {head} body: {body}");
+    assert!(body.contains("desktop import token rejected"), "body: {body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

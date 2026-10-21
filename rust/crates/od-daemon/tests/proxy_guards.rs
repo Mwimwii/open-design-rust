@@ -29,6 +29,7 @@ fn router() -> axum::Router {
         api_token: None,
         api_auth_disabled: false,
         web_dist: None,
+        desktop_auth_secret: None,
     };
     let store = Store::open(&config.paths.data_dir().join("app.sqlite")).expect("store");
     od_daemon::routes::build_router(AppState::new(config, store))

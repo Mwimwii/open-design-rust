@@ -46,6 +46,12 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = DaemonConfig::with_paths(paths);
     let web_dist = web_dist(app);
     config.web_dist = web_dist.clone();
+    // The desktop import-token secret: one per process, minted before the
+    // daemon starts so the embedded daemon can verify the tokens this shell
+    // hands the renderer (parity: `REGISTER_DESKTOP_AUTH` in the Electron
+    // pair, where the secret crosses the sidecar boundary instead).
+    let desktop_auth = DesktopAuth::generate();
+    config.desktop_auth_secret = Some(desktop_auth.secret().to_vec());
     let daemon = start_daemon(config)?;
     let daemon_url = daemon.url().to_string();
 
@@ -53,7 +59,7 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         daemon_url: daemon_url.clone(),
         data_dir,
         web_dist,
-        desktop_auth: DesktopAuth::generate(),
+        desktop_auth,
         daemon: Mutex::new(Some(daemon)),
     });
 

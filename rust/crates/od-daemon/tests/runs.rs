@@ -32,6 +32,7 @@ fn setup_state(tag: &str, shutting_down: bool) -> (Router, Store, PathBuf) {
         api_token: None,
         api_auth_disabled: false,
         web_dist: None,
+        desktop_auth_secret: None,
     };
     let store = Store::open(&config.paths.db_file()).expect("store");
     store

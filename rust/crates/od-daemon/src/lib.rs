@@ -21,6 +21,7 @@ pub mod critique;
 pub mod design_system_catalog;
 pub mod chat_artifacts;
 pub mod config;
+pub mod desktop_import;
 pub mod conversations;
 pub mod diagnostics;
 pub mod egress;

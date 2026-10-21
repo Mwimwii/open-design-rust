@@ -37,6 +37,7 @@ fn setup(tag: &str) -> Fixture {
         api_token: None,
         api_auth_disabled: false,
         web_dist: None,
+        desktop_auth_secret: None,
     };
     let store = Store::open(&config.paths.db_file()).expect("store");
     store

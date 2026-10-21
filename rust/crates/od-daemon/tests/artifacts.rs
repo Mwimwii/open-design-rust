@@ -41,6 +41,7 @@ fn setup_with_token(tag: &str, api_token: Option<&str>) -> Fixture {
         api_token: api_token.map(str::to_string),
         api_auth_disabled: false,
         web_dist: None,
+        desktop_auth_secret: None,
     };
     let store = Store::open(&config.paths.db_file()).expect("store");
     let router = build_router(AppState::new(config, store.clone()));

@@ -251,6 +251,32 @@ impl Store {
         Ok(body)
     }
 
+    /// Replace a project's stored metadata (parity: `updateProject` with a
+    /// metadata patch).
+    ///
+    /// `updateProject` merges the patch over the existing row and stamps
+    /// `updatedAt` with the current clock; the metadata patch here is
+    /// authoritative (the caller composes the whole document), exactly like
+    /// the TypeScript route does before it calls the update.
+    pub fn update_project_metadata(
+        &self,
+        id: &str,
+        metadata_json: &str,
+        now: i64,
+    ) -> Result<Option<ProjectRow>, StoreError> {
+        {
+            let conn = self.lock()?;
+            let updated = conn.execute(
+                "UPDATE projects SET metadata_json = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![metadata_json, now, id],
+            )?;
+            if updated == 0 {
+                return Ok(None);
+            }
+        }
+        self.get_project(id)
+    }
+
     /// Workspace claiming a project, if any (parity:
     /// `getWorkspaceProjectByProjectId`).
     pub fn workspace_id_for_project(&self, id: &str) -> Result<Option<String>, StoreError> {

@@ -49,6 +49,7 @@ fn config(paths: RuntimePaths, web_dist: Option<PathBuf>) -> DaemonConfig {
         api_token: None,
         api_auth_disabled: false,
         web_dist,
+        desktop_auth_secret: None,
     }
 }
 

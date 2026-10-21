@@ -23,6 +23,7 @@ fn config(paths: RuntimePaths) -> DaemonConfig {
         api_token: None,
         api_auth_disabled: false,
         web_dist: None,
+        desktop_auth_secret: None,
     }
 }
 
