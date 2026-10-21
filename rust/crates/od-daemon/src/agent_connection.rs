@@ -11,12 +11,18 @@
 //! that never spawn a real agent. [`SpawnAgentProbe`] is the production
 //! [`AgentProbe`] that actually resolves the binary and runs the CLI.
 //!
+//! ACP / dsh-profile / pi-rpc agents get a real session lane from
+//! [`crate::smoke_sessions`]: the probe performs the protocol handshake, asks
+//! for the smoke reply, and reports `acpCleanCompletion` / `acpFatal` (and the
+//! dsh/pi terminal signals) into the decision tree. The chat-run session
+//! controllers (tool execution, artifacts, resume, model selection, MCP) stay
+//! unported and are documented in that module.
+//!
 //! Deferred to follow-up beads (documented rather than silently dropped):
-//! the ACP / dsh-profile / pi-rpc session layers, so those stream formats run
-//! through the plain stdout lane in [`SpawnAgentProbe`]; `resolveModelForAgent`
-//! live-catalog substitution; and the redaction set of `redact.ts` (this module
-//! uses the connection-test redactor for both, since the diagnostics it builds
-//! are auth-header shaped).
+//! `resolveConnectionTestModelForAgent` live-catalog substitution (an agent
+//! with a resolved model slot, e.g. amr, still exercises `default`); and the
+//! redaction set of `redact.ts` (this module uses the connection-test redactor
+//! for both, since the diagnostics it builds are auth-header shaped).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -27,6 +33,7 @@ use std::time::SystemTime;
 use regex::Regex;
 use serde_json::{Map, Value};
 
+use crate::smoke_sessions::SmokeSession;
 use crate::agent_auth::{
     antigravity_auth_guidance, antigravity_quota_guidance, classify_agent_auth_failure,
     classify_agent_service_failure, cursor_auth_guidance, AgentServiceFailureCode,
@@ -1978,6 +1985,9 @@ enum SmokeLaneKind {
     Copilot(Box<crate::protocol::CopilotParser>),
     Qoder(Box<crate::protocol::QoderParser>),
     Json(Box<crate::protocol::JsonEventParser>),
+    /// ACP / dsh-profile / pi-rpc: the session controller owns stdin and
+    /// recovers assistant text from protocol frames.
+    Session(Box<SmokeSession>),
     Plain,
 }
 
@@ -2107,7 +2117,17 @@ fn tail_bytes(text: &str, max: usize) -> String {
 }
 
 impl SmokeLane {
-    fn new(stream_format: &str, json_kind: Option<&'static str>) -> Self {
+    fn new(
+        stream_format: &str,
+        json_kind: Option<&'static str>,
+        session: Option<SmokeSession>,
+    ) -> Self {
+        if let Some(session) = session {
+            return Self {
+                kind: SmokeLaneKind::Session(Box::new(session)),
+                browser: SmokeSink::default(),
+            };
+        }
         let kind = match stream_format {
             "claude-stream-json" => {
                 SmokeLaneKind::Claude(Box::new(crate::protocol::ClaudeParser::new()))
@@ -2126,8 +2146,8 @@ impl SmokeLane {
                 }
                 None => SmokeLaneKind::Plain,
             },
-            // ACP / dsh-profile / pi-rpc session layers are not ported; the
-            // plain lane still recovers their stdout text for the smoke test.
+            // Session formats arrive pre-built as `Some(session)`; this arm
+            // only covers defs whose protocol has no session lane.
             _ => SmokeLaneKind::Plain,
         };
         Self {
@@ -2136,8 +2156,30 @@ impl SmokeLane {
         }
     }
 
+    /// Parity: `acpSession.completedSuccessfully()`.
+    fn session_completed_successfully(&self) -> bool {
+        matches!(&self.kind, SmokeLaneKind::Session(session) if session.completed_successfully())
+    }
+
+    /// Parity: `acpSession.hasFatalError()`.
+    fn session_has_fatal_error(&self) -> bool {
+        matches!(&self.kind, SmokeLaneKind::Session(session) if session.has_fatal_error())
+    }
+
     /// Feed one stdout line (no trailing newline) and collect sink state.
-    fn feed_line(&mut self, line: &str) {
+    async fn feed_line(&mut self, line: &str) {
+        if let SmokeLaneKind::Session(session) = &mut self.kind {
+            let update = session.feed_line(line).await;
+            if !update.text.is_empty() {
+                self.browser.consume_text(&update.text);
+            }
+            if let Some(error) = update.error {
+                if self.browser.stream_error.is_none() {
+                    self.browser.stream_error = Some(error);
+                }
+            }
+            return;
+        }
         if matches!(&self.kind, SmokeLaneKind::Plain) {
             let chunk = format!("{line}\n");
             self.browser.append_raw_stdout(&chunk);
@@ -2162,6 +2204,7 @@ impl SmokeLane {
             SmokeLaneKind::Json(parser) => {
                 parser.feed(&format!("{line}\n"), &mut |event| events.push(event));
             }
+            SmokeLaneKind::Session(_) => unreachable!("session lane handled above"),
             SmokeLaneKind::Plain => unreachable!("plain lane handled above"),
         }
         if raw_lane {
@@ -2179,7 +2222,7 @@ impl SmokeLane {
             SmokeLaneKind::Copilot(parser) => parser.flush(&mut |event| events.push(event)),
             SmokeLaneKind::Qoder(parser) => parser.flush(&mut |event| events.push(event)),
             SmokeLaneKind::Json(parser) => parser.flush(&mut |event| events.push(event)),
-            SmokeLaneKind::Plain => {}
+            SmokeLaneKind::Session(_) | SmokeLaneKind::Plain => {}
         }
         for event in &events {
             self.browser.send_event(event);
@@ -2369,9 +2412,14 @@ impl SpawnAgentProbe {
                 return ProbeOutcome::AuthRequired(auth);
             }
         }
+        let session_lane = matches!(
+            def.stream_format,
+            "acp-json-rpc" | "dsh-profile-jsonl" | "pi-rpc"
+        );
         let stdin_piped = def.prompt_via_stdin
             || def.stream_format == "acp-json-rpc"
-            || def.stream_format == "dsh-profile-jsonl";
+            || def.stream_format == "dsh-profile-jsonl"
+            || def.stream_format == "pi-rpc";
         let spawned = match crate::spawn::spawn_child(
             std::path::Path::new(&launch_path),
             &args,
@@ -2399,8 +2447,22 @@ impl SpawnAgentProbe {
             }
         };
         let mut child = spawned.child;
-        if let Some(bytes) = stdin_piped.then(|| crate::spawn::stdin_bytes(def, SMOKE_PROMPT)) {
-            if let Some(mut stdin) = child.stdin.take() {
+        // Session formats own stdin: they write the protocol handshake
+        // (ACP JSON-RPC, dsh execute, pi prompt) and must keep it open.
+        let mut stdin_handle = child.stdin.take();
+        let mut session = None;
+        if session_lane {
+            if let Some(stdin) = stdin_handle.take() {
+                session = SmokeSession::start(
+                    def.stream_format,
+                    Box::new(stdin),
+                    &temp_dir.to_string_lossy(),
+                    SMOKE_PROMPT,
+                )
+                .await;
+            }
+        } else if let Some(bytes) = stdin_piped.then(|| crate::spawn::stdin_bytes(def, SMOKE_PROMPT)) {
+            if let Some(mut stdin) = stdin_handle.take() {
                 let _ = stdin.write_all(&bytes).await;
                 let _ = stdin.shutdown().await;
             }
@@ -2414,6 +2476,7 @@ impl SpawnAgentProbe {
             } else {
                 None
             },
+            session,
         );
         // Drain stdout and stderr concurrently with the child.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<LaneMessage>();
@@ -2480,7 +2543,7 @@ impl SpawnAgentProbe {
                 Ok(None) => break,
                 Ok(Some(message)) => match message {
                     LaneMessage::Stdout(line) => {
-                        lane.feed_line(&line);
+                        lane.feed_line(&line).await;
                         if let Some(error) = lane.browser.stream_error.clone() {
                             winner.get_or_insert(Winner::StreamError(error));
                         }
@@ -2515,7 +2578,7 @@ impl SpawnAgentProbe {
         tokio::time::sleep(std::time::Duration::from_millis(AGENT_STDOUT_DRAIN_MS)).await;
         while let Ok(message) = rx.try_recv() {
             match message {
-                LaneMessage::Stdout(line) => lane.feed_line(&line),
+                LaneMessage::Stdout(line) => lane.feed_line(&line).await,
                 LaneMessage::Stderr(line) => {
                     lane.browser.append_stderr(&line);
                     lane.browser.append_stderr("\n");
@@ -2545,7 +2608,15 @@ impl SpawnAgentProbe {
                 Err(_) => {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
-                    Some(Winner::Timeout)
+                    // Parity: TS sends SIGTERM and `acpCleanCompletion` turns
+                    // that teardown into a clean forced shutdown. The Rust
+                    // probe uses SIGKILL, so a session that already completed
+                    // its prompt reports text success instead of a timeout.
+                    if lane.session_completed_successfully() {
+                        None
+                    } else {
+                        Some(Winner::Timeout)
+                    }
                 }
             }
         } else {
@@ -2560,6 +2631,8 @@ impl SpawnAgentProbe {
         } else {
             None
         };
+        let acp_clean_completion = lane.session_completed_successfully();
+        let acp_fatal = lane.session_has_fatal_error();
         let browser = lane.browser;
         ProbeOutcome::Smoke(SmokeOutcome {
             winner,
@@ -2570,8 +2643,8 @@ impl SpawnAgentProbe {
             stderr_tail: browser.stderr_tail,
             resolved_model: browser.resolved_model,
             saw_terminal_completion: browser.saw_terminal_completion,
-            acp_clean_completion: false,
-            acp_fatal: false,
+            acp_clean_completion,
+            acp_fatal,
             antigravity_log_tail,
         })
     }
@@ -3244,16 +3317,17 @@ mod tests {
     /// pump does — a line *with* its terminator. Feeding raw lines without it
     /// made the parser buffer the whole stream into one unparseable blob, so
     /// a real smoke test reported `unknown` with exit 0 despite full output.
-    #[test]
-    fn smoke_lane_feeds_the_claude_parser_with_line_terminators() {
-        let mut lane = SmokeLane::new("claude-stream-json", None);
-        lane.feed_line(r#"{"type":"system","subtype":"init","model":"opus","session_id":"s1"}"#);
+    #[tokio::test]
+    async fn smoke_lane_feeds_the_claude_parser_with_line_terminators() {
+        let mut lane = SmokeLane::new("claude-stream-json", None, None);
+        lane.feed_line(r#"{"type":"system","subtype":"init","model":"opus","session_id":"s1"}"#)
+            .await;
         lane.feed_line(
             r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"ok"}]}}"#,
-        );
-        lane.feed_line(
-            r#"{"type":"result","subtype":"success","stop_reason":"end_turn"}"#,
-        );
+        )
+        .await;
+        lane.feed_line(r#"{"type":"result","subtype":"success","stop_reason":"end_turn"}"#)
+            .await;
         lane.flush();
         assert_eq!(lane.browser.text, "ok");
         assert_eq!(lane.browser.resolved_model.as_deref(), Some("opus"));
@@ -3262,10 +3336,10 @@ mod tests {
         assert!(lane.browser.raw_stdout.contains(r#""text":"ok""#));
     }
 
-    #[test]
-    fn smoke_lane_plain_format_streams_stdout_as_text() {
-        let mut lane = SmokeLane::new("plain", None);
-        lane.feed_line("ok");
+    #[tokio::test]
+    async fn smoke_lane_plain_format_streams_stdout_as_text() {
+        let mut lane = SmokeLane::new("plain", None, None);
+        lane.feed_line("ok").await;
         lane.flush();
         assert_eq!(lane.browser.text, "ok\n");
     }
