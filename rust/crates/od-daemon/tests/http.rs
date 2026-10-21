@@ -92,6 +92,15 @@ async fn project_create_and_import_match_the_web_contract() {
         value["project"].get("metadata_json").is_none(),
         "raw snake_case columns must not leak: {body}"
     );
+    // The managed project directory exists with the row, so a run can spawn
+    // with it as its cwd.
+    assert!(daemon
+        .state
+        .config
+        .paths
+        .projects_dir()
+        .join("p-create")
+        .is_dir());
 
     // The catalog and the detail route use the same shape.
     let (_, body) = http_get(addr, "/api/projects", None).await;
@@ -293,6 +302,145 @@ async fn media_task_list_matches_the_typescript_shape() {
     let (head, body) = http_get(addr, "/api/projects/nope/media/tasks", None).await;
     assert!(head.contains("404"), "status: {head}");
     assert!(body.contains("PROJECT_NOT_FOUND"), "body: {body}");
+}
+
+async fn http_put(addr: SocketAddr, path: &str, body: &str) -> (String, String) {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let request = format!(
+        "PUT {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
+        .await
+        .expect("write");
+    let mut response = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response)
+        .await
+        .expect("read");
+    let response = String::from_utf8_lossy(&response).into_owned();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap_or(("", ""));
+    (head.to_string(), body.to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_config_round_trips_the_onboarding_write() {
+    let daemon = RunningDaemon::start(config_with(temp_paths("app-config"), None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+
+    // Fresh install: telemetry defaults are on, so onboarding events emit.
+    let (head, body) = http_get(addr, "/api/app-config", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["config"]["telemetry"]["metrics"], true);
+
+    // The onboarding Continue write must land and survive a reread.
+    let (head, body) = http_put(
+        addr,
+        "/api/app-config",
+        r#"{"agentId":"qwen","mode":"daemon","onboardingCompleted":true}"#,
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["config"]["agentId"], "qwen");
+    assert_eq!(value["config"]["onboardingCompleted"], true);
+    // `mode` is request state, not a persisted preference.
+    assert!(value["config"].get("mode").is_none(), "body: {body}");
+
+    let (_, body) = http_get(addr, "/api/app-config", None).await;
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["config"]["agentId"], "qwen");
+    assert_eq!(value["config"]["onboardingCompleted"], true);
+}
+
+/// Raw request with an arbitrary extra header line (ETag revalidation, Origin).
+async fn http_get_with_header(
+    addr: SocketAddr,
+    path: &str,
+    name: &str,
+    value: &str,
+) -> (String, String) {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\n{name}: {value}\r\nConnection: close\r\n\r\n"
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
+        .await
+        .expect("write");
+    let mut response = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response)
+        .await
+        .expect("read");
+    let response = String::from_utf8_lossy(&response).into_owned();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap_or(("", ""));
+    (head.to_string(), body.to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_serves_artifact_bytes_with_revalidating_etag() {
+    let daemon = RunningDaemon::start(config_with(temp_paths("raw"), None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+    let payload = serde_json::json!({ "id": "p-raw", "name": "Raw" }).to_string();
+    let (head, _) = http_post(addr, "/api/projects", &payload).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    let dir = daemon.state.config.paths.projects_dir().join("p-raw");
+    std::fs::write(dir.join("hero.html"), b"<html><body>raw</body></html>").expect("write");
+
+    // The preview iframe's HEAD/GET pair: bytes, MIME, and a cache validator.
+    let (head, body) = http_get(addr, "/api/projects/p-raw/raw/hero.html", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    assert!(head.contains("text/html"), "mime: {head}");
+    assert!(head.contains("no-cache"), "cache: {head}");
+    let etag = head
+        .lines()
+        .find_map(|line| line.strip_prefix("etag: ").or_else(|| line.strip_prefix("ETag: ")))
+        .expect("etag header")
+        .trim()
+        .to_string();
+    assert_eq!(body, "<html><body>raw</body></html>");
+
+    // Unchanged bytes revalidate to 304 and carry no body.
+    let (head, body) =
+        http_get_with_header(addr, "/api/projects/p-raw/raw/hero.html", "If-None-Match", &etag)
+            .await;
+    assert!(head.contains("304"), "status: {head}");
+    assert!(body.is_empty(), "304 body: {body:?}");
+
+    // A sandboxed preview iframe sends `Origin: null`; it must be allowed.
+    let (head, _) =
+        http_get_with_header(addr, "/api/projects/p-raw/raw/hero.html", "Origin", "null").await;
+    assert!(head.contains("access-control-allow-origin: *"), "cors: {head}");
+
+    let (head, _) = http_get(addr, "/api/projects/p-raw/raw/missing.html", None).await;
+    assert!(head.contains("404"), "status: {head}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_scope_reads_as_unbound_and_gates_artifact_previews() {
+    let daemon = RunningDaemon::start(config_with(temp_paths("scope"), None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+    let payload = serde_json::json!({ "id": "p-scope", "name": "Scoped" }).to_string();
+    let (head, _) = http_post(addr, "/api/projects", &payload).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+
+    // The web app maps `unbound` to local resource authority, which is what
+    // lets the artifact preview render.
+    let (head, body) = http_get(addr, "/api/projects/p-scope/workspace-scope", None).await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["scope"]["kind"], "unbound");
+    assert_eq!(value["scope"]["projectId"], "p-scope");
+    assert!(value["scope"]["workspaceId"].is_null());
+    assert!(value["scope"]["context"].is_null());
+
+    let (head, _) = http_get(addr, "/api/projects/missing/workspace-scope", None).await;
+    assert!(head.contains("404"), "status: {head}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

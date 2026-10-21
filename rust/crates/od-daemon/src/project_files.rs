@@ -167,6 +167,38 @@ pub fn read_project_file(
     Ok((bytes, mime_for(&resolved.rel).to_string()))
 }
 
+/// Bytes plus the cache validators the `/raw/` route needs.
+///
+/// Parity: the TypeScript route derives a weak `size-mtime` ETag so an agent
+/// rewrite busts the browser cache immediately while an unchanged file answers
+/// 304. Keeping the pair together here means the route cannot serve bytes and
+/// validators from two different reads.
+pub struct RawFile {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+    pub size: u64,
+    pub mtime_ms: i64,
+}
+
+/// Resolve, stat, and read one project file for `/raw/`.
+pub fn read_raw_file(base: &Path, rel: &str, imported: bool) -> Result<RawFile, ProjectPathError> {
+    let resolved = resolve_project_file(base, rel, imported)?;
+    let metadata = std::fs::metadata(&resolved.path).map_err(map_io)?;
+    let bytes = std::fs::read(&resolved.path).map_err(map_io)?;
+    let mtime_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    Ok(RawFile {
+        bytes,
+        mime: mime_for(&resolved.rel).to_string(),
+        size: metadata.len(),
+        mtime_ms,
+    })
+}
+
 /// Port of the `text-preview` route: bounded UTF-8 preview plus file metadata
 /// and the HTML "powered preview" capability hint.
 pub fn text_preview(

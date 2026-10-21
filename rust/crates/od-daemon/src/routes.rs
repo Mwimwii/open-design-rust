@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::{ConnectInfo, Path, RawQuery, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -88,18 +88,35 @@ impl AppState {
 ///
 /// Auth parity: the TypeScript middleware is mounted on `/api` only — static
 /// preview/SPA assets are not token-guarded (loopback binding protects them).
+/// Opt-in request log for UI acceptance runs (`OD_HTTP_LOG=1`). Off by
+/// default: a headless UI pass needs to see which route a click actually
+/// reached, but the daemon is not a server whose access log anyone reads.
+async fn log_request(request: axum::extract::Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let response = next.run(request).await;
+    eprintln!("[http] {method} {path} -> {}", response.status());
+    response
+}
+
 pub fn build_router(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/health", get(health))
         .route("/api/ready", get(ready))
         .route("/api/version", get(version))
         .route("/api/agents", get(list_agents))
+        .route("/api/app-config", get(get_app_config).put(put_app_config))
         .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/import/folder", post(import_folder))
         .route("/api/projects/{id}", get(get_project))
+        .route(
+            "/api/projects/{id}/workspace-scope",
+            get(get_project_workspace_scope),
+        )
         .route("/api/projects/{id}/files", get(list_project_files))
         .route("/api/projects/{id}/media/tasks", get(list_media_tasks))
         .route("/api/projects/{id}/files/{*path}", get(serve_project_file))
+        .route("/api/projects/{id}/raw/{*path}", get(serve_project_raw))
         .route(
             "/api/projects/{id}/text-preview/{*path}",
             get(project_file_text_preview),
@@ -162,6 +179,11 @@ pub fn build_router(state: AppState) -> Router {
             )
         }
         None => router.fallback(not_found),
+    };
+    let router = if std::env::var_os("OD_HTTP_LOG").is_some() {
+        router.layer(middleware::from_fn(log_request))
+    } else {
+        router
     };
     router.with_state(state)
 }
@@ -328,6 +350,61 @@ async fn get_project(State(state): State<AppState>, Path(id): Path<String>) -> R
     Json(json!({ "project": project_json, "resolvedDir": resolved_dir })).into_response()
 }
 
+/// `GET /api/app-config` — the persisted app preferences (parity: the route in
+/// `apps/daemon/src/routes/media.ts`). The web app reads this before it can
+/// leave onboarding.
+async fn get_app_config(State(state): State<AppState>) -> Response {
+    let data_dir = state.config.paths.data_dir().to_path_buf();
+    match tokio::task::spawn_blocking(move || crate::app_config::read_app_config(&data_dir)).await {
+        Ok(config) => Json(json!({ "config": config })).into_response(),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// `PUT /api/app-config` — merge and persist preferences.
+async fn put_app_config(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let data_dir = state.config.paths.data_dir().to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        crate::app_config::write_app_config(&data_dir, &body)
+    })
+    .await
+    {
+        Ok(Ok(config)) => Json(json!({ "config": config })).into_response(),
+        Ok(Err(message)) => api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", &message),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// `GET /api/projects/{id}/workspace-scope` — parity port of the read in
+/// `apps/daemon/src/routes/project/index.ts`.
+///
+/// The web app derives its project resource authority from this answer, and
+/// that authority gates every artifact preview: an unbound scope reads as
+/// `local`. The Rust daemon has no Workspace binding table (its rows always
+/// serialize `workspaceId: null`), so every project it serves is unbound; a
+/// Team-bound project has no representation here yet and must not be invented.
+async fn get_project_workspace_scope(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let project = match state.store.get_project(&id) {
+        Ok(Some(project)) => project,
+        Ok(None) => {
+            return api_error(StatusCode::NOT_FOUND, "PROJECT_NOT_FOUND", "not found")
+        }
+        Err(err) => return store_error_response(&err),
+    };
+    Json(json!({
+        "scope": {
+            "kind": "unbound",
+            "projectId": project.id,
+            "workspaceId": null,
+            "context": null,
+        }
+    }))
+    .into_response()
+}
+
 /// `GET /api/agents` — the detected agent catalogue (parity: the route in
 /// `apps/daemon/src/routes/static-resource.ts`). `?stream=1` answers the same
 /// rows as `agent` SSE events followed by `done`, which is what `apps/web`
@@ -483,8 +560,13 @@ async fn create_project(State(state): State<AppState>, Json(body): Json<Value>) 
     let pending_prompt = pending_prompt.map(str::to_string);
     let conversation_id = crate::conversations::random_id();
     let conversation_id_for_task = conversation_id.clone();
+    let project_dir = state.config.paths.projects_dir().join(&id);
     let result = tokio::task::spawn_blocking(move || {
         let now = crate::conversations::now_ms();
+        // The managed project directory is created with the row (parity:
+        // `ensureProjectDir` in the TypeScript create path). A run whose cwd
+        // does not exist fails at spawn with ENOENT.
+        std::fs::create_dir_all(&project_dir)?;
         let project = store.insert_project(storage::NewProject {
             id: &id,
             name: &name,
@@ -784,6 +866,73 @@ async fn serve_project_file(
         Ok(Err(err)) => project_path_error_response(err),
         Err(err) => internal_error(&err.to_string()),
     }
+}
+
+/// `GET /api/projects/:id/raw/*path` — the bytes the artifact preview iframe
+/// loads (parity: the `/raw/` route in `apps/daemon/src/routes/project/index.ts`).
+///
+/// The viewer issues a HEAD first and refuses to render without it, so this
+/// route is what turns a persisted artifact into a visible one. It answers with
+/// a weak `size-mtime` ETag and `no-cache` so a rewritten artifact is picked up
+/// on the next load while unchanged bytes revalidate to 304.
+///
+/// DOCUMENTED GAPS: the preview bridges (URL rewriting, Vite preview
+/// resolution, workspace-scoped asset URLs) are not applied — the daemon serves
+/// the stored bytes as-is. A sandboxed preview iframe sends `Origin: null`, so
+/// that case gets `Access-Control-Allow-Origin: *`, exactly like the port.
+async fn serve_project_raw(
+    State(state): State<AppState>,
+    Path((id, path)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if project_files::is_project_file_version_path(&path) {
+        return api_error(StatusCode::NOT_FOUND, "FILE_NOT_FOUND", "file not found");
+    }
+    let project = match load_project_for_files(&state, &id).await {
+        Ok(project) => project,
+        Err(response) => return *response,
+    };
+    let base = match project_fs_base(&state, &project) {
+        Ok(base) => base,
+        Err(response) => return *response,
+    };
+    let imported = project_dir::has_external_project_root(&project);
+    let result =
+        tokio::task::spawn_blocking(move || project_files::read_raw_file(&base, &path, imported))
+            .await;
+    let file = match result {
+        Ok(Ok(file)) => file,
+        Ok(Err(err)) => return project_path_error_response(err),
+        Err(err) => return internal_error(&err.to_string()),
+    };
+
+    let etag = format!("W/\"{:x}-{:x}\"", file.size, file.mtime_ms);
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&file.mime)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    response_headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag).unwrap_or_else(|_| HeaderValue::from_static("W/\"0-0\"")),
+    );
+    response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    if headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        == Some("null")
+    {
+        response_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    }
+    let fresh = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == etag));
+    if fresh {
+        return (StatusCode::NOT_MODIFIED, response_headers).into_response();
+    }
+    (response_headers, file.bytes).into_response()
 }
 
 /// `GET /api/projects/:id/text-preview/*path?limit=` — bounded UTF-8 preview
