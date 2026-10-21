@@ -96,6 +96,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/projects", get(list_projects))
         .route("/api/projects/{id}", get(get_project))
         .route("/api/projects/{id}/files", get(list_project_files))
+        .route("/api/projects/{id}/media/tasks", get(list_media_tasks))
         .route("/api/projects/{id}/files/{*path}", get(serve_project_file))
         .route(
             "/api/projects/{id}/text-preview/{*path}",
@@ -340,6 +341,84 @@ async fn list_project_files(
         Ok(Err(err)) => api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", &err.to_string()),
         Err(err) => internal_error(&err.to_string()),
     }
+}
+
+/// `GET /api/projects/:id/media/tasks` — parity port of the TS media task
+/// list (`apps/daemon/src/routes/media.ts`), reading the durable `media_tasks`
+/// rows the daemon already stores.
+///
+/// DOCUMENTED GAP: the TS route also recovers a `done` task whose file was
+/// moved by re-resolving it by size/mtime across the project inventory. This
+/// port only confirms a file that still exists under its recorded name; when
+/// it does not, the task omits `file` (the same shape TS produces when no
+/// candidate can be confirmed).
+async fn list_media_tasks(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let project = match load_project_for_files(&state, &id).await {
+        Ok(project) => project,
+        Err(response) => return *response,
+    };
+    let include_done = matches!(
+        single_query_value(query.as_deref(), "includeDone").as_deref(),
+        Some("1") | Some("true")
+    );
+    let store = state.store.clone();
+    let project_id = project.id.clone();
+    let rows = match tokio::task::spawn_blocking(move || {
+        crate::media_tasks::list_media_tasks_by_project(&store, &project_id, include_done)
+    })
+    .await
+    {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(err)) => return store_error_response(&err),
+        Err(err) => return internal_error(&err.to_string()),
+    };
+
+    // Confirm the files a finished task claims. Only `done` rows can have a
+    // file, and only when `includeDone` asked for them.
+    let mut confirmed: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    if include_done && rows.iter().any(|row| row.status == "done") {
+        if let Ok(base) = project_fs_base(&state, &project) {
+            let inventory = tokio::task::spawn_blocking(move || {
+                project_files::list_files(&base, None)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+            let by_name: std::collections::HashMap<String, Value> = inventory
+                .into_iter()
+                .filter_map(|entry| {
+                    let name = entry.get("name").and_then(Value::as_str)?.to_string();
+                    Some((name, entry))
+                })
+                .collect();
+            for row in &rows {
+                if row.status != "done" {
+                    continue;
+                }
+                let name = row
+                    .file
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty());
+                if let Some(entry) = name.and_then(|name| by_name.get(name)) {
+                    confirmed.insert(row.id.clone(), entry.clone());
+                }
+            }
+        }
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    let payload = crate::media_tasks::media_task_list_payload(&rows, &confirmed, now_ms);
+    ([(header::CACHE_CONTROL, "no-store")], Json(payload)).into_response()
 }
 
 /// `GET /api/projects/:id/files/*path` — raw file bytes + MIME type.

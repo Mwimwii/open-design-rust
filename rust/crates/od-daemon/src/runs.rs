@@ -3358,16 +3358,183 @@ fn push_lane_event(runs: &Runs, run_id: &str, event: crate::protocol::StreamEven
     runs.push_external_event(run_id, "agent", data);
 }
 
-fn push_lane_events(
+/// Per-run safety guards applied at the single lane-event choke point
+/// (parity: the `emitAgentEvent` / `emitGuardedTextDelta` wrappers in
+/// `apps/daemon/src/server.ts`).
+struct LaneGuards {
+    role: crate::role_marker_guard::RoleMarkerGuard,
+    tool_loop: crate::tool_loop_guard::ToolLoopGuard,
+    role_aborted: bool,
+    tool_loop_aborted: bool,
+}
+
+impl LaneGuards {
+    fn new() -> Self {
+        let mode = std::env::var("OD_TOOL_LOOP_GUARD").ok();
+        Self {
+            role: crate::role_marker_guard::RoleMarkerGuard::new("run"),
+            tool_loop: crate::tool_loop_guard::ToolLoopGuard::new(
+                crate::tool_loop_guard::ToolLoopGuardOptions {
+                    mode: crate::tool_loop_guard::resolve_tool_loop_mode(mode.as_deref()),
+                    ..Default::default()
+                },
+            ),
+            role_aborted: false,
+            tool_loop_aborted: false,
+        }
+    }
+}
+
+/// Terminate the child from inside the lane pump (parity: `signalChild` +
+/// the forced-shutdown schedule). The Rust child is killed directly; the run
+/// finishes as failed from the observed signal.
+async fn kill_guarded_child(child: &Arc<tokio::sync::Mutex<tokio::process::Child>>) {
+    let mut child = child.lock().await;
+    let _ = child.start_kill();
+}
+
+fn abort_for_role_marker(runs: &Runs, run_id: &str, marker: &str) {
+    let message = format!(
+        "Run terminated: model emitted fabricated role marker (`{marker}`). \
+         No further tokens or tool calls accepted from this turn. \
+         See https://github.com/nexu-io/open-design/issues/3247."
+    );
+    runs.push_external_event(
+        run_id,
+        "error",
+        serde_json::json!({
+            "message": message,
+            "error": {
+                "code": "ROLE_MARKER_HALLUCINATION",
+                "message": message,
+                "retryable": true,
+            },
+        }),
+    );
+}
+
+fn abort_for_tool_loop(
     runs: &Runs,
     run_id: &str,
+    verdict: &crate::tool_loop_guard::ToolLoopVerdict,
+) {
+    let message = format!(
+        "Run terminated: the agent repeated a failing {} call {}× without progress (`{}`). \
+         Re-check the actual target — the file, the element, the command — before retrying \
+         instead of resubmitting the same turn.",
+        verdict.tool_name, verdict.count, verdict.signature
+    );
+    runs.push_external_event(
+        run_id,
+        "error",
+        serde_json::json!({
+            "message": message,
+            "error": {
+                "code": "TOOL_LOOP_DETECTED",
+                "message": message,
+                "retryable": true,
+            },
+        }),
+    );
+}
+
+/// Emit one lane event through the guards.
+///
+/// * `text_delta` is filtered by the role-marker guard; a confirmed marker
+///   emits `fabricated_role_marker` + the `ROLE_MARKER_HALLUCINATION` error
+///   and terminates the child.
+/// * `tool_use` / `tool_result` feed the tool-loop guard; a verdict emits the
+///   `tool_loop` event after the result frame (TS order), and a halt emits the
+///   `TOOL_LOOP_DETECTED` error and terminates the child.
+async fn push_guarded_lane_event(
+    runs: &Runs,
+    run_id: &str,
+    guards: &mut LaneGuards,
+    child: &Arc<tokio::sync::Mutex<tokio::process::Child>>,
+    event: crate::protocol::StreamEvent,
+) {
+    use crate::protocol::StreamEvent;
+    match event {
+        StreamEvent::TextDelta { delta } => {
+            let safe = guards.role.feed_text(&delta);
+            if !safe.is_empty() {
+                push_lane_event(runs, run_id, StreamEvent::TextDelta { delta: safe });
+            }
+            if guards.role.contaminated() && !guards.role_aborted {
+                guards.role_aborted = true;
+                if let Some(mut warning) = guards.role.warning_event() {
+                    if let serde_json::Value::Object(ref mut map) = warning {
+                        map.insert("runId".to_string(), serde_json::json!(run_id));
+                    }
+                    let marker = warning
+                        .get("marker")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("role marker")
+                        .to_string();
+                    runs.push_external_event(run_id, "agent", warning);
+                    abort_for_role_marker(runs, run_id, &marker);
+                    kill_guarded_child(child).await;
+                }
+            }
+        }
+        StreamEvent::ToolUse { id, name, input } => {
+            if let Some(id) = id.as_deref().filter(|id| !id.is_empty()) {
+                guards
+                    .tool_loop
+                    .observe_tool_use(id, name.as_deref().unwrap_or("tool"), &input);
+            }
+            push_lane_event(runs, run_id, StreamEvent::ToolUse { id, name, input });
+        }
+        StreamEvent::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => {
+            // Parity: the result frame goes out BEFORE the verdict it triggers.
+            let verdict = tool_use_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .and_then(|id| {
+                    guards
+                        .tool_loop
+                        .observe_tool_result(id, is_error, &content)
+                });
+            push_lane_event(
+                runs,
+                run_id,
+                StreamEvent::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                },
+            );
+            if let Some(verdict) = verdict {
+                runs.push_external_event(run_id, "agent", verdict.to_json(run_id));
+                if verdict.action == crate::tool_loop_guard::ToolLoopAction::Halt
+                    && !guards.tool_loop_aborted
+                {
+                    guards.tool_loop_aborted = true;
+                    abort_for_tool_loop(runs, run_id, &verdict);
+                    kill_guarded_child(child).await;
+                }
+            }
+        }
+        other => push_lane_event(runs, run_id, other),
+    }
+}
+
+async fn push_lane_events(
+    runs: &Runs,
+    run_id: &str,
+    guards: &mut LaneGuards,
+    child: &Arc<tokio::sync::Mutex<tokio::process::Child>>,
     parser: &mut crate::protocol::ClaudeParser,
     line: &str,
 ) {
     let mut events = Vec::new();
     parser.feed(&format!("{line}\n"), &mut |event| events.push(event));
     for event in events {
-        push_lane_event(runs, run_id, event);
+        push_guarded_lane_event(runs, run_id, guards, child, event).await;
     }
 }
 
@@ -3425,7 +3592,9 @@ async fn pump_child(inputs: PumpInputs) {
     };
     let runs_for_out = runs.clone();
     let out_id = run_id.clone();
+    let kill_handle = Arc::clone(&handle);
     let out_task = tokio::spawn(async move {
+        let mut guards = LaneGuards::new();
         // Parity: the plain-lane artifact head/tail windows. The head keeps
         // the first CAP bytes; the tail is reconstructed from `stdout` events
         // after the pump finishes. TS keeps these on the run object because
@@ -3440,11 +3609,22 @@ async fn pump_child(inputs: PumpInputs) {
                 let mut parser = crate::protocol::ClaudeParser::new();
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    push_lane_events(&runs_for_out, &out_id, &mut parser, &line);
+                    push_lane_events(
+                        &runs_for_out,
+                        &out_id,
+                        &mut guards,
+                        &kill_handle,
+                        &mut parser,
+                        &line,
+                    )
+                    .await;
                 }
-                parser.flush(&mut |event| {
-                    push_lane_event(&runs_for_out, &out_id, event);
-                });
+                let mut tail = Vec::new();
+                parser.flush(&mut |event| tail.push(event));
+                for event in tail {
+                    push_guarded_lane_event(&runs_for_out, &out_id, &mut guards, &kill_handle, event)
+                        .await;
+                }
             }
         } else if stream_format == "copilot-stream-json" {
             if let Some(stdout) = stdout {
@@ -3456,7 +3636,14 @@ async fn pump_child(inputs: PumpInputs) {
                     let mut events = Vec::new();
                     parser.feed(&format!("{line}\n"), &mut |event| events.push(event));
                     for event in events {
-                        push_lane_event(&runs_for_out, &out_id, event);
+                        push_guarded_lane_event(
+                            &runs_for_out,
+                            &out_id,
+                            &mut guards,
+                            &kill_handle,
+                            event,
+                        )
+                        .await;
                     }
                 }
                 let mut tail = Vec::new();
@@ -3465,7 +3652,8 @@ async fn pump_child(inputs: PumpInputs) {
                 // necessarily a raw one; label it the same way the Claude
                 // branch does rather than forcing the `raw` lane.
                 for event in tail {
-                    push_lane_event(&runs_for_out, &out_id, event);
+                    push_guarded_lane_event(&runs_for_out, &out_id, &mut guards, &kill_handle, event)
+                        .await;
                 }
             }
         } else if stream_format == "qoder-stream-json" {
@@ -3478,12 +3666,22 @@ async fn pump_child(inputs: PumpInputs) {
                     let mut events = Vec::new();
                     parser.feed(&format!("{line}\n"), &mut |event| events.push(event));
                     for event in events {
-                        push_lane_event(&runs_for_out, &out_id, event);
+                        push_guarded_lane_event(
+                            &runs_for_out,
+                            &out_id,
+                            &mut guards,
+                            &kill_handle,
+                            event,
+                        )
+                        .await;
                     }
                 }
-                parser.flush(&mut |event| {
-                    push_lane_event(&runs_for_out, &out_id, event);
-                });
+                let mut tail = Vec::new();
+                parser.flush(&mut |event| tail.push(event));
+                for event in tail {
+                    push_guarded_lane_event(&runs_for_out, &out_id, &mut guards, &kill_handle, event)
+                        .await;
+                }
             }
         } else if let Some(kind) = json_kind.filter(|kind| crate::protocol::json_event_kind_supported(kind))
         {
@@ -3498,12 +3696,22 @@ async fn pump_child(inputs: PumpInputs) {
                     let mut events = Vec::new();
                     parser.feed(&format!("{line}\n"), &mut |event| events.push(event));
                     for event in events {
-                        push_lane_event(&runs_for_out, &out_id, event);
+                        push_guarded_lane_event(
+                            &runs_for_out,
+                            &out_id,
+                            &mut guards,
+                            &kill_handle,
+                            event,
+                        )
+                        .await;
                     }
                 }
-                parser.flush(&mut |event| {
-                    push_lane_event(&runs_for_out, &out_id, event);
-                });
+                let mut tail = Vec::new();
+                parser.flush(&mut |event| tail.push(event));
+                for event in tail {
+                    push_guarded_lane_event(&runs_for_out, &out_id, &mut guards, &kill_handle, event)
+                        .await;
+                }
             }
         } else if let Some(stdout) = stdout {
             // The plain/BYOK lane streams the child's stdout to the renderer.
@@ -3519,13 +3727,40 @@ async fn pump_child(inputs: PumpInputs) {
                     Ok(0) => break,
                     Ok(_) => {
                         let chunk = String::from_utf8_lossy(&buf).into_owned();
-                        plain_total += chunk.len() as u64;
-                        crate::plain_stream::append_plain_artifact_head(&mut plain_head, &chunk);
-                        runs_for_out.push_external_event(
-                            &out_id,
-                            "stdout",
-                            serde_json::json!({ "runId": out_id, "chunk": chunk }),
-                        );
+                        // Parity: the plain lane's stdout is guarded too, so a
+                        // fabricated marker never reaches the renderer.
+                        let safe = guards.role.feed_text(&chunk);
+                        if !safe.is_empty() {
+                            plain_total += safe.len() as u64;
+                            crate::plain_stream::append_plain_artifact_head(
+                                &mut plain_head,
+                                &safe,
+                            );
+                            runs_for_out.push_external_event(
+                                &out_id,
+                                "stdout",
+                                serde_json::json!({ "runId": out_id, "chunk": safe }),
+                            );
+                        }
+                        if guards.role.contaminated() && !guards.role_aborted {
+                            guards.role_aborted = true;
+                            if let Some(mut warning) = guards.role.warning_event() {
+                                if let serde_json::Value::Object(ref mut map) = warning {
+                                    map.insert(
+                                        "runId".to_string(),
+                                        serde_json::json!(out_id),
+                                    );
+                                }
+                                let marker = warning
+                                    .get("marker")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("role marker")
+                                    .to_string();
+                                runs_for_out.push_external_event(&out_id, "agent", warning);
+                                abort_for_role_marker(&runs_for_out, &out_id, &marker);
+                                kill_guarded_child(&kill_handle).await;
+                            }
+                        }
                     }
                     Err(_) => break,
                 }

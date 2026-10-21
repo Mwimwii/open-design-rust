@@ -94,6 +94,87 @@ async fn health_ready_projects_over_real_socket() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn media_task_list_matches_the_typescript_shape() {
+    let paths = temp_paths("media-tasks");
+    let project_dir = paths.projects_dir().join("p1");
+    std::fs::create_dir_all(&project_dir).expect("project dir");
+    std::fs::write(project_dir.join("shot.png"), b"png-bytes").expect("write file");
+    let daemon = RunningDaemon::start(config_with(paths, None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+
+    daemon
+        .state
+        .store
+        .execute(
+            "INSERT INTO projects (id, name, created_at, updated_at) VALUES ('p1', 'Demo', 1, 2)",
+            (),
+        )
+        .expect("insert project");
+    // A finished task with a file that still exists, plus a live one.
+    daemon
+        .state
+        .store
+        .execute(
+            "INSERT INTO media_tasks (id, project_id, run_id, status, surface, model, \
+             progress_json, file_json, error_json, started_at, ended_at, created_at, updated_at) \
+             VALUES ('m1', 'p1', 'r1', 'done', 'image', 'img-1', \
+             '[\"a\",\"b\",\"c\",\"d\"]', '{\"name\":\"shot.png\"}', NULL, 1000, 4500, 1000, 4500)",
+            (),
+        )
+        .expect("insert done task");
+    daemon
+        .state
+        .store
+        .execute(
+            "INSERT INTO media_tasks (id, project_id, run_id, status, surface, model, \
+             progress_json, file_json, error_json, started_at, ended_at, created_at, updated_at) \
+             VALUES ('m2', 'p1', 'r1', 'running', 'image', 'img-1', \
+             '[]', NULL, NULL, 2000, NULL, 2000, 2000)",
+            (),
+        )
+        .expect("insert running task");
+
+    // Default: terminal rows are filtered out.
+    let (head, body) = http_get(addr, "/api/projects/p1/media/tasks", None).await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let tasks = value["tasks"].as_array().expect("tasks");
+    assert_eq!(tasks.len(), 1, "only the live task: {body}");
+    assert_eq!(tasks[0]["taskId"], "m2");
+
+    // includeDone=1 keeps the done row, confirms its file, and reports the
+    // last three progress lines + batch coordinates.
+    let (head, body) = http_get(addr, "/api/projects/p1/media/tasks?includeDone=1", None).await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let tasks = value["tasks"].as_array().expect("tasks");
+    assert_eq!(tasks.len(), 2, "both tasks: {body}");
+    assert_eq!(tasks[0]["taskId"], "m2");
+    let done = &tasks[1];
+    assert_eq!(done["taskId"], "m1");
+    assert_eq!(done["status"], "done");
+    assert_eq!(done["file"]["name"], "shot.png");
+    assert_eq!(done["file"]["kind"], "image");
+    assert_eq!(done["file"]["mime"], "image/png");
+    assert_eq!(done["file"]["size"], 9);
+    assert_eq!(done["progress"].as_array().expect("progress").len(), 3);
+    assert_eq!(done["progress"][0], "b");
+    assert_eq!(done["progressCount"], 4);
+    assert_eq!(done["elapsed"], 3);
+    // Same run + same surface + overlapping lifetimes → one batch of two.
+    assert_eq!(done["batchSize"], 2);
+    assert_eq!(done["batchIndex"], 1);
+    assert_eq!(tasks[0]["batchIndex"], 2);
+    assert!(done.get("error").is_none(), "done tasks carry no error");
+
+    let (head, body) = http_get(addr, "/api/projects/nope/media/tasks", None).await;
+    assert!(head.contains("404"), "status: {head}");
+    assert!(body.contains("PROJECT_NOT_FOUND"), "body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_layer_matches_typescript_rules() {
     let config = config_with(temp_paths("auth"), Some(TOKEN));
     let store = Store::open(&config.paths.db_file()).expect("store");

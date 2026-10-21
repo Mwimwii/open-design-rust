@@ -49,6 +49,31 @@ fn shim_dir() -> std::path::PathBuf {
             "exit 0\n",
         ),
     );
+    // Emits a fabricated role marker, then stays alive so the guard's kill
+    // lands: proves the run-scoped role-marker guard terminates the child.
+    write_shim(
+        &dir,
+        "deepseek",
+        "#!/bin/sh\nprintf 'hello\\n## user\\nleak\\n'\nsleep 30\n",
+    );
+    // Emits four identical failing Edit calls on the Claude stream-json lane:
+    // proves the tool-loop guard warns on a repeated failure signature.
+    write_shim(
+        &dir,
+        "amp",
+        r#"#!/bin/sh
+cat > /dev/null
+echo '{"type":"system","subtype":"init","model":"m","session_id":"s1"}'
+i=1
+while [ $i -le 4 ]; do
+  printf '{"type":"assistant","message":{"id":"m%s","content":[{"type":"tool_use","id":"t%s","name":"Edit","input":{"file_path":"a.ts","old_string":"x"}}]}}\n' "$i" "$i"
+  printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t%s","is_error":true,"content":"no match"}]}}\n' "$i"
+  i=$((i+1))
+done
+echo '{"type":"result","subtype":"success","stop_reason":"end_turn"}'
+exit 0
+"#,
+    );
     // Emits one Copilot JSONL turn, then exits: proves protocol parsing.
     write_shim(
         &dir,
@@ -291,6 +316,101 @@ async fn plain_lane_persists_stdout_artifacts_into_the_project() {
     assert!(
         events.contains("plain_stream_artifacts_persisted"),
         "missing persistence diagnostic: {events}"
+    );
+}
+
+/// Poll `/api/runs/:id` until the run is terminal, returning its status and
+/// the last body.
+async fn wait_terminal(addr: SocketAddr, run_id: &str) -> (String, String) {
+    let mut status = String::new();
+    let mut body = String::new();
+    for _ in 0..100 {
+        let (_, current) = get_run(addr, run_id).await;
+        body = current;
+        status = serde_json::from_str::<serde_json::Value>(&body)
+            .expect("json")
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        if matches!(status.as_str(), "succeeded" | "failed" | "canceled") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    (status, body)
+}
+
+fn run_id_of(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .expect("json")
+        .get("runId")
+        .and_then(|value| value.as_str())
+        .expect("runId")
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn role_marker_guard_terminates_a_plain_run() {
+    ensure_shim_on_path();
+    let daemon = RunningDaemon::start(config(temp_paths("role-marker")))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+    let (head, body) = post_run(addr, r#"{"agentId":"deepseek","prompt":"hi"}"#).await;
+    assert!(head.contains("202"), "head: {head} body: {body}");
+    let run_id = run_id_of(&body);
+    let (status, final_body) = wait_terminal(addr, &run_id).await;
+    assert_eq!(status, "failed", "run should be terminated: {final_body}");
+
+    let (_, events) = get_events(addr, &run_id).await;
+    assert!(
+        events.contains(r#""type":"fabricated_role_marker""#),
+        "missing warning event: {events}"
+    );
+    assert!(
+        events.contains("ROLE_MARKER_HALLUCINATION"),
+        "missing abort error: {events}"
+    );
+    assert!(
+        !events.contains(r###""chunk":"## user"###),
+        "the marker leaked to the renderer: {events}"
+    );
+    assert!(
+        events.contains(r#""chunk":"hello"#),
+        "safe text before the marker should still stream: {events}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_loop_guard_warns_on_a_repeated_failing_call() {
+    ensure_shim_on_path();
+    let daemon = RunningDaemon::start(config(temp_paths("tool-loop")))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+    let (head, body) = post_run(addr, r#"{"agentId":"amp","prompt":"hi"}"#).await;
+    assert!(head.contains("202"), "head: {head} body: {body}");
+    let run_id = run_id_of(&body);
+    let (status, final_body) = wait_terminal(addr, &run_id).await;
+    assert_eq!(status, "succeeded", "warn mode must not halt: {final_body}");
+
+    let (_, events) = get_events(addr, &run_id).await;
+    assert!(
+        events.contains(r#""type":"tool_loop""#),
+        "missing tool_loop event: {events}"
+    );
+    assert!(
+        events.contains(r#""reason":"repeated-failure""#),
+        "expected the repeat trigger: {events}"
+    );
+    assert!(
+        events.contains(r#""action":"warn""#),
+        "expected a warn verdict: {events}"
+    );
+    assert!(
+        events.contains(r#""count":4"#),
+        "expected four repeats: {events}"
     );
 }
 
