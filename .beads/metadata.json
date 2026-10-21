@@ -2,6 +2,6 @@
   "database": "dolt",
   "backend": "dolt",
   "dolt_mode": "embedded",
-  "dolt_database": "open_design_rust",
-  "project_id": "07df1266-a9e8-4efe-b84d-8dd2975aed0b"
+  "dolt_database": "workspace",
+  "project_id": "edda737a-d059-4106-8f6d-308ab9ad7055"
 }
