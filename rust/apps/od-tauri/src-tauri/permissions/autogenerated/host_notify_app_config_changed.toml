@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-host-notify-app-config-changed"
+description = "Enables the host_notify_app_config_changed command without any pre-configured scope."
+commands.allow = ["host_notify_app_config_changed"]
+
+[[permission]]
+identifier = "deny-host-notify-app-config-changed"
+description = "Denies the host_notify_app_config_changed command without any pre-configured scope."
+commands.deny = ["host_notify_app_config_changed"]

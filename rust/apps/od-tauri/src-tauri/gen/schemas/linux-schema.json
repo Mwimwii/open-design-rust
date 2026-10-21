@@ -513,6 +513,18 @@
           "markdownDescription": "Enables the host_clear_browser_data command without any pre-configured scope."
         },
         {
+          "description": "Enables the host_export_diagnostics command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-host-export-diagnostics",
+          "markdownDescription": "Enables the host_export_diagnostics command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the host_notify_app_config_changed command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-host-notify-app-config-changed",
+          "markdownDescription": "Enables the host_notify_app_config_changed command without any pre-configured scope."
+        },
+        {
           "description": "Enables the host_open_path command without any pre-configured scope.",
           "type": "string",
           "const": "allow-host-open-path",
@@ -601,6 +613,18 @@
           "type": "string",
           "const": "deny-host-clear-browser-data",
           "markdownDescription": "Denies the host_clear_browser_data command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the host_export_diagnostics command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-host-export-diagnostics",
+          "markdownDescription": "Denies the host_export_diagnostics command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the host_notify_app_config_changed command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-host-notify-app-config-changed",
+          "markdownDescription": "Denies the host_notify_app_config_changed command without any pre-configured scope."
         },
         {
           "description": "Denies the host_open_path command without any pre-configured scope.",

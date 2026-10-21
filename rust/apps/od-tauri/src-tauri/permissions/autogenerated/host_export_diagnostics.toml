@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-host-export-diagnostics"
+description = "Enables the host_export_diagnostics command without any pre-configured scope."
+commands.allow = ["host_export_diagnostics"]
+
+[[permission]]
+identifier = "deny-host-export-diagnostics"
+description = "Denies the host_export_diagnostics command without any pre-configured scope."
+commands.deny = ["host_export_diagnostics"]

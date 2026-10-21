@@ -232,6 +232,50 @@ const BRIDGE_SOURCE: &str = r#"(function () {
     value: bridge,
     writable: true
   });
+
+  // The Electron preload exposed a second global beside `__od__`:
+  // `window.openDesignDesktop = { exportDiagnostics() }`. It is deliberately
+  // not part of `__od__` (the host-bridge validator in packages/host does not
+  // know it); the web app only probes it to choose the native save dialog over
+  // the browser download. Same result envelope as the Electron IPC handler.
+  var desktop = {
+    exportDiagnostics: function () {
+      return invoke('host_export_diagnostics', {});
+    }
+  };
+  Object.defineProperty(window, 'openDesignDesktop', {
+    configurable: true,
+    enumerable: true,
+    value: desktop,
+    writable: true
+  });
+
+  // `open-design:app-config-changed`: the Electron preload re-dispatched the
+  // main process's `od:app-config-changed` IPC as a DOM event, which
+  // apps/web/src/App.tsx listens for to re-read config. The shell emits the
+  // same event over Tauri's event bus; bridge it into the page. Subscribing is
+  // best-effort and deferred: an initialization script is not ordered against
+  // Tauri's own, so `__TAURI_INTERNALS__` may not exist yet.
+  function onHostEvent(name, handler, attempts) {
+    var internals = window.__TAURI_INTERNALS__;
+    if (internals && typeof internals.invoke === 'function' &&
+        typeof internals.transformCallback === 'function') {
+      var id = internals.transformCallback(function () { handler(); });
+      Promise.resolve(internals.invoke('plugin:event|listen', {
+        event: name,
+        target: { kind: 'Any' },
+        handler: id
+      })).catch(function () {});
+      return;
+    }
+    if ((attempts || 0) >= 50) return;
+    setTimeout(function () {
+      onHostEvent(name, handler, (attempts || 0) + 1);
+    }, 100);
+  }
+  onHostEvent('od:app-config-changed', function () {
+    window.dispatchEvent(new CustomEvent('open-design:app-config-changed'));
+  });
 })();
 "#;
 
@@ -340,11 +384,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn script_exposes_the_desktop_diagnostics_extra() {
+        // The web app's ExportDiagnosticsButton takes the native path only when
+        // `window.openDesignDesktop.exportDiagnostics` exists; without the
+        // extra it silently falls back to a browser download.
+        let script = script(&facts());
+        assert!(script.contains("'openDesignDesktop'"));
+        assert!(script.contains("exportDiagnostics"));
+        assert!(script.contains("host_export_diagnostics"));
+    }
+
+    #[test]
+    fn script_bridges_the_app_config_changed_event() {
+        // Parity: apps/web/src/App.tsx listens for the DOM event, which the
+        // Electron preload re-dispatched from its `od:app-config-changed` IPC.
+        let script = script(&facts());
+        assert!(script.contains("od:app-config-changed"));
+        assert!(script.contains("open-design:app-config-changed"));
+        assert!(script.contains("plugin:event|listen"));
+        assert!(script.contains("transformCallback"));
+    }
+
     /// Catches a syntax error in the injected script, which would otherwise
     /// only show up as an app that silently has no host bridge.
     #[test]
-    fn script_parses_as_javascript_when_node_is_available() {
-        let script = script(&facts());
+    fn script_parses_as_javascript_when_node_is_available() {        let script = script(&facts());
         let dir = std::env::temp_dir().join("od-tauri-bridge-check");
         if std::fs::create_dir_all(&dir).is_err() {
             return;

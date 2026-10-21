@@ -74,6 +74,27 @@
           }
           p('isOpenDesignHostBridge verdict', verdict);
         }
+        // The two host surfaces 7c7.4 added beside `__od__`. Presence only for
+        // exportDiagnostics: invoking it opens a native save dialog, which a
+        // headless window cannot answer.
+        p('typeof window.openDesignDesktop', typeof window.openDesignDesktop);
+        p(
+          'openDesignDesktop.exportDiagnostics',
+          typeof window.openDesignDesktop?.exportDiagnostics,
+        );
+        // Parity with apps/web/src/App.tsx: the app listens for this DOM event
+        // to re-read config. The host emits it over the Tauri event bus; the
+        // bridge must turn that into the DOM event.
+        const appConfigChanged = new Promise((resolve) => {
+          window.addEventListener('open-design:app-config-changed', () => resolve(true), { once: true });
+          setTimeout(() => resolve(false), 2000);
+        });
+        try {
+          await window.__TAURI_INTERNALS__.invoke('host_notify_app_config_changed');
+        } catch (error) {
+          p('invoke host_notify_app_config_changed ERROR', String(error));
+        }
+        p('open-design:app-config-changed dispatched', await appConfigChanged);
         // A real round trip, so the ACL is exercised and not merely declared:
         // these three commands are granted to the daemon origin in
         // `capabilities/default.json`.

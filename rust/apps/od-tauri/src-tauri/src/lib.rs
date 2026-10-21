@@ -57,6 +57,8 @@ pub fn run() {
             host::misc::host_clear_browser_data,
             host::misc::host_set_theme,
             host::misc::host_set_pet_visible,
+            host::diagnostics::host_export_diagnostics,
+            host::diagnostics::host_notify_app_config_changed,
         ])
         .setup(|app| shell::setup(app))
         .build(tauri::generate_context!())

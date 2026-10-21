@@ -32,13 +32,13 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use od_daemon::diagnostics::manifest;
 use serde_json::{json, Value};
-use tauri::{AppHandle, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
 use super::success;
-use crate::diagnostics::manifest;
 use crate::shell::ShellState;
 
 /// The daemon route the bundle is fetched from.
@@ -46,9 +46,6 @@ pub const DIAGNOSTICS_EXPORT_PATH: &str = "/api/diagnostics/export";
 /// `DIAGNOSTICS_FILENAME_PREFIX`-equivalent; kept as the literal the same way
 /// `open_design_diagnostics` string appears in the bridge below.
 pub const DIAGNOSTICS_FILENAME_PREFIX: &str = "open-design-diagnostics";
-/// The DOM CustomEvent the web app listens for
-/// (`apps/web/src/App.tsx` → `open-design:app-config-changed`).
-pub const APP_CONFIG_CHANGED_DOM_EVENT: &str = "open-design:app-config-changed";
 /// The Tauri event that re-dispatches the DOM event (parity with the
 /// Electron preload's `od:app-config-changed` IPC channel).
 pub const APP_CONFIG_CHANGED_TAURI_EVENT: &str = "od:app-config-changed";
@@ -178,8 +175,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cancelled_maps_to_the_absent_envelope() {
-        let wire = ExportOutcome::Cancelled.to_wire();
+    fn cancelled_maps_to_the_absent_envelope() {        let wire = ExportOutcome::Cancelled.to_wire();
         assert_eq!(wire["ok"], json!(false));
         assert_eq!(wire["cancelled"], json!(true));
         assert!(wire.get("message").is_none());
@@ -214,5 +210,46 @@ mod tests {
         let failed = serde_json::to_string(&ExportOutcome::Failed("x".to_string()).to_wire()).unwrap();
         assert!(failed.contains("\"cancelled\":false") && failed.contains("\"message\":\"x\""));
         assert!(!failed.contains("reason"));
+    }
+
+    /// Minimal one-shot HTTP server: answers a single request with `status`
+    /// and `body`, so the bundle fetch is exercised over a real socket.
+    fn serve_once(status: &'static str, body: &'static [u8]) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn bundle_fetch_returns_the_daemon_bytes() {
+        // `fetchDiagnosticsBundle` (apps/desktop/src/main/diagnostics-fetch.ts)
+        // returns the response body unchanged; the shell must not re-zip it.
+        let base = serve_once("200 OK", b"PK\x03\x04bundle-bytes");
+        let bytes = fetch_diagnostics_bundle(&base).await.expect("fetch");
+        assert_eq!(bytes, b"PK\x03\x04bundle-bytes");
+    }
+
+    #[tokio::test]
+    async fn bundle_fetch_reports_the_http_status() {
+        // The Electron host throws `GET … failed with HTTP <status>`; the
+        // message reaches the renderer in the failure envelope.
+        let base = serve_once("500 Internal Server Error", b"nope");
+        let err = fetch_diagnostics_bundle(&base).await.expect_err("must fail");
+        assert!(err.contains("HTTP 500"), "{err}");
     }
 }

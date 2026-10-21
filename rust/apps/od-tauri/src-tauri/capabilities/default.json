@@ -27,6 +27,8 @@
     "allow-host-updater",
     "allow-host-clear-browser-data",
     "allow-host-set-theme",
-    "allow-host-set-pet-visible"
+    "allow-host-set-pet-visible",
+    "allow-host-export-diagnostics",
+    "allow-host-notify-app-config-changed"
   ]
 }

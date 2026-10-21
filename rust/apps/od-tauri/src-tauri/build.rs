@@ -33,6 +33,8 @@ fn main() {
             "host_clear_browser_data",
             "host_set_theme",
             "host_set_pet_visible",
+            "host_export_diagnostics",
+            "host_notify_app_config_changed",
         ]),
     ))
     .expect("failed to run tauri-build");
