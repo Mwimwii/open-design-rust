@@ -35,6 +35,20 @@ fn shim_dir() -> std::path::PathBuf {
         "claude",
         "#!/bin/sh\ncat > /dev/null\nsleep 30\n",
     );
+    // Emits one plain-lane artifact tag, then exits: proves the finalizer
+    // persists stdout artifacts into the project with their manifest.
+    write_shim(
+        &dir,
+        "aider",
+        concat!(
+            "#!/bin/sh\n",
+            "case \"$1\" in --version) echo 'aider 0.0.0'; exit 0;; esac\n",
+            "printf '%s\\n' '<artifact identifier=\"hero\" type=\"text/html\" title=\"Hero\">'\n",
+            "printf '%s\\n' '<html><body>artifact-body</body></html>'\n",
+            "printf '%s\\n' '</artifact>'\n",
+            "exit 0\n",
+        ),
+    );
     // Emits one Copilot JSONL turn, then exits: proves protocol parsing.
     write_shim(
         &dir,
@@ -197,6 +211,86 @@ async fn spawned_shim_runs_to_succeeded_with_stdout_events() {
     assert!(
         events.contains("\"chunk\""),
         "stdout payload lacks the contract's chunk field: {events}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_lane_persists_stdout_artifacts_into_the_project() {
+    ensure_shim_on_path();
+    let paths = temp_paths("artifacts");
+    let data_dir = paths.data_dir().to_path_buf();
+    let daemon = RunningDaemon::start(config(paths)).await.expect("start");
+    daemon
+        .state
+        .store
+        .execute(
+            "INSERT INTO projects (id, name, created_at, updated_at) VALUES ('p1', 'Demo', 1, 2)",
+            (),
+        )
+        .expect("insert p1");
+    // Parity: `ensureProject` creates the managed project directory before a
+    // run can spawn with it as cwd.
+    std::fs::create_dir_all(data_dir.join("projects").join("p1")).expect("project dir");
+    let addr = daemon.addr();
+    let (head, body) = post_run(
+        addr,
+        r#"{"agentId":"aider","prompt":"hi","model":"default","projectId":"p1"}"#,
+    )
+    .await;
+    assert!(head.contains("202"), "head: {head} body: {body}");
+    let run_id: String = serde_json::from_str::<serde_json::Value>(&body)
+        .expect("json")
+        .get("runId")
+        .and_then(|v| v.as_str())
+        .expect("runId")
+        .to_string();
+    let mut status = String::new();
+    for _ in 0..100 {
+        let (_, body) = get_run(addr, &run_id).await;
+        status = serde_json::from_str::<serde_json::Value>(&body)
+            .expect("json")
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if matches!(status.as_str(), "succeeded" | "failed" | "canceled") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let (_, final_body) = get_run(addr, &run_id).await;
+    assert_eq!(status, "succeeded", "run did not succeed: {final_body}");
+
+    let project_dir = data_dir.join("projects").join("p1");
+    let artifact = project_dir.join("hero.html");
+    assert!(
+        artifact.exists(),
+        "artifact missing at {}: {:?}",
+        artifact.display(),
+        std::fs::read_dir(&project_dir).map(|entries| entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>())
+    );
+    assert!(std::fs::read_to_string(&artifact)
+        .expect("artifact body")
+        .contains("artifact-body"));
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(project_dir.join("hero.html.artifact.json")).expect("manifest"),
+    )
+    .expect("manifest json");
+    assert_eq!(manifest["version"], 1);
+    assert_eq!(manifest["kind"], "html");
+    assert_eq!(manifest["entry"], "hero.html");
+
+    let (_, events) = get_events(addr, &run_id).await;
+    assert!(
+        events.contains(r#""type":"artifact""#),
+        "missing artifact frame: {events}"
+    );
+    assert!(
+        events.contains("plain_stream_artifacts_persisted"),
+        "missing persistence diagnostic: {events}"
     );
 }
 

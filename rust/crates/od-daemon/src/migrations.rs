@@ -912,7 +912,7 @@ fn matches_natural_unique(sql: &str) -> bool {
 
 /// `new Date(milliseconds).toISOString()`, including the extended `±YYYYYY`
 /// form JavaScript uses for years outside 0000–9999.
-fn to_iso8601_utc(ms: i64) -> String {
+pub(crate) fn to_iso8601_utc(ms: i64) -> String {
     const MS_PER_DAY: i64 = 86_400_000;
     let days = ms.div_euclid(MS_PER_DAY);
     let ms_of_day = ms.rem_euclid(MS_PER_DAY);

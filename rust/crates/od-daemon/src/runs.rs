@@ -1154,6 +1154,40 @@ impl Runs {
         }
     }
 
+    /// Payloads of every event with `event` still in the ring buffer.
+    /// Parity: the finalizer's `run.events` scan.
+    fn event_payloads(&self, run_id: &str, event: &str) -> Vec<Value> {
+        self.get(run_id)
+            .map(|run| {
+                run.events
+                    .iter()
+                    .filter(|record| record.event == event)
+                    .map(|record| record.data.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Finish a run as failed with an explicit error code (parity: the
+    /// artifact-persistence failure path's `AGENT_EXECUTION_FAILED`).
+    fn finish_with_error_code(&self, run_id: &str, error_code: &str, detail: &str) {
+        {
+            let mut registry = lock(&self.inner);
+            let Some(run) = registry.runs.get_mut(run_id) else {
+                return;
+            };
+            if run.is_terminal() {
+                return;
+            }
+            run.error = Some(detail.to_string());
+            run.error_code = Some(error_code.to_string());
+            run.failure_category = Some("agent_error".to_string());
+            run.failure_detail = Some(detail.to_string());
+            run.retryable = Some(false);
+        }
+        self.finish(run_id, "failed", Some(0), None);
+    }
+
     /// Record a spawn-time failure and finish the run as failed (parity:
     /// the daemon failing a run when the agent binary is missing).
     /// A missing binary answers AGENT_UNAVAILABLE (retryable, mirroring the
@@ -3214,15 +3248,25 @@ async fn setup_and_spawn(setup: SpawnSetup) {
     } else {
         None
     };
-    pump_child(
+    // Parity: a succeeded plain-lane run with a project persists the
+    // artifacts its stdout carried. `cwd` is the resolved project directory
+    // (`resolveProjectDir`), which is the write base for managed projects and
+    // the external root for imported ones.
+    let plain_artifact_base = if def.stream_format == "plain" && project_id.is_some() {
+        cwd.as_deref().map(std::path::PathBuf::from)
+    } else {
+        None
+    };
+    pump_child(PumpInputs {
         runs,
         run_id,
         handle,
         stdin_bytes,
         prompt_file,
-        def.stream_format,
+        stream_format: def.stream_format,
         json_kind,
-    )
+        plain_artifact_base,
+    })
     .await;
 }
 
@@ -3340,7 +3384,7 @@ fn stage_prompt_file(run_id: &str, prompt: &str) -> Result<String, String> {
 /// runtime's parser (or stream it raw on the plain lane), drain stderr, then
 /// finish the run from the exit status. Cancellation wins races via `finish`'s
 /// terminal guard.
-async fn pump_child(
+struct PumpInputs {
     runs: Runs,
     run_id: String,
     handle: Arc<tokio::sync::Mutex<tokio::process::Child>>,
@@ -3348,7 +3392,22 @@ async fn pump_child(
     prompt_file: Option<String>,
     stream_format: &'static str,
     json_kind: Option<&'static str>,
-) {
+    /// Project directory for the plain-lane artifact write, when the run has
+    /// a project. `None` skips persistence.
+    plain_artifact_base: Option<std::path::PathBuf>,
+}
+
+async fn pump_child(inputs: PumpInputs) {
+    let PumpInputs {
+        runs,
+        run_id,
+        handle,
+        stdin_bytes,
+        prompt_file,
+        stream_format,
+        json_kind,
+        plain_artifact_base,
+    } = inputs;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     if let Some(bytes) = stdin_bytes {
         let mut stdin = {
@@ -3367,6 +3426,13 @@ async fn pump_child(
     let runs_for_out = runs.clone();
     let out_id = run_id.clone();
     let out_task = tokio::spawn(async move {
+        // Parity: the plain-lane artifact head/tail windows. The head keeps
+        // the first CAP bytes; the tail is reconstructed from `stdout` events
+        // after the pump finishes. TS keeps these on the run object because
+        // its finalizer is a separate function; here the pump is the
+        // finalizer, so they stay local.
+        let mut plain_head = String::new();
+        let mut plain_total = 0u64;
         if stream_format == "claude-stream-json" {
             // Claude Code's stream-json wire maps onto UI-lane events;
             // anything else on a line is a bounded raw event.
@@ -3453,6 +3519,8 @@ async fn pump_child(
                     Ok(0) => break,
                     Ok(_) => {
                         let chunk = String::from_utf8_lossy(&buf).into_owned();
+                        plain_total += chunk.len() as u64;
+                        crate::plain_stream::append_plain_artifact_head(&mut plain_head, &chunk);
                         runs_for_out.push_external_event(
                             &out_id,
                             "stdout",
@@ -3463,6 +3531,7 @@ async fn pump_child(
                 }
             }
         }
+        (plain_head, plain_total)
     });
     let err_task = tokio::spawn(async move {
         let mut tail = Vec::new();
@@ -3481,14 +3550,56 @@ async fn pump_child(
         let mut child = handle.lock().await;
         child.wait().await
     };
-    let _ = out_task.await;
+    let (plain_head, plain_total) = out_task.await.unwrap_or_default();
     let stderr_tail = err_task.await.unwrap_or_default();
     if let Some(path) = prompt_file {
         let _ = std::fs::remove_file(path);
     }
     match status {
         Ok(status) => match spawn::classify_exit(status) {
-            Ok(0) => runs.finish(&run_id, "succeeded", Some(0), None),
+            Ok(0) => {
+                if let Some(base) = plain_artifact_base.as_deref() {
+                    if let Err(message) = persist_plain_stream_artifacts(
+                        &runs,
+                        &run_id,
+                        base,
+                        &plain_head,
+                        plain_total,
+                    ) {
+                        let failure =
+                            format!("Failed to persist plain-stream artifact(s): {message}");
+                        runs.push_external_event(
+                            &run_id,
+                            "agent",
+                            serde_json::json!({
+                                "runId": run_id,
+                                "type": "diagnostic",
+                                "name": "plain_stream_artifacts_persist_failed",
+                                "source": "daemon-run-finalize",
+                                "message": message,
+                            }),
+                        );
+                        runs.push_external_event(
+                            &run_id,
+                            "error",
+                            serde_json::json!({
+                                "message": failure,
+                                "error": {
+                                    "code": "AGENT_EXECUTION_FAILED",
+                                    "message": failure,
+                                },
+                            }),
+                        );
+                        runs.finish_with_error_code(
+                            &run_id,
+                            "AGENT_EXECUTION_FAILED",
+                            &failure,
+                        );
+                        return;
+                    }
+                }
+                runs.finish(&run_id, "succeeded", Some(0), None)
+            }
             Ok(code) => {
                 runs.finish_with_failure(
                     &run_id,
@@ -3505,6 +3616,72 @@ async fn pump_child(
             runs.finish_with_failure(&run_id, None, None, &format!("failed waiting on agent: {err}"));
         }
     }
+}
+
+/// Parity: the `status === 'succeeded' && streamFormat === 'plain' &&
+/// projectId` finalize block in `apps/daemon/src/server.ts`. Reconstructs the
+/// stdout from the head window plus the event tail, extracts once (or twice
+/// across a true gap), persists through the project write path, and emits the
+/// artifact/diagnostic frames.
+fn persist_plain_stream_artifacts(
+    runs: &Runs,
+    run_id: &str,
+    base: &std::path::Path,
+    head: &str,
+    total_bytes: u64,
+) -> Result<(), String> {
+    let tail =
+        crate::plain_stream::plain_stdout_from_events(&runs.event_payloads(run_id, "stdout"));
+    let mut artifacts = Vec::new();
+    for window in crate::plain_stream::plain_stdout_windows(head, &tail, total_bytes) {
+        artifacts.extend(crate::plain_stream::extract_plain_stream_artifacts(&window));
+    }
+    if artifacts.is_empty() {
+        return Ok(());
+    }
+    let existing_names: Vec<String> = crate::project_files::list_files(base, None)
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .filter_map(|file| {
+            file.get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    let persisted =
+        crate::plain_stream::persist_plain_stream_artifact_list(base, &artifacts, &existing_names)
+            .map_err(|err| err.to_string())?;
+    if persisted.is_empty() {
+        return Ok(());
+    }
+    for artifact in &persisted {
+        runs.push_external_event(
+            run_id,
+            "agent",
+            serde_json::json!({
+                "runId": run_id,
+                "type": "artifact",
+                "source": "plain-stream",
+                "name": artifact.name,
+                "path": artifact.name,
+                "identifier": artifact.identifier,
+                "artifactType": artifact.artifact_type,
+            }),
+        );
+    }
+    runs.push_external_event(
+        run_id,
+        "agent",
+        serde_json::json!({
+            "runId": run_id,
+            "type": "diagnostic",
+            "name": "plain_stream_artifacts_persisted",
+            "source": "daemon-run-finalize",
+            "fileCount": persisted.len(),
+            "files": persisted.iter().map(|artifact| artifact.name.clone()).collect::<Vec<_>>(),
+        }),
+    );
+    Ok(())
 }
 
 fn project_cwd(state: &AppState, run: &Run) -> Option<String> {

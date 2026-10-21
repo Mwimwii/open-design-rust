@@ -458,6 +458,60 @@ pub fn resolve_under(base: &Path, rel: &str) -> Result<ResolvedFile, ProjectPath
     })
 }
 
+/// Write-side variant of [`resolve_under`] (parity: `resolveSafeReal`'s
+/// ENOENT branch): a target that does not exist yet is resolved by
+/// canonicalizing its longest existing prefix and re-appending the missing
+/// tail, so the containment check still catches a symlinked parent.
+pub fn resolve_under_write(base: &Path, rel: &str) -> Result<ResolvedFile, ProjectPathError> {
+    let base_real = std::fs::canonicalize(base).map_err(map_io)?;
+    let candidate = base_real.join(rel);
+    let real = match std::fs::canonicalize(&candidate) {
+        Ok(real) => real,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => resolve_existing_prefix(&candidate)?,
+        Err(err) => return Err(map_io(err)),
+    };
+    if !real.starts_with(&base_real) {
+        return Err(ProjectPathError::Escape);
+    }
+    let rel_real = real
+        .strip_prefix(&base_real)
+        .map(|value| value.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| rel.to_string());
+    Ok(ResolvedFile {
+        base: base_real,
+        path: real,
+        rel: rel_real,
+    })
+}
+
+/// `realpath(longest existing prefix) + missing tail` (parity:
+/// `resolveExistingPrefix`).
+fn resolve_existing_prefix(path: &Path) -> Result<PathBuf, ProjectPathError> {
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        match std::fs::canonicalize(&current) {
+            Ok(real) => {
+                let mut resolved = real;
+                for part in missing.iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(resolved);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = current.file_name().map(|name| name.to_os_string()) else {
+                    return Err(map_io(err));
+                };
+                missing.push(name);
+                if !current.pop() {
+                    return Err(map_io(err));
+                }
+            }
+            Err(err) => return Err(map_io(err)),
+        }
+    }
+}
+
 /// Missing paths are `NotFound` (→ 404); everything else stays an I/O error
 /// (→ 400), matching the TypeScript routes' ENOENT/other split.
 pub fn map_io(err: std::io::Error) -> ProjectPathError {

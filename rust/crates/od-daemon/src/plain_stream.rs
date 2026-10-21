@@ -285,6 +285,99 @@ pub fn artifact_manifest_for(artifact: &PlainStreamArtifact, entry: &str) -> Val
     }
 }
 
+/// Parity: `PLAIN_ARTIFACT_STDOUT_CAP` — the head window the run keeps for
+/// artifact extraction (8 MiB).
+pub const PLAIN_ARTIFACT_STDOUT_CAP: usize = 8 * 1024 * 1024;
+
+/// Append `chunk` to the bounded head window, truncating on a UTF-8 boundary
+/// when the cap is crossed. The TS original slices UTF-16 code units; Rust
+/// tracks UTF-8 bytes. Both are self-consistent seam units, and the stitched
+/// string is the same text either way.
+pub fn append_plain_artifact_head(head: &mut String, chunk: &str) {
+    if head.len() >= PLAIN_ARTIFACT_STDOUT_CAP {
+        return;
+    }
+    head.push_str(chunk);
+    if head.len() > PLAIN_ARTIFACT_STDOUT_CAP {
+        let mut end = PLAIN_ARTIFACT_STDOUT_CAP;
+        while end > 0 && !head.is_char_boundary(end) {
+            end -= 1;
+        }
+        head.truncate(end);
+    }
+}
+
+/// Parity: the finalize-time stitch of the head window and the event tail.
+/// Returns the windows to extract from: one when the windows overlap or are
+/// contiguous, two when a true gap separates them. Byte offsets are used
+/// consistently for `head` and `tail`, so the seam removes exactly the
+/// double-covered span.
+pub fn plain_stdout_windows(head: &str, tail: &str, total_bytes: u64) -> Vec<String> {
+    if head.is_empty() {
+        return vec![tail.to_string()];
+    }
+    let head_len = head.len() as u64;
+    let tail_start = total_bytes.saturating_sub(tail.len() as u64);
+    if tail_start <= head_len {
+        let skip = (head_len - tail_start) as usize;
+        let skip = skip.min(tail.len());
+        let mut stitched = String::with_capacity(head.len() + tail.len() - skip);
+        stitched.push_str(head);
+        stitched.push_str(&tail[skip..]);
+        vec![stitched]
+    } else {
+        vec![head.to_string(), tail.to_string()]
+    }
+}
+
+/// One persisted artifact (parity: `PersistedPlainStreamArtifact`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedPlainArtifact {
+    pub identifier: String,
+    pub artifact_type: String,
+    pub title: String,
+    pub name: String,
+    pub file: Value,
+}
+
+/// Parity: `persistPlainStreamArtifactList` — reserve a unique file name per
+/// artifact against the project's current inventory, then write the file and
+/// its manifest sidecar. `overwrite: false` makes a name collision a hard
+/// error rather than a silent replacement.
+pub fn persist_plain_stream_artifact_list(
+    base: &std::path::Path,
+    artifacts: &[PlainStreamArtifact],
+    existing_names: &[String],
+) -> Result<Vec<PersistedPlainArtifact>, crate::project_files::WriteProjectFileError> {
+    if artifacts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut reserved: HashSet<String> = existing_names.iter().cloned().collect();
+    let mut persisted = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let name = reserve_unique_artifact_file_name(&artifact.file_name, &mut reserved)
+            .map_err(|message| {
+                crate::project_files::WriteProjectFileError::Io(std::io::Error::other(message))
+            })?;
+        let manifest = artifact_manifest_for(artifact, &name);
+        let file = crate::project_files::write_project_file(
+            base,
+            &name,
+            artifact.content.as_bytes(),
+            false,
+            Some(&manifest),
+        )?;
+        persisted.push(PersistedPlainArtifact {
+            identifier: artifact.identifier.clone(),
+            artifact_type: artifact.artifact_type.clone(),
+            title: artifact.title.clone(),
+            name,
+            file,
+        });
+    }
+    Ok(persisted)
+}
+
 /// Parity: the `TYPE_TO_EXTENSION` table.
 fn extension_for(artifact_type: &str) -> Option<&'static str> {
     Some(match artifact_type {
@@ -933,6 +1026,90 @@ mod plain_stream_tests {
         assert_eq!(find_open_tag_end(r#" type="a>b'"#, 0), None);
         assert_eq!(find_open_tag_end(" type=", 0), None);
         assert_eq!(find_open_tag_end(">", 0), Some(1));
+    }
+
+    #[test]
+    fn stdout_windows_stitch_overlap_and_split_gaps() {
+        // Whole stream already fits the head window: tail is a suffix of it.
+        assert_eq!(
+            plain_stdout_windows("abcdef", "ef", 6),
+            vec!["abcdef".to_string()]
+        );
+        // Tail covers the head exactly.
+        assert_eq!(
+            plain_stdout_windows("abcdef", "abcdef", 6),
+            vec!["abcdef".to_string()]
+        );
+        // Overlap: the head keeps the first 6 bytes of a 10-byte stream.
+        assert_eq!(
+            plain_stdout_windows("abcdef", "cdefghij", 10),
+            vec!["abcdefghij".to_string()]
+        );
+        // Gap: the tail starts after the head ends, so both windows extract.
+        assert_eq!(
+            plain_stdout_windows("abc", "ghij", 10),
+            vec!["abc".to_string(), "ghij".to_string()]
+        );
+        // Empty head falls back to the tail.
+        assert_eq!(
+            plain_stdout_windows("", "ghij", 10),
+            vec!["ghij".to_string()]
+        );
+    }
+
+    #[test]
+    fn head_window_caps_on_a_char_boundary() {
+        let mut head = String::new();
+        append_plain_artifact_head(&mut head, "ok");
+        assert_eq!(head, "ok");
+        let big = "é".repeat(PLAIN_ARTIFACT_STDOUT_CAP);
+        append_plain_artifact_head(&mut head, &big);
+        assert!(head.len() <= PLAIN_ARTIFACT_STDOUT_CAP);
+        assert!(head.is_char_boundary(head.len()));
+        // Further chunks are ignored once the cap is reached.
+        append_plain_artifact_head(&mut head, "more");
+        assert!(head.len() <= PLAIN_ARTIFACT_STDOUT_CAP);
+    }
+
+    #[test]
+    fn persists_artifacts_with_unique_names_and_manifests() {
+        let base = std::env::temp_dir().join(format!(
+            "od-plain-persist-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let artifacts = extract_plain_stream_artifacts(concat!(
+            r#"<artifact identifier="hero" type="text/html" title="Hero">"#,
+            "<html><body>one</body></html>",
+            "</artifact>",
+            r#"<artifact identifier="hero" type="text/html" title="Hero">"#,
+            "<html><body>two</body></html>",
+            "</artifact>",
+        ));
+        assert_eq!(artifacts.len(), 2);
+
+        let persisted =
+            persist_plain_stream_artifact_list(&base, &artifacts, &["hero.html".to_string()])
+                .expect("persist");
+        assert_eq!(
+            persisted.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            vec!["hero-2.html", "hero-3.html"]
+        );
+        for artifact in &persisted {
+            let body = std::fs::read_to_string(base.join(&artifact.name)).expect("body");
+            assert!(body.contains("html"));
+            let manifest: Value = serde_json::from_str(
+                &std::fs::read_to_string(base.join(format!("{}.artifact.json", artifact.name)))
+                    .expect("manifest"),
+            )
+            .expect("manifest json");
+            assert_eq!(manifest["version"], json!(1));
+            assert_eq!(manifest["kind"], json!("html"));
+            assert_eq!(manifest["entry"], json!(artifact.name));
+            assert!(manifest["createdAt"].as_str().is_some());
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -15,8 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Map, Value};
 
 use crate::project_dir::{
-    assert_visible_for_imported_project, map_io, resolve_under, validate_project_path,
-    ProjectPathError, ResolvedFile,
+    assert_visible_for_imported_project, map_io, resolve_under, resolve_under_write,
+    validate_project_path, ProjectPathError, ResolvedFile,
 };
 
 /// Parity: `listFiles` `since` filter and the `text-preview` route clamps.
@@ -193,6 +193,239 @@ pub fn text_preview(
         "kind": kind,
         "poweredPreview": powered_preview,
     }))
+}
+
+/// Why a project file write failed. The route/run layer maps these onto
+/// `BAD_REQUEST` / `FILE_EXISTS` and a run-level persistence diagnostic.
+#[derive(Debug, thiserror::Error)]
+pub enum WriteProjectFileError {
+    /// Path validation or sandbox confinement rejected the name.
+    #[error(transparent)]
+    Path(#[from] ProjectPathError),
+    /// `overwrite: false` and the target already exists (parity: `EEXIST`).
+    #[error("file already exists")]
+    AlreadyExists,
+    /// Filesystem failure while creating the file or its sidecar.
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    /// The manifest could not be serialized (never happens for JSON values).
+    #[error("artifact manifest is not serializable")]
+    Manifest,
+}
+
+/// Port of `writeProjectFile`: validate the name, confine it inside the
+/// project, write the body, then write the `<name>.artifact.json` sidecar
+/// when the manifest passes validation.
+///
+/// Deliberate gaps (documented, tracked with the artifact write path):
+/// * `normalizeArtifactRuntimeImports` (the framer-motion UMD rewrite) is not
+///   ported, so an HTML artifact keeps the imports the model emitted;
+/// * the publication guard (`assertArtifactPublicationAllowed`) and the
+///   stub-regression guard are not ported, so a placeholder-bearing artifact
+///   that TS would reject with 422 is written here.
+pub fn write_project_file(
+    base: &Path,
+    name: &str,
+    body: &[u8],
+    overwrite: bool,
+    artifact_manifest: Option<&Value>,
+) -> Result<Value, WriteProjectFileError> {
+    let safe_name = validate_project_path(name)?;
+    std::fs::create_dir_all(base)?;
+    let target = resolve_under_write(base, &safe_name)?;
+    if !overwrite && target.path.exists() {
+        return Err(WriteProjectFileError::AlreadyExists);
+    }
+    if let Some(parent) = target.path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let manifest = artifact_manifest
+        .and_then(Value::as_object)
+        .and_then(|manifest| validate_manifest_input(manifest, &safe_name))
+        .map(|manifest| sanitize_manifest(&manifest, &safe_name));
+    std::fs::write(&target.path, body)?;
+    if let Some(manifest) = &manifest {
+        let sidecar_name = format!("{safe_name}.artifact.json");
+        let sidecar = resolve_under_write(base, &sidecar_name)?;
+        let serialized = serde_json::to_string_pretty(manifest)
+            .map_err(|_| WriteProjectFileError::Manifest)?;
+        std::fs::write(&sidecar.path, serialized)?;
+    }
+    let metadata = std::fs::metadata(&target.path)?;
+    let persisted = read_manifest_for_path(&target.base, &target.rel);
+    let mtime = metadata
+        .modified()
+        .map(system_time_ms)
+        .unwrap_or_default();
+    Ok(json!({
+        "name": target.rel,
+        "path": target.rel,
+        "size": metadata.len(),
+        "mtime": mtime,
+        "kind": kind_for(&target.rel),
+        "mime": mime_for(&target.rel),
+        "artifactKind": persisted.as_ref().and_then(|manifest| manifest.get("kind").cloned()),
+        "artifactManifest": persisted,
+    }))
+}
+
+/// Port of `validateArtifactManifestInput`'s acceptance rules (the daemon
+/// only writes manifests it built itself, so the error strings are not part
+/// of the surface). `None` means "skip the sidecar", matching TS's
+/// `{ ok: false }` branch.
+fn validate_manifest_input(manifest: &Map<String, Value>, entry: &str) -> Option<Map<String, Value>> {
+    let kind = manifest.get("kind")?.as_str()?;
+    if !ALLOWED_MANIFEST_KINDS.contains(&kind) {
+        return None;
+    }
+    let renderer = manifest.get("renderer")?.as_str()?;
+    if !ALLOWED_MANIFEST_RENDERERS.contains(&renderer) {
+        return None;
+    }
+    let exports = manifest.get("exports")?.as_array()?;
+    if exports.is_empty()
+        || exports
+            .iter()
+            .any(|export| !export.as_str().is_some_and(|value| ALLOWED_MANIFEST_EXPORTS.contains(&value)))
+    {
+        return None;
+    }
+    if let Some(status) = manifest.get("status") {
+        if !status.as_str().is_some_and(|value| ALLOWED_MANIFEST_STATUS.contains(&value)) {
+            return None;
+        }
+    }
+    if let Some(primary) = manifest.get("primary") {
+        let valid = primary.as_bool() == Some(true) || primary.as_str().is_some_and(is_valid_manifest_path);
+        if !valid {
+            return None;
+        }
+    }
+    if let Some(supporting) = manifest.get("supportingFiles") {
+        let files = supporting.as_array()?;
+        if files.len() > MAX_MANIFEST_SUPPORTING_FILES
+            || files.iter().any(|file| !file.as_str().is_some_and(is_valid_manifest_path))
+        {
+            return None;
+        }
+    }
+    if let Some(title) = manifest.get("title") {
+        let title = title.as_str()?;
+        if title.is_empty() || title.len() > MAX_MANIFEST_TITLE_LENGTH {
+            return None;
+        }
+    }
+    if let Some(source_skill_id) = manifest.get("sourceSkillId") {
+        if source_skill_id.as_str()?.len() > MAX_MANIFEST_SOURCE_SKILL_ID_LENGTH {
+            return None;
+        }
+    }
+    if let Some(design_system_id) = manifest.get("designSystemId") {
+        if !design_system_id.is_null()
+            && design_system_id.as_str()?.len() > MAX_MANIFEST_DESIGN_SYSTEM_ID_LENGTH
+        {
+            return None;
+        }
+    }
+    if let Some(metadata) = manifest.get("metadata") {
+        if !metadata.is_object() {
+            return None;
+        }
+        let serialized = serde_json::to_string(metadata).ok()?;
+        if serialized.len() > MAX_MANIFEST_METADATA_BYTES {
+            return None;
+        }
+    }
+    let manifest_entry = manifest
+        .get("entry")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(entry);
+    if !is_valid_manifest_path(manifest_entry) {
+        return None;
+    }
+    Some(manifest.clone())
+}
+
+/// Port of `sanitizeManifest`: stamp the version/timestamps and normalize
+/// paths. `preserveUpdatedAt` is false on the write path, so `updatedAt` is
+/// always "now".
+fn sanitize_manifest(manifest: &Map<String, Value>, entry: &str) -> Value {
+    let now = crate::migrations::to_iso8601_utc(crate::project_files::now_ms());
+    let title = manifest
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(entry);
+    let status = manifest
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| ALLOWED_MANIFEST_STATUS.contains(status))
+        .unwrap_or("complete");
+    let mut out = Map::new();
+    out.insert("version".to_string(), json!(MANIFEST_VERSION));
+    out.insert("kind".to_string(), manifest.get("kind").cloned().unwrap_or(Value::Null));
+    out.insert("title".to_string(), json!(title));
+    out.insert("entry".to_string(), json!(entry.replace('\\', "/")));
+    out.insert(
+        "renderer".to_string(),
+        manifest.get("renderer").cloned().unwrap_or(Value::Null),
+    );
+    out.insert("status".to_string(), json!(status));
+    out.insert(
+        "exports".to_string(),
+        manifest.get("exports").cloned().unwrap_or_else(|| json!([])),
+    );
+    if let Some(primary) = manifest.get("primary") {
+        if primary.as_bool() == Some(true) {
+            out.insert("primary".to_string(), json!(true));
+        } else if let Some(primary) = primary.as_str() {
+            out.insert("primary".to_string(), json!(primary.replace('\\', "/")));
+        }
+    }
+    if let Some(supporting) = manifest.get("supportingFiles").and_then(Value::as_array) {
+        out.insert(
+            "supportingFiles".to_string(),
+            Value::Array(
+                supporting
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|path| json!(path.replace('\\', "/")))
+                    .collect(),
+            ),
+        );
+    }
+    out.insert(
+        "createdAt".to_string(),
+        manifest
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .map(|value| json!(value))
+            .unwrap_or_else(|| json!(now)),
+    );
+    out.insert("updatedAt".to_string(), json!(now));
+    if let Some(source_skill_id) = manifest.get("sourceSkillId").and_then(Value::as_str) {
+        out.insert("sourceSkillId".to_string(), json!(source_skill_id));
+    }
+    if let Some(design_system_id) = manifest.get("designSystemId") {
+        if !design_system_id.is_null() {
+            if let Some(value) = design_system_id.as_str() {
+                out.insert("designSystemId".to_string(), json!(value));
+            }
+        }
+    }
+    if let Some(metadata) = manifest.get("metadata") {
+        out.insert("metadata".to_string(), metadata.clone());
+    }
+    Value::Object(out)
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Parity: `rejectInternalVersionPath` — the internal version store is never
@@ -989,6 +1222,88 @@ mod tests {
         assert_eq!(first["artifactKind"], "html");
         assert!(first["localPath"].as_str().unwrap().ends_with("/index.html"));
         assert!(first.get("artifactManifest").is_some());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn write_project_file_persists_body_and_manifest_sidecar() {
+        let base = temp_dir("write");
+        let manifest = json!({
+            "kind": "html",
+            "title": "Hero",
+            "entry": "hero.html",
+            "renderer": "html",
+            "status": "complete",
+            "exports": ["html", "pdf", "zip"],
+            "primary": true,
+            "metadata": { "identifier": "hero", "inferred": false },
+        });
+        let written = write_project_file(
+            &base,
+            "hero.html",
+            b"<html><body>hero</body></html>",
+            false,
+            Some(&manifest),
+        )
+        .expect("write");
+        assert_eq!(written["name"], "hero.html");
+        assert_eq!(written["kind"], "html");
+        assert_eq!(written["artifactKind"], "html");
+        assert_eq!(written["artifactManifest"]["entry"], "hero.html");
+        assert_eq!(written["artifactManifest"]["version"], json!(1));
+        assert!(written["artifactManifest"]["createdAt"].as_str().is_some());
+        assert_eq!(
+            std::fs::read_to_string(base.join("hero.html")).unwrap(),
+            "<html><body>hero</body></html>"
+        );
+        let sidecar: Value =
+            serde_json::from_str(&std::fs::read_to_string(base.join("hero.html.artifact.json")).unwrap())
+                .unwrap();
+        assert_eq!(sidecar["title"], "Hero");
+        assert_eq!(sidecar["metadata"]["identifier"], "hero");
+
+        // overwrite: false is a hard error; overwrite: true replaces.
+        assert!(matches!(
+            write_project_file(&base, "hero.html", b"second", false, None),
+            Err(WriteProjectFileError::AlreadyExists)
+        ));
+        write_project_file(&base, "hero.html", b"second", true, None).expect("overwrite");
+        assert_eq!(std::fs::read_to_string(base.join("hero.html")).unwrap(), "second");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn write_project_file_creates_nested_dirs_and_rejects_escapes() {
+        let base = temp_dir("write-nested");
+        write_project_file(&base, "reports/q1.html", b"report", true, None).expect("nested");
+        assert_eq!(
+            std::fs::read_to_string(base.join("reports/q1.html")).unwrap(),
+            "report"
+        );
+        assert!(matches!(
+            write_project_file(&base, "../escape.html", b"x", true, None),
+            Err(WriteProjectFileError::Path(_))
+        ));
+        assert!(matches!(
+            write_project_file(&base, ".file-versions/x.html", b"x", true, None),
+            Err(WriteProjectFileError::Path(_))
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn invalid_manifests_are_skipped_not_written() {
+        let base = temp_dir("write-bad-manifest");
+        let written = write_project_file(
+            &base,
+            "page.html",
+            b"body",
+            true,
+            Some(&json!({ "kind": "not-a-kind" })),
+        )
+        .expect("write without sidecar");
+        assert_eq!(written["name"], "page.html");
+        assert!(!base.join("page.html.artifact.json").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 
