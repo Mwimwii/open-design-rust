@@ -394,7 +394,7 @@ async fn create_project(State(state): State<AppState>, Json(body): Json<Value>) 
             )
         }
     };
-    if let Some(metadata) = &metadata {
+    if let Some(metadata) = &mut metadata {
         if metadata.contains_key("baseDir") {
             return api_error(
                 StatusCode::BAD_REQUEST,
@@ -417,8 +417,15 @@ async fn create_project(State(state): State<AppState>, Json(body): Json<Value>) 
             );
         }
         if let Some(linked_dirs) = metadata.get("linkedDirs") {
-            if let Err(message) = crate::project_create::validate_linked_dirs(linked_dirs) {
-                return api_error(StatusCode::BAD_REQUEST, "INVALID_LINKED_DIR", &message);
+            match crate::project_create::validate_linked_dirs(linked_dirs) {
+                // Persist the canonical, de-duplicated list, exactly like the
+                // TypeScript create path.
+                Ok(validated) => {
+                    metadata.insert("linkedDirs".to_string(), json!(validated));
+                }
+                Err(message) => {
+                    return api_error(StatusCode::BAD_REQUEST, "INVALID_LINKED_DIR", &message);
+                }
             }
         }
     }

@@ -104,6 +104,27 @@ async fn project_create_and_import_match_the_web_contract() {
     assert_eq!(value["project"]["skillId"], serde_json::Value::Null);
     assert!(value["resolvedDir"].as_str().is_some());
 
+    // linkedDirs are validated and persisted canonical/de-duplicated.
+    let linked = std::env::temp_dir().join(format!("od-linked-http-{}", std::process::id()));
+    std::fs::create_dir_all(&linked).expect("linked dir");
+    let payload = serde_json::json!({
+        "id": "p-linked",
+        "name": "Linked",
+        "metadata": { "linkedDirs": [linked.to_string_lossy(), linked.to_string_lossy()] },
+    })
+    .to_string();
+    let (head, body) = http_post(addr, "/api/projects", &payload).await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let dirs = value["project"]["metadata"]["linkedDirs"]
+        .as_array()
+        .expect("linked dirs");
+    assert_eq!(dirs.len(), 1, "duplicates collapse: {body}");
+    assert_eq!(
+        dirs[0],
+        linked.canonicalize().expect("canonical").to_string_lossy().as_ref()
+    );
+
     // baseDir is privileged: only the import route may set it.
     let (head, body) = http_post(
         addr,
