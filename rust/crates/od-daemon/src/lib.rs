@@ -33,6 +33,7 @@ pub mod proxy;
 pub mod protocol;
 pub mod provider_models;
 pub mod project_files;
+pub mod route_guard;
 pub mod routes;
 pub mod runs;
 pub mod server;
@@ -40,6 +41,7 @@ pub mod spawn;
 pub mod static_resources;
 pub mod static_spa;
 pub mod storage;
+pub mod telemetry_environment;
 
 pub use config::DaemonConfig;
 pub use routes::AppState;
