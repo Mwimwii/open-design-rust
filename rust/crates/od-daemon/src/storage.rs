@@ -39,6 +39,48 @@ pub struct ProjectRow {
 const PROJECT_COLUMNS: &str = "id, name, skill_id, design_system_id, pending_prompt, \
      metadata_json, custom_instructions, created_at, updated_at";
 
+impl ProjectRow {
+    /// The camelCase project shape `apps/web` reads.
+    ///
+    /// The Rust row mirrors the SQLite columns (snake_case); the TypeScript
+    /// daemon's `getProject` mapper hands the web app camelCase keys with
+    /// `metadata_json` parsed into `metadata`. Emitting the raw row makes the
+    /// UI drop the project's metadata (baseDir, importedFrom, entryFile) and
+    /// render every id field as `undefined`.
+    pub fn to_api_json(&self) -> serde_json::Value {
+        let metadata = self
+            .metadata_json
+            .as_deref()
+            .filter(|raw| !raw.trim().is_empty())
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .unwrap_or(serde_json::Value::Null);
+        serde_json::json!({
+            "id": self.id,
+            "name": self.name,
+            "skillId": self.skill_id,
+            "designSystemId": self.design_system_id,
+            "pendingPrompt": self.pending_prompt,
+            "metadata": metadata,
+            "customInstructions": self.custom_instructions,
+            "createdAt": self.created_at,
+            "updatedAt": self.updated_at,
+        })
+    }
+}
+
+/// Input for [`Store::insert_project`] (parity: `insertProject`).
+pub struct NewProject<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub skill_id: Option<&'a str>,
+    pub design_system_id: Option<&'a str>,
+    pub pending_prompt: Option<&'a str>,
+    pub metadata_json: Option<&'a str>,
+    pub custom_instructions: Option<&'a str>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error(transparent)]
@@ -96,6 +138,64 @@ impl Store {
         let sql = format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?1");
         let row = conn.query_row(&sql, [id], map_project_row).optional()?;
         Ok(row)
+    }
+
+    /// Insert a project row (parity: `insertProject`).
+    pub fn insert_project(&self, project: NewProject<'_>) -> Result<ProjectRow, StoreError> {
+        self.execute(
+            "INSERT INTO projects
+               (id, name, skill_id, design_system_id, pending_prompt,
+                metadata_json, custom_instructions, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                project.id,
+                project.name,
+                project.skill_id,
+                project.design_system_id,
+                project.pending_prompt,
+                project.metadata_json,
+                project.custom_instructions,
+                project.created_at,
+                project.updated_at,
+            ],
+        )?;
+        self.get_project(project.id)?.ok_or(StoreError::Poisoned)
+    }
+
+    /// Replace a project's saved tab state (parity: `setTabs`).
+    pub fn set_tabs(
+        &self,
+        project_id: &str,
+        tabs: &[String],
+        active: Option<&str>,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let state = serde_json::json!({ "tabs": tabs, "active": active });
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO tabs_state (project_id, updated_at, state_json)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+               updated_at = excluded.updated_at,
+               state_json = excluded.state_json",
+            rusqlite::params![project_id, now, state.to_string()],
+        )?;
+        tx.execute("DELETE FROM tabs WHERE project_id = ?1", [project_id])?;
+        for (position, name) in tabs.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO tabs (project_id, name, position, is_active)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    project_id,
+                    name,
+                    position as i64,
+                    i64::from(active == Some(name.as_str())),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Workspace claiming a project, if any (parity:

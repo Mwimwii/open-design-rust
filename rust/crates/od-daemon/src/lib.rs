@@ -29,6 +29,7 @@ pub mod mcp_tokens;
 pub mod media_tasks;
 pub mod migrations;
 pub mod plain_stream;
+pub mod project_create;
 pub mod project_dir;
 pub mod proxy;
 pub mod project_files;

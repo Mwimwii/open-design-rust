@@ -46,6 +46,106 @@ async fn http_get(addr: SocketAddr, path: &str, authorization: Option<&str>) -> 
     (head.to_string(), body.to_string())
 }
 
+async fn http_post(addr: SocketAddr, path: &str, body: &str) -> (String, String) {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
+        .await
+        .expect("write");
+    let mut response = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response)
+        .await
+        .expect("read");
+    let response = String::from_utf8_lossy(&response).into_owned();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap_or(("", ""));
+    (head.to_string(), body.to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn project_create_and_import_match_the_web_contract() {
+    let paths = temp_paths("project-create");
+    let daemon = RunningDaemon::start(config_with(paths, None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+
+    // Create a managed project. The response must be the camelCase shape the
+    // web app reads, with metadata parsed out of the SQLite column.
+    let (head, body) = http_post(
+        addr,
+        "/api/projects",
+        r#"{"id":"p-create","name":"  Created  ","metadata":{"kind":"prototype"},"customInstructions":"be brief"}"#,
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["project"]["id"], "p-create");
+    assert_eq!(value["project"]["name"], "Created");
+    assert_eq!(value["project"]["metadata"]["kind"], "prototype");
+    assert_eq!(value["project"]["customInstructions"], "be brief");
+    assert_eq!(value["project"]["workspaceId"], serde_json::Value::Null);
+    assert!(value["conversationId"].as_str().is_some_and(|id| !id.is_empty()));
+    assert!(
+        value["project"].get("metadata_json").is_none(),
+        "raw snake_case columns must not leak: {body}"
+    );
+
+    // The catalog and the detail route use the same shape.
+    let (_, body) = http_get(addr, "/api/projects", None).await;
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["projects"][0]["id"], "p-create");
+    assert_eq!(value["projects"][0]["metadata"]["kind"], "prototype");
+    let (head, body) = http_get(addr, "/api/projects/p-create", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["project"]["skillId"], serde_json::Value::Null);
+    assert!(value["resolvedDir"].as_str().is_some());
+
+    // baseDir is privileged: only the import route may set it.
+    let (head, body) = http_post(
+        addr,
+        "/api/projects",
+        r#"{"id":"p-smuggle","name":"Nope","metadata":{"baseDir":"/etc"}}"#,
+    )
+    .await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(
+        body.contains("baseDir can only be set via POST /api/import/folder"),
+        "body: {body}"
+    );
+
+    // Import a real folder: canonical path persisted, entry file detected,
+    // seed conversation + Design Files tab state created.
+    let folder = std::env::temp_dir().join(format!("od-import-{}", std::process::id()));
+    std::fs::create_dir_all(&folder).expect("folder");
+    std::fs::write(folder.join("index.html"), b"<html>imported</html>").expect("write");
+    let payload = serde_json::json!({ "baseDir": folder.to_string_lossy() }).to_string();
+    let (head, body) = http_post(addr, "/api/import/folder", &payload).await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let project_id = value["project"]["id"].as_str().expect("project id").to_string();
+    assert_eq!(value["entryFile"], "index.html");
+    assert_eq!(value["project"]["metadata"]["importedFrom"], "folder");
+    assert_eq!(
+        value["project"]["metadata"]["baseDir"],
+        folder.canonicalize().expect("canonical").to_string_lossy().as_ref()
+    );
+    assert_eq!(value["project"]["name"], folder.file_name().unwrap().to_string_lossy().as_ref());
+    let (_, files) = http_get(addr, &format!("/api/projects/{project_id}/files"), None).await;
+    assert!(files.contains("index.html"), "files: {files}");
+
+    // System roots and the data directory are refused.
+    let (head, body) = http_post(addr, "/api/import/folder", r#"{"baseDir":"/etc"}"#).await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(body.contains("system or credential directory"), "body: {body}");
+    let (head, body) = http_post(addr, "/api/import/folder", r#"{"baseDir":"relative/dir"}"#).await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(body.contains("baseDir must be absolute"), "body: {body}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_ready_projects_over_real_socket() {
     let config = config_with(temp_paths("socket"), None);
@@ -172,6 +272,39 @@ async fn media_task_list_matches_the_typescript_shape() {
     let (head, body) = http_get(addr, "/api/projects/nope/media/tasks", None).await;
     assert!(head.contains("404"), "status: {head}");
     assert!(body.contains("PROJECT_NOT_FOUND"), "body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_route_matches_the_web_contract() {
+    let daemon = RunningDaemon::start(config_with(temp_paths("agents"), None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+
+    let (head, body) = http_get(addr, "/api/agents", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let agents = value["agents"].as_array().expect("agents");
+    assert!(agents.len() > 5, "expected the shipped registry: {body}");
+    let claude = agents
+        .iter()
+        .find(|agent| agent["id"] == "claude")
+        .expect("claude in registry");
+    assert_eq!(claude["bin"], "claude");
+    assert!(claude["models"].as_array().is_some_and(|models| !models.is_empty()));
+    assert_eq!(claude["modelsSource"], "fallback");
+    assert_eq!(claude["promptInputFormat"], "stream-json");
+    assert!(claude["available"].is_boolean());
+
+    // The cold-start path: one `agent` event per row, then `done`.
+    let (head, body) = http_get(addr, "/api/agents?stream=1", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    assert!(
+        head.to_ascii_lowercase().contains("text/event-stream"),
+        "status: {head}"
+    );
+    assert!(body.contains("event: agent\ndata: "), "body: {body}");
+    assert!(body.contains("event: done\ndata: {}"), "body: {body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

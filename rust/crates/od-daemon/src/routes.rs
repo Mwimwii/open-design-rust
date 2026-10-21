@@ -11,7 +11,7 @@ use axum::extract::{ConnectInfo, Path, RawQuery, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use tower_http::services::ServeDir;
@@ -93,7 +93,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/ready", get(ready))
         .route("/api/version", get(version))
-        .route("/api/projects", get(list_projects))
+        .route("/api/agents", get(list_agents))
+        .route("/api/projects", get(list_projects).post(create_project))
+        .route("/api/import/folder", post(import_folder))
         .route("/api/projects/{id}", get(get_project))
         .route("/api/projects/{id}/files", get(list_project_files))
         .route("/api/projects/{id}/media/tasks", get(list_media_tasks))
@@ -277,7 +279,18 @@ async fn version(State(_state): State<AppState>) -> impl IntoResponse {
 async fn list_projects(State(state): State<AppState>) -> Response {
     let store = state.store.clone();
     match tokio::task::spawn_blocking(move || store.list_unbound_projects()).await {
-        Ok(Ok(projects)) => Json(json!({ "projects": projects })).into_response(),
+        Ok(Ok(projects)) => {
+            let projects: Vec<Value> = projects
+                .iter()
+                .map(|project| {
+                    let mut value = project.to_api_json();
+                    // The no-scope catalog only ever lists unbound projects.
+                    value["workspaceId"] = Value::Null;
+                    value
+                })
+                .collect();
+            Json(json!({ "projects": projects })).into_response()
+        }
         Ok(Err(err)) => store_error_response(&err),
         Err(join) => internal_error(&join.to_string()),
     }
@@ -307,12 +320,326 @@ async fn get_project(State(state): State<AppState>, Path(id): Path<String>) -> R
         Ok(dir) => dir,
         Err(err) => return project_dir_error_response(err),
     };
-    let mut project_json = serde_json::to_value(&project).unwrap_or(Value::Null);
+    let mut project_json = project.to_api_json();
     project_json["workspaceId"] = match workspace_id {
         Some(id) if !id.trim().is_empty() => Value::String(id),
         _ => Value::Null,
     };
     Json(json!({ "project": project_json, "resolvedDir": resolved_dir })).into_response()
+}
+
+/// `GET /api/agents` — the detected agent catalogue (parity: the route in
+/// `apps/daemon/src/routes/static-resource.ts`). `?stream=1` answers the same
+/// rows as `agent` SSE events followed by `done`, which is what `apps/web`
+/// consumes on cold start.
+async fn list_agents(RawQuery(query): RawQuery) -> Response {
+    let wants_stream = matches!(
+        single_query_value(query.as_deref(), "stream").as_deref(),
+        Some("1") | Some("true")
+    );
+    let agents: Vec<Value> = crate::agents::shipped_agent_defs()
+        .iter()
+        .map(|def| {
+            let bin_path = crate::spawn::resolve_bin(def.bin, def.fallback_bins);
+            crate::agents::agent_info_json(def, bin_path.as_deref())
+        })
+        .collect();
+    if !wants_stream {
+        return Json(json!({ "agents": agents })).into_response();
+    }
+    let mut body = String::new();
+    for agent in &agents {
+        body.push_str("event: agent\ndata: ");
+        body.push_str(&agent.to_string());
+        body.push_str("\n\n");
+    }
+    body.push_str("event: done\ndata: {}\n\n");
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache, no-transform"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// `POST /api/projects` — create a managed project (parity:
+/// `apps/daemon/src/routes/project/index.ts`). Workspace attribution, catalog
+/// validation, and plugin snapshot resolution are not ported (see
+/// [`crate::project_create`]).
+async fn create_project(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "invalid project id");
+    };
+    if !storage::is_safe_id(id) {
+        return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "invalid project id");
+    }
+    let Some(name) = body
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "name required");
+    };
+    let mut metadata = match body.get("metadata") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(object)) => Some(object.clone()),
+        Some(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "metadata must be an object",
+            )
+        }
+    };
+    if let Some(metadata) = &metadata {
+        if metadata.contains_key("baseDir") {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "baseDir can only be set via POST /api/import/folder",
+            );
+        }
+        if metadata.contains_key("fromTrustedPicker") {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "fromTrustedPicker can only be set via POST /api/import/folder",
+            );
+        }
+        if metadata.contains_key("orchestratorWorkspace") {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "orchestratorWorkspace can only be set via POST /api/import/folder or POST /api/projects/:id/working-dir",
+            );
+        }
+        if let Some(linked_dirs) = metadata.get("linkedDirs") {
+            if let Err(message) = crate::project_create::validate_linked_dirs(linked_dirs) {
+                return api_error(StatusCode::BAD_REQUEST, "INVALID_LINKED_DIR", &message);
+            }
+        }
+    }
+    let custom_instructions = match body.get("customInstructions") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if value.chars().count() <= 5000 => Some(value.clone()),
+        Some(Value::String(_)) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "customInstructions exceeds 5 000 character limit",
+            )
+        }
+        Some(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "customInstructions must be a string or null",
+            )
+        }
+    };
+    let skip_discovery_brief = match body.get("skipDiscoveryBrief") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "skipDiscoveryBrief must be a boolean",
+            )
+        }
+    };
+    if skip_discovery_brief {
+        metadata
+            .get_or_insert_with(serde_json::Map::new)
+            .insert("skipDiscoveryBrief".to_string(), Value::Bool(true));
+    }
+    let session_mode = body
+        .get("conversationMode")
+        .or_else(|| body.get("sessionMode"))
+        .and_then(Value::as_str)
+        .filter(|mode| matches!(*mode, "design" | "ask"))
+        .unwrap_or("design")
+        .to_string();
+    let skill_id = body.get("skillId").and_then(Value::as_str);
+    let design_system_id = body.get("designSystemId").and_then(Value::as_str);
+    let pending_prompt = body.get("pendingPrompt").and_then(Value::as_str);
+    let metadata_json = metadata.map(|metadata| Value::Object(metadata).to_string());
+
+    let store = state.store.clone();
+    let id = id.to_string();
+    let name = name.to_string();
+    let skill_id = skill_id.map(str::to_string);
+    let design_system_id = design_system_id.map(str::to_string);
+    let pending_prompt = pending_prompt.map(str::to_string);
+    let conversation_id = crate::conversations::random_id();
+    let conversation_id_for_task = conversation_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let now = crate::conversations::now_ms();
+        let project = store.insert_project(storage::NewProject {
+            id: &id,
+            name: &name,
+            skill_id: skill_id.as_deref(),
+            design_system_id: design_system_id.as_deref(),
+            pending_prompt: pending_prompt.as_deref(),
+            metadata_json: metadata_json.as_deref(),
+            custom_instructions: custom_instructions.as_deref(),
+            created_at: now,
+            updated_at: now,
+        })?;
+        crate::conversations::insert_conversation(
+            &store,
+            &conversation_id_for_task,
+            &id,
+            Value::Null,
+            &session_mode,
+            now,
+        )?;
+        Ok::<_, StoreError>(project)
+    })
+    .await;
+    match result {
+        Ok(Ok(project)) => {
+            let mut project_json = project.to_api_json();
+            project_json["workspaceId"] = Value::Null;
+            Json(json!({ "project": project_json, "conversationId": conversation_id }))
+                .into_response()
+        }
+        Ok(Err(err)) => store_error_response(&err),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// `POST /api/import/folder` — import an existing folder as a project
+/// (parity: `apps/daemon/src/import-export-routes.ts`). The desktop import
+/// token and workspace attribution are not ported; every import is treated as
+/// a headerless local create.
+async fn import_folder(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let Some(base_dir) = body
+        .get("baseDir")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+    else {
+        return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "baseDir required");
+    };
+    if !StdPath::new(base_dir).is_absolute() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "baseDir must be absolute",
+        );
+    }
+    if body
+        .get("orchestratorWorkspace")
+        .is_some_and(|value| !value.is_null())
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "orchestratorWorkspace is not supported by the Rust daemon",
+        );
+    }
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    let skill_id = body.get("skillId").and_then(Value::as_str).map(str::to_string);
+    let design_system_id = body
+        .get("designSystemId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let data_dir = state.config.paths.data_dir().to_path_buf();
+    let base_dir = base_dir.to_string();
+    let project_id = crate::conversations::random_id();
+    let conversation_id = crate::conversations::random_id();
+    let conversation_id_for_task = conversation_id.clone();
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        // Resolve symlinks once and persist the canonical path (parity: the
+        // import route's realpath + lstat sequence).
+        let real_path = std::fs::canonicalize(&base_dir)
+            .map_err(|_| "folder not found".to_string())?;
+        let metadata =
+            std::fs::metadata(&real_path).map_err(|_| "folder not found".to_string())?;
+        if !metadata.is_dir() {
+            return Err("path must be a directory".to_string());
+        }
+        if real_path.parent().is_none() {
+            return Err("cannot import the filesystem root".to_string());
+        }
+        let canonical_data_dir = std::fs::canonicalize(&data_dir).unwrap_or(data_dir);
+        if real_path == canonical_data_dir || real_path.starts_with(&canonical_data_dir) {
+            return Err("cannot import the data directory".to_string());
+        }
+        if crate::project_create::blocked_project_root_reason(&real_path).is_some() {
+            return Err(
+                "cannot use a system or credential directory as a project root".to_string(),
+            );
+        }
+        let project_name = name.unwrap_or_else(|| {
+            real_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "project".to_string())
+        });
+        let entry_file = crate::project_create::detect_entry_file(&real_path);
+        let now = crate::conversations::now_ms();
+        let metadata_json = json!({
+            "kind": "prototype",
+            "baseDir": real_path.to_string_lossy(),
+            "importedFrom": "folder",
+            "entryFile": entry_file,
+        })
+        .to_string();
+        let project = store.insert_project(storage::NewProject {
+            id: &project_id,
+            name: &project_name,
+            skill_id: skill_id.as_deref(),
+            design_system_id: design_system_id.as_deref(),
+            pending_prompt: None,
+            metadata_json: Some(&metadata_json),
+            custom_instructions: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .map_err(|err| err.to_string())?;
+        crate::conversations::insert_conversation(
+            &store,
+            &conversation_id_for_task,
+            &project_id,
+            json!(format!("Imported from {project_name}")),
+            "design",
+            now,
+        )
+        .map_err(|err| err.to_string())?;
+        // Folder imports land on Design Files so the user picks from the
+        // imported artifacts instead of auto-opening the detected file.
+        store
+            .set_tabs(&project_id, &[], None, now)
+            .map_err(|err| err.to_string())?;
+        Ok::<_, String>((project, entry_file))
+    })
+    .await;
+    match result {
+        Ok(Ok((project, entry_file))) => {
+            let mut project_json = project.to_api_json();
+            project_json["workspaceId"] = Value::Null;
+            Json(json!({
+                "project": project_json,
+                "conversationId": conversation_id,
+                "entryFile": entry_file,
+            }))
+            .into_response()
+        }
+        Ok(Err(err)) => api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", &err),
+        Err(err) => internal_error(&err.to_string()),
+    }
 }
 
 /// `GET /api/projects/:id/files` — the project's file inventory (parity:

@@ -916,7 +916,7 @@ fn get_conversation(store: &Store, id: &str) -> Result<Option<Value>, StoreError
     Ok(Some(Value::Object(out)))
 }
 
-fn insert_conversation(
+pub(crate) fn insert_conversation(
     store: &Store,
     id: &str,
     project_id: &str,
@@ -3695,7 +3695,7 @@ fn normalize_js_numbers(value: Value) -> Value {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
@@ -3703,7 +3703,7 @@ fn now_ms() -> i64 {
 }
 
 /// UUID-v4 shaped id, matching `randomUUID()` without a `uuid` dependency.
-fn random_id() -> String {
+pub(crate) fn random_id() -> String {
     use std::hash::{BuildHasher, Hasher};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);

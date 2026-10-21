@@ -211,6 +211,72 @@ pub fn shipped_agent_defs() -> &'static [AgentDef] {
     registry()
 }
 
+fn model_option_json(model: &ModelOption) -> serde_json::Value {
+    let mut out = serde_json::json!({
+        "id": model.id,
+        "label": model.label,
+    });
+    if model.enabled {
+        out["enabled"] = serde_json::Value::Bool(true);
+    }
+    if model.default {
+        out["default"] = serde_json::Value::Bool(true);
+    }
+    if !model.reasoning_options.is_empty() {
+        out["reasoningOptions"] = serde_json::Value::Array(
+            model.reasoning_options.iter().map(model_option_json).collect(),
+        );
+    }
+    if !model.service_tier_options.is_empty() {
+        out["serviceTierOptions"] = serde_json::Value::Array(
+            model.service_tier_options.iter().map(model_option_json).collect(),
+        );
+    }
+    out
+}
+
+/// One `AgentInfo` row for `GET /api/agents` (parity: the `/api/agents` route
+/// in `apps/daemon/src/routes/static-resource.ts`).
+///
+/// Availability is decided by binary resolution, which is the part the UI
+/// needs to enable an agent card. Version/auth probes are deliberately not
+/// run here: they are bounded CLI executions, and the Rust detection layer
+/// keeps them for the connection-test surface instead of every list refresh.
+pub fn agent_info_json(def: &AgentDef, bin_path: Option<&std::path::Path>) -> serde_json::Value {
+    let mut out = serde_json::json!({
+        "id": def.id,
+        "name": def.name,
+        "bin": def.bin,
+        "available": bin_path.is_some(),
+        "modelsSource": "fallback",
+        "models": def.fallback_models.iter().map(model_option_json).collect::<Vec<_>>(),
+    });
+    if let Some(path) = bin_path {
+        out["path"] = serde_json::json!(path.to_string_lossy());
+    }
+    if !def.reasoning_options.is_empty() {
+        out["reasoningOptions"] = serde_json::Value::Array(
+            def.reasoning_options.iter().map(model_option_json).collect(),
+        );
+    }
+    if let Some(install_url) = def.install_url {
+        out["installUrl"] = serde_json::json!(install_url);
+    }
+    if let Some(docs_url) = def.docs_url {
+        out["docsUrl"] = serde_json::json!(docs_url);
+    }
+    if let Some(injection) = def.external_mcp_injection {
+        out["externalMcpInjection"] = serde_json::json!(injection);
+    }
+    if let Some(supports) = def.supports_custom_model {
+        out["supportsCustomModel"] = serde_json::json!(supports);
+    }
+    if let Some(format) = def.prompt_input_format {
+        out["promptInputFormat"] = serde_json::json!(format);
+    }
+    out
+}
+
 // ---- live model cache (parity: liveModelCache/liveModelOrder) --------------
 
 /// Process-side cache of the model lists last surfaced to the UI, keyed by
