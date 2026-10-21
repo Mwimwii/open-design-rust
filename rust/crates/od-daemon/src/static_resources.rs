@@ -60,11 +60,12 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::project_dir::{map_io, resolve_under, ProjectPathError};
 use crate::project_files::mime_for;
 use crate::routes::{api_error, internal_error, AppState};
+use crate::design_system_catalog;
 use crate::skill_catalog::{self, SkillInfo};
 
 /// Parity: the two static routes of `registerStaticResourceRoutes`
@@ -77,6 +78,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/skills/{id}/assets/{*splat}", get(skill_asset))
         .route("/api/design-templates", get(list_design_templates))
         .route("/api/design-templates/{id}", get(design_template_detail))
+        .route("/api/design-systems", get(list_design_systems))
+        .route("/api/design-systems/{id}", get(design_system_detail))
 }
 
 // ---- routes ----------------------------------------------------------------
@@ -152,6 +155,57 @@ async fn design_template_detail(
     match result {
         Ok(Some(body)) => Json(body).into_response(),
         Ok(None) => api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "design template not found"),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// `GET /api/design-systems` — the brand picker's catalogue: built-in systems
+/// plus locally authored ones, bodies stripped (parity:
+/// `static-resource.ts:795` over `listAllDesignSystems`).
+async fn list_design_systems(State(state): State<AppState>) -> Response {
+    let data_dir = state.config.paths.data_dir().to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        let (user_root, builtin_root) =
+            design_system_catalog::design_system_roots(&data_dir);
+        let catalog =
+            design_system_catalog::list_all_design_systems(&user_root, builtin_root.as_deref());
+        design_system_catalog::catalog_json(&catalog)
+    })
+    .await
+    {
+        Ok(body) => Json(body).into_response(),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// `GET /api/design-systems/:id` — the summary plus the full DESIGN.md body,
+/// `canMutate`, and the duplicated `designSystem` key the client reads
+/// (parity: `design-systems.ts:661`).
+async fn design_system_detail(
+    State(state): State<AppState>,
+    PathExtractor(id): PathExtractor<String>,
+) -> Response {
+    let data_dir = state.config.paths.data_dir().to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        let (user_root, builtin_root) =
+            design_system_catalog::design_system_roots(&data_dir);
+        let catalog =
+            design_system_catalog::list_all_design_systems(&user_root, builtin_root.as_deref());
+        design_system_catalog::find_design_system(&catalog, &id)
+            .map(|system| (system.to_json(true), system.is_editable))
+    })
+    .await;
+    match result {
+        Ok(Some((mut detail, can_mutate))) => {
+            if let Value::Object(object) = &mut detail {
+                object.insert("canMutate".to_string(), Value::Bool(can_mutate));
+                let mut response = object.clone();
+                response.insert("designSystem".to_string(), Value::Object(object.clone()));
+                return Json(Value::Object(response)).into_response();
+            }
+            Json(detail).into_response()
+        }
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "design system not found"),
         Err(err) => internal_error(&err.to_string()),
     }
 }

@@ -470,6 +470,53 @@ async fn skill_catalog_serves_the_summary_and_detail_shapes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn design_system_catalog_serves_the_picker_and_detail_shapes() {
+    let daemon = RunningDaemon::start(config_with(temp_paths("design-systems"), None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+    let data_dir = daemon.state.config.paths.data_dir().to_path_buf();
+    let system_dir = data_dir.join("design-systems").join("acme");
+    std::fs::create_dir_all(&system_dir).expect("mkdir");
+    std::fs::write(
+        system_dir.join("DESIGN.md"),
+        "# Design System Inspired by Acme\n\n> Category: Industrial\n> Surface: web\n\nA crisp industrial identity.\n\n- **Background:** `#F4F4F4`\n- **Heading:** `#101010`\n- **Primary:** `#B23A2E`\n- **Border:** `#D8D8D8`\n",
+    )
+    .expect("write");
+
+    let (head, body) = http_get(addr, "/api/design-systems", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let systems = value["designSystems"].as_array().expect("designSystems");
+    let acme = systems
+        .iter()
+        .find(|system| system["id"] == "user:acme")
+        .expect("user system");
+    assert_eq!(acme["title"], "Acme");
+    assert_eq!(acme["category"], "Industrial");
+    assert_eq!(acme["summary"], "A crisp industrial identity.");
+    assert_eq!(acme["source"], "user");
+    assert_eq!(acme["status"], "draft");
+    assert_eq!(acme["isEditable"], true);
+    assert_eq!(
+        acme["swatches"],
+        serde_json::json!(["#f4f4f4", "#d8d8d8", "#101010", "#b23a2e"])
+    );
+    assert!(acme.get("body").is_none(), "listing must not ship bodies");
+
+    let (head, body) = http_get(addr, "/api/design-systems/user%3Aacme", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert!(value["body"].as_str().expect("body").contains("crisp industrial"));
+    assert_eq!(value["canMutate"], true);
+    assert_eq!(value["designSystem"]["id"], "user:acme");
+    assert_eq!(value["designSystem"]["body"], value["body"]);
+
+    let (head, _) = http_get(addr, "/api/design-systems/missing", None).await;
+    assert!(head.contains("404"), "status: {head}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_reads_answer_the_shell_without_a_workspace_identity() {
     let daemon = RunningDaemon::start(config_with(temp_paths("bootstrap"), None))
         .await

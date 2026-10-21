@@ -18,6 +18,7 @@ pub mod connection_test;
 pub mod detect;
 pub mod launch;
 pub mod critique;
+pub mod design_system_catalog;
 pub mod chat_artifacts;
 pub mod config;
 pub mod conversations;
