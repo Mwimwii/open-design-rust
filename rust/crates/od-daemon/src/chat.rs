@@ -100,6 +100,15 @@ async fn post_provider_models(
             },
         );
     }
+    if let Some(response) = crate::proxy::reasoning_egress_denial(
+        &body,
+        crate::egress::ReasoningEgressRouteKind::ProviderModels,
+        protocol,
+        Some(base_url),
+        None,
+    ) {
+        return response;
+    }
     let result = crate::provider_models::list_provider_models(&body_value).await;
     Json(result).into_response()
 }
@@ -137,6 +146,15 @@ async fn post_test_connection(
                         "baseUrl and model are required"
                     },
                 );
+            }
+            if let Some(response) = crate::proxy::reasoning_egress_denial(
+                &body,
+                crate::egress::ReasoningEgressRouteKind::ConnectionTest,
+                protocol,
+                Some(base_url),
+                Some(model),
+            ) {
+                return response;
             }
             let body_value = Value::Object(body.clone());
             let result = crate::connection_test::test_provider_connection(&body_value).await;

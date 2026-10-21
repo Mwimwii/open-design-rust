@@ -21,6 +21,7 @@ pub mod chat_artifacts;
 pub mod config;
 pub mod conversations;
 pub mod diagnostics;
+pub mod egress;
 pub mod mcp;
 pub mod mcp_inject;
 pub mod mcp_oauth;

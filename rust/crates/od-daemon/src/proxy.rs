@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt as _;
 
+use crate::egress;
 use crate::routes::{api_error, AppState};
 
 pub fn router() -> axum::routing::Router<AppState> {
@@ -20,13 +21,97 @@ pub fn router() -> axum::routing::Router<AppState> {
         .route("/api/proxy/ollama/stream", post(ollama_proxy))
 }
 
+/// Parity: `rejectProxyPluginContext` in `apps/daemon/src/routes/chat.ts`.
+/// Plugin runs must be resolved and pinned by `POST /api/runs`, never streamed
+/// through a proxy route with a caller-supplied snapshot id.
+fn reject_proxy_plugin_context(
+    body: &serde_json::Map<String, Value>,
+) -> Option<axum::response::Response> {
+    let present = |key: &str| {
+        body.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .map(|value| !value.is_empty())
+            .unwrap_or(false)
+    };
+    if present("pluginId") || present("appliedPluginSnapshotId") {
+        return Some(api_error(
+            axum::http::StatusCode::CONFLICT,
+            "PLUGIN_REQUIRES_DAEMON",
+            "Plugin runs must go through POST /api/runs so the daemon can resolve and pin the applied plugin snapshot.",
+        ));
+    }
+    None
+}
+
+/// Parity: `validateExternalApiBaseUrl` → `validateUserProviderBaseUrl`.
+/// A blocked host answers 403 FORBIDDEN; a malformed one 400 BAD_REQUEST.
+async fn validate_external_api_base_url(
+    base_url: &str,
+) -> Option<axum::response::Response> {
+    let validated = egress::validate_user_provider_base_url(base_url).await;
+    let error = validated.error?;
+    let (status, code) = if validated.forbidden {
+        (axum::http::StatusCode::FORBIDDEN, "FORBIDDEN")
+    } else {
+        (axum::http::StatusCode::BAD_REQUEST, "BAD_REQUEST")
+    };
+    Some(api_error(status, code, &error))
+}
+
+/// Parity: `authorizeReasoningEgress` followed by `sendReasoningEgressDenial`.
+/// Absent policy means enabled.
+pub(crate) fn reasoning_egress_denial(
+    body: &serde_json::Map<String, Value>,
+    route_kind: egress::ReasoningEgressRouteKind,
+    provider: &str,
+    base_url: Option<&str>,
+    model: Option<&str>,
+) -> Option<axum::response::Response> {
+    let request = egress::ReasoningEgressRequest {
+        policy: body.get("reasoningExecution").cloned(),
+        route_kind,
+        provider: provider.to_string(),
+        resolved_base_url: base_url.map(str::to_string),
+        model: model.map(str::to_string),
+    };
+    egress::authorize_reasoning_egress(&request)
+        .map(egress::ReasoningEgressDenial::into_response)
+}
+
+/// The egress guards that run after the required-field check, in TS order:
+/// resolved base URL, then reasoning policy.
+async fn guard_external_egress(
+    body: &serde_json::Map<String, Value>,
+    provider: &str,
+    base_url: &str,
+    model: &str,
+) -> Option<axum::response::Response> {
+    if let Some(response) = validate_external_api_base_url(base_url).await {
+        return Some(response);
+    }
+    reasoning_egress_denial(
+        body,
+        egress::ReasoningEgressRouteKind::Proxy,
+        provider,
+        Some(base_url),
+        Some(model),
+    )
+}
+
 async fn openai_proxy(axum::Json(body): axum::Json<Value>) -> axum::response::Response {
     let body = body.as_object().cloned().unwrap_or_default();
+    if let Some(response) = reject_proxy_plugin_context(&body) {
+        return response;
+    }
     let base_url = body.get("baseUrl").and_then(Value::as_str).unwrap_or_default().trim().to_string();
     let api_key = body.get("apiKey").and_then(Value::as_str).unwrap_or_default().trim().to_string();
     let model = body.get("model").and_then(Value::as_str).unwrap_or_default().trim().to_string();
     if base_url.is_empty() || api_key.is_empty() || model.is_empty() {
         return api_error(axum::http::StatusCode::BAD_REQUEST, "BAD_REQUEST", "baseUrl, apiKey, and model are required");
+    }
+    if let Some(response) = guard_external_egress(&body, "openai", &base_url, &model).await {
+        return response;
     }
     let system_prompt = body.get("systemPrompt").and_then(Value::as_str).map(str::to_string);
     let messages = body.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -171,11 +256,17 @@ fn append_versioned(base_url: &str, suffix: &str) -> Result<String, String> {
 
 async fn anthropic_proxy(axum::Json(body): axum::Json<Value>) -> axum::response::Response {
     let body = body.as_object().cloned().unwrap_or_default();
+    if let Some(response) = reject_proxy_plugin_context(&body) {
+        return response;
+    }
     let base_url = body.get("baseUrl").and_then(Value::as_str).unwrap_or_default().trim().to_string();
     let api_key = body.get("apiKey").and_then(Value::as_str).unwrap_or_default().trim().to_string();
     let model = body.get("model").and_then(Value::as_str).unwrap_or_default().trim().to_string();
     if base_url.is_empty() || api_key.is_empty() || model.is_empty() {
         return api_error(axum::http::StatusCode::BAD_REQUEST, "BAD_REQUEST", "baseUrl, apiKey, and model are required");
+    }
+    if let Some(response) = guard_external_egress(&body, "anthropic", &base_url, &model).await {
+        return response;
     }
     let system_prompt = body.get("systemPrompt").and_then(Value::as_str).map(str::to_string);
     let messages = body.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -324,11 +415,17 @@ async fn anthropic_proxy(axum::Json(body): axum::Json<Value>) -> axum::response:
 
 async fn azure_proxy(axum::Json(body): axum::Json<Value>) -> axum::response::Response {
     let body = body.as_object().cloned().unwrap_or_default();
+    if let Some(response) = reject_proxy_plugin_context(&body) {
+        return response;
+    }
     let base_url = body.get("baseUrl").and_then(Value::as_str).unwrap_or_default().trim().to_string();
     let api_key = body.get("apiKey").and_then(Value::as_str).unwrap_or_default().trim().to_string();
     let model = body.get("model").and_then(Value::as_str).unwrap_or_default().trim().to_string();
     if base_url.is_empty() || api_key.is_empty() || model.is_empty() {
         return api_error(axum::http::StatusCode::BAD_REQUEST, "BAD_REQUEST", "baseUrl, apiKey, and model are required");
+    }
+    if let Some(response) = guard_external_egress(&body, "azure", &base_url, &model).await {
+        return response;
     }
     let system_prompt = body.get("systemPrompt").and_then(Value::as_str).map(str::to_string);
     let messages = body.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -581,6 +678,9 @@ fn extract_stream_error(data: &Value) -> Option<String> {
 
 async fn google_proxy(axum::Json(body): axum::Json<Value>) -> axum::response::Response {
     let body = body.as_object().cloned().unwrap_or_default();
+    if let Some(response) = reject_proxy_plugin_context(&body) {
+        return response;
+    }
     let api_key = body.get("apiKey").and_then(Value::as_str).unwrap_or_default().trim().to_string();
     let model = body.get("model").and_then(Value::as_str).unwrap_or_default().trim().to_string();
     if api_key.is_empty() || model.is_empty() {
@@ -593,6 +693,9 @@ async fn google_proxy(axum::Json(body): axum::Json<Value>) -> axum::response::Re
         .filter(|v| !v.is_empty())
         .unwrap_or("https://generativelanguage.googleapis.com")
         .to_string();
+    if let Some(response) = guard_external_egress(&body, "google", &base_url, &model).await {
+        return response;
+    }
     let system_prompt = body.get("systemPrompt").and_then(Value::as_str).map(str::to_string);
     let messages = body.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
     let max_tokens = body
@@ -804,6 +907,9 @@ fn extract_gemini_block(data: &Value) -> Option<String> {
 
 async fn ollama_proxy(axum::Json(body): axum::Json<Value>) -> axum::response::Response {
     let body = body.as_object().cloned().unwrap_or_default();
+    if let Some(response) = reject_proxy_plugin_context(&body) {
+        return response;
+    }
     let api_key = body.get("apiKey").and_then(Value::as_str).unwrap_or_default().trim().to_string();
     let model = body.get("model").and_then(Value::as_str).unwrap_or_default().trim().to_string();
     if api_key.is_empty() || model.is_empty() {
@@ -816,6 +922,9 @@ async fn ollama_proxy(axum::Json(body): axum::Json<Value>) -> axum::response::Re
         .filter(|v| !v.is_empty())
         .unwrap_or("https://ollama.com")
         .to_string();
+    if let Some(response) = guard_external_egress(&body, "ollama", &base_url, &model).await {
+        return response;
+    }
     let system_prompt = body.get("systemPrompt").and_then(Value::as_str).map(str::to_string);
     let messages = body.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
     let max_tokens = body.get("maxTokens").and_then(Value::as_i64).filter(|v| *v > 0);
