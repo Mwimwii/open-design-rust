@@ -378,6 +378,96 @@ async fn http_get_with_header(
     (head.to_string(), body.to_string())
 }
 
+/// Read the head of a streaming response without waiting for it to end.
+async fn http_get_stream_head(addr: SocketAddr, path: &str) -> String {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
+        .await
+        .expect("write");
+    let mut buffer = vec![0u8; 1024];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::io::AsyncReadExt::read(&mut stream, &mut buffer),
+    )
+    .await
+    .expect("stream head timed out")
+    .expect("read");
+    String::from_utf8_lossy(&buffer[..read]).into_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_reads_answer_the_shell_without_a_workspace_identity() {
+    let daemon = RunningDaemon::start(config_with(temp_paths("bootstrap"), None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+
+    // Workspace identity: this daemon has none, and says so instead of 404ing.
+    let (head, body) = http_get(addr, "/api/workspace/context", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert!(value["context"].is_null(), "body: {body}");
+    let (head, body) = http_get(addr, "/api/workspace/directory", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["items"], serde_json::json!([]));
+    assert!(value["activeWorkspaceId"].is_null());
+
+    // Directory probe: a real folder exists, a deleted one does not.
+    let dir = std::env::temp_dir().join(format!("od-dir-exists-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let payload = serde_json::json!({ "path": dir }).to_string();
+    let (head, body) = http_post(addr, "/api/dir-exists", &payload).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["exists"], true);
+    let payload = serde_json::json!({ "path": dir.join("gone") }).to_string();
+    let (_, body) = http_post(addr, "/api/dir-exists", &payload).await;
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["exists"], false);
+
+    // Recent dirs are pruned to what still exists and the pruned list is
+    // persisted back.
+    let keep = std::env::temp_dir().join(format!("od-recent-keep-{}", std::process::id()));
+    std::fs::create_dir_all(&keep).expect("keep");
+    let gone = std::env::temp_dir().join(format!("od-recent-gone-{}", std::process::id()));
+    let payload = serde_json::json!({ "recentLinkedDirs": [keep, gone] }).to_string();
+    let (head, _) = http_put(addr, "/api/app-config", &payload).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    let (head, body) = http_get(addr, "/api/recent-dirs", None).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["dirs"].as_array().expect("dirs").len(), 1, "body: {body}");
+    let (_, body) = http_get(addr, "/api/app-config", None).await;
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        value["config"]["recentLinkedDirs"].as_array().expect("persisted").len(),
+        1,
+        "body: {body}"
+    );
+
+    // Tabs: the project create seeds the Design Files tab document.
+    let payload = serde_json::json!({ "id": "p-tabs", "name": "Tabs" }).to_string();
+    let (head, _) = http_post(addr, "/api/projects", &payload).await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    let (head, body) = http_get(addr, "/api/projects/p-tabs/tabs", None).await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert!(value["tabs"].is_array(), "body: {body}");
+    let (head, _) = http_get(addr, "/api/projects/missing/tabs", None).await;
+    assert!(head.contains("404"), "status: {head}");
+
+    // Project events: the client's reconnect handshake, not a 404 loop.
+    let head = http_get_stream_head(addr, "/api/projects/p-tabs/events").await;
+    assert!(head.contains("200 OK"), "status: {head}");
+    assert!(head.contains("text/event-stream"), "headers: {head}");
+    assert!(head.contains("event: ready"), "stream: {head}");
+    assert!(head.contains("p-tabs"), "stream: {head}");
+    let head = http_get_stream_head(addr, "/api/projects/missing/events").await;
+    assert!(head.contains("404"), "status: {head}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_serves_artifact_bytes_with_revalidating_etag() {
     let daemon = RunningDaemon::start(config_with(temp_paths("raw"), None))

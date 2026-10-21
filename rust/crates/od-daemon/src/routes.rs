@@ -9,11 +9,13 @@ use std::time::Instant;
 
 use axum::extract::{ConnectInfo, Path, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::sse::{Event, Sse};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
+use tokio_stream::wrappers::ReceiverStream;
 use tower_http::services::ServeDir;
 
 use crate::auth;
@@ -106,6 +108,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/version", get(version))
         .route("/api/agents", get(list_agents))
         .route("/api/app-config", get(get_app_config).put(put_app_config))
+        .route("/api/dir-exists", post(dir_exists))
+        .route("/api/recent-dirs", get(list_recent_dirs))
+        .route("/api/workspace/context", get(workspace_context))
+        .route("/api/workspace/directory", get(workspace_directory))
         .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/import/folder", post(import_folder))
         .route("/api/projects/{id}", get(get_project))
@@ -114,6 +120,8 @@ pub fn build_router(state: AppState) -> Router {
             get(get_project_workspace_scope),
         )
         .route("/api/projects/{id}/files", get(list_project_files))
+        .route("/api/projects/{id}/tabs", get(list_project_tabs))
+        .route("/api/projects/{id}/events", get(project_events))
         .route("/api/projects/{id}/media/tasks", get(list_media_tasks))
         .route("/api/projects/{id}/files/{*path}", get(serve_project_file))
         .route("/api/projects/{id}/raw/{*path}", get(serve_project_raw))
@@ -348,6 +356,156 @@ async fn get_project(State(state): State<AppState>, Path(id): Path<String>) -> R
         _ => Value::Null,
     };
     Json(json!({ "project": project_json, "resolvedDir": resolved_dir })).into_response()
+}
+
+/// `POST /api/dir-exists` — the composer's live "is this folder still there"
+/// probe (parity: `apps/daemon/src/routes/media.ts`).
+///
+/// The web app treats an unreachable probe as "still there" so a daemon hiccup
+/// cannot red-flag a working directory, but a 200 with `exists: false` is what
+/// turns the chip red the moment the folder is deleted.
+async fn dir_exists(Json(body): Json<Value>) -> Response {
+    let path = body
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let exists = if path.is_empty() {
+        false
+    } else {
+        tokio::task::spawn_blocking(move || std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false))
+            .await
+            .unwrap_or(false)
+    };
+    Json(json!({ "exists": exists })).into_response()
+}
+
+/// `GET /api/recent-dirs` — the composer's recent working folders, pruned to
+/// those that still exist (parity: the route in `apps/daemon/src/routes/media.ts`).
+///
+/// The pruned list is written back so the picker never offers a path that no
+/// longer resolves. This is also the first read/write of `recentLinkedDirs`
+/// through `app_config`, which is why the key is in its allowlist.
+async fn list_recent_dirs(State(state): State<AppState>) -> Response {
+    let data_dir = state.config.paths.data_dir().to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        let config = crate::app_config::read_app_config(&data_dir);
+        let recents: Vec<String> = config
+            .get("recentLinkedDirs")
+            .and_then(Value::as_array)
+            .map(|dirs| {
+                dirs.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let existing: Vec<String> = recents
+            .iter()
+            .filter(|dir| std::fs::metadata(dir).map(|meta| meta.is_dir()).unwrap_or(false))
+            .cloned()
+            .collect();
+        if existing.len() != recents.len() {
+            crate::app_config::write_app_config(
+                &data_dir,
+                &json!({ "recentLinkedDirs": existing }),
+            )
+            .map_err(|err| err.to_string())?;
+        }
+        Ok::<_, String>(existing)
+    })
+    .await;
+    match result {
+        Ok(Ok(dirs)) => Json(json!({ "dirs": dirs })).into_response(),
+        Ok(Err(message)) => internal_error(&message),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// `GET /api/projects/:id/tabs` — the saved Design Files tab document
+/// (parity: `listTabs` behind the route in `apps/daemon/src/routes/project/index.ts`).
+async fn list_project_tabs(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if !storage::is_safe_id(&id) {
+        return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "invalid project id");
+    }
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let project = store.get_project(&id)?;
+        match project {
+            Some(_) => store.list_tabs(&id).map(Some),
+            None => Ok(None),
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(tabs))) => Json(tabs).into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "project not found" })),
+        )
+            .into_response(),
+        Ok(Err(err)) => store_error_response(&err),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// `GET /api/projects/:id/events` — the project event feed the web app keeps
+/// open for the lifetime of a project view.
+///
+/// The stream opens with the `ready` handshake the client uses to reset its
+/// reconnect backoff, then sends keepalive `ping` frames. DOCUMENTED GAP: file
+/// watching (`file-changed`) and the in-process project event sinks are not
+/// ported, so a change made outside the UI arrives on the client's next
+/// snapshot read instead of as a pushed event.
+async fn project_events(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if !storage::is_safe_id(&id) {
+        return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "invalid project id");
+    }
+    let store = state.store.clone();
+    let project_id = id.clone();
+    let found = tokio::task::spawn_blocking(move || store.get_project(&project_id))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+        .is_some();
+    if !found {
+        return api_error(StatusCode::NOT_FOUND, "PROJECT_NOT_FOUND", "not found");
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(8);
+    tokio::spawn(async move {
+        let ready = Event::default()
+            .event("ready")
+            .data(json!({ "projectId": id }).to_string());
+        if tx.send(Ok(ready)).await.is_err() {
+            return;
+        }
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(25));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let ping = Event::default().event("ping").data("{}");
+            if tx.send(Ok(ping)).await.is_err() {
+                break;
+            }
+        }
+    });
+    Sse::new(ReceiverStream::new(rx)).into_response()
+}
+
+/// `GET /api/workspace/context` — this daemon has no Workspace identity, so the
+/// honest answer is a null context (parity: the route in
+/// `apps/daemon/src/routes/collab-context.ts`, reduced to its headerless case).
+async fn workspace_context() -> Response {
+    Json(json!({ "context": null })).into_response()
+}
+
+/// `GET /api/workspace/directory` — the signed-in account's Workspace list.
+/// This daemon has no AMR account, so it is always empty; the web app reads
+/// that as the local, unbound scope.
+async fn workspace_directory() -> Response {
+    Json(json!({ "items": [], "activeWorkspaceId": null })).into_response()
 }
 
 /// `GET /api/app-config` — the persisted app preferences (parity: the route in

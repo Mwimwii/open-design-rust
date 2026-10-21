@@ -198,6 +198,59 @@ impl Store {
         Ok(())
     }
 
+    /// Port of `listTabs` (db.ts:5435): the saved `tabs_state` document wins
+    /// over the per-row `tabs` table, because a client that saved an active
+    /// tab may have written a state the rows cannot represent.
+    pub fn list_tabs(&self, project_id: &str) -> Result<serde_json::Value, StoreError> {
+        let conn = self.lock()?;
+        let mut state_stmt = conn.prepare(
+            "SELECT updated_at, state_json FROM tabs_state WHERE project_id = ?1 LIMIT 1",
+        )?;
+        let state = state_stmt
+            .query_row([project_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .optional()?;
+        if let Some((updated_at, Some(state_json))) = state.as_ref() {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(state_json) {
+                if parsed.get("tabs").and_then(|tabs| tabs.as_array()).is_some() {
+                    let mut body = parsed;
+                    if let Some(object) = body.as_object_mut() {
+                        object.insert("hasSavedState".to_string(), serde_json::json!(true));
+                        object.insert("updatedAt".to_string(), serde_json::json!(updated_at));
+                    }
+                    return Ok(body);
+                }
+            }
+        }
+        let mut rows_stmt = conn
+            .prepare("SELECT name, is_active FROM tabs WHERE project_id = ?1 ORDER BY position ASC")?;
+        let rows = rows_stmt
+            .query_map([project_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let tabs: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(name, _)| serde_json::json!(name))
+            .collect();
+        let active = rows
+            .iter()
+            .find(|(_, is_active)| *is_active != 0)
+            .map(|(name, _)| serde_json::json!(name));
+        let mut body = serde_json::json!({
+            "tabs": tabs,
+            "active": active,
+            "hasSavedState": !rows.is_empty() || state.is_some(),
+        });
+        if let Some((updated_at, _)) = state.as_ref() {
+            body.as_object_mut()
+                .expect("object literal")
+                .insert("updatedAt".to_string(), serde_json::json!(updated_at));
+        }
+        Ok(body)
+    }
+
     /// Workspace claiming a project, if any (parity:
     /// `getWorkspaceProjectByProjectId`).
     pub fn workspace_id_for_project(&self, id: &str) -> Result<Option<String>, StoreError> {
