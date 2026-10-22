@@ -12,23 +12,31 @@ pub struct DaemonInfo {
     pub version: String,
     pub data_dir: String,
     pub web_dist: Option<String>,
+    /// The release channel this build belongs to.
+    pub channel: String,
+    /// The namespace this build writes into.
+    pub namespace: String,
 }
 
+/// The version this build carries — the bundle's version, which is what the
+/// installer and the About surface show.
 #[tauri::command]
-pub fn app_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
+pub fn app_version(state: State<'_, ShellState>) -> String {
+    state.identity.app_version.clone()
 }
 
 #[tauri::command]
 pub fn daemon_info(state: State<'_, ShellState>) -> DaemonInfo {
     DaemonInfo {
         url: state.daemon_url.clone(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: state.identity.app_version.clone(),
         data_dir: state.data_dir.display().to_string(),
         web_dist: state
             .web_dist
             .as_ref()
             .map(|path| path.display().to_string()),
+        channel: state.identity.channel.as_str().to_string(),
+        namespace: state.identity.namespace.clone(),
     }
 }
 

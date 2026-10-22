@@ -9,12 +9,33 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use od_core::RuntimePaths;
+use od_core::release::{ReleaseChannel, ReleasePlatform};
+use od_core::{NamespacePaths, RuntimePaths};
 use od_daemon::{DaemonConfig, RunningDaemon, StartError};
 use tauri::{App, AppHandle, Listener, Manager, WebviewUrl, WebviewWindowBuilder};
 use url::Url;
 
 use crate::host::desktop_auth::DesktopAuth;
+
+/// The release identity of this build: the channel it belongs to, the
+/// namespace it writes into, and the paths that namespace owns.
+///
+/// Parity: the packaged layout of `apps/packaged/src/paths.ts` and the
+/// release domain of `packages/release/src/index.ts`. The namespace is what
+/// keeps two builds apart: a stable build and a beta build, or a mac build
+/// and a Windows build, own separate data roots.
+#[derive(Debug, Clone)]
+pub struct ShellIdentity {
+    /// The version this build carries (the bundle's version).
+    pub app_version: String,
+    /// The release channel the version names; the stable lane when the
+    /// version names none.
+    pub channel: ReleaseChannel,
+    /// The namespace this build writes into.
+    pub namespace: String,
+    /// Every path the namespace owns.
+    pub paths: NamespacePaths,
+}
 
 /// State handed to IPC commands.
 pub struct ShellState {
@@ -22,6 +43,8 @@ pub struct ShellState {
     pub daemon_url: String,
     /// Resolved `OD_DATA_DIR` for this app namespace.
     pub data_dir: PathBuf,
+    /// The release identity of this build.
+    pub identity: ShellIdentity,
     /// The static web export the daemon serves; `None` means API-only.
     pub web_dist: Option<PathBuf>,
     /// The per-process secret the project flows mint import tokens with. In
@@ -36,7 +59,8 @@ pub struct ShellState {
 /// Tauri `setup` hook: resolve the data root, boot the daemon, open the
 /// main window pointed at the daemon (same-origin SPA + API).
 pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
-    let data_dir = resolve_data_dir(app)?;
+    let identity = resolve_identity(app)?;
+    let data_dir = identity.paths.data_root.clone();
 
     // Daemon data contract: resolve the root once, hand the same value to
     // every agent subprocess via the environment.
@@ -55,9 +79,18 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let daemon = start_daemon(config)?;
     let daemon_url = daemon.url().to_string();
 
+    tracing::info!(
+        version = %identity.app_version,
+        channel = %identity.channel,
+        namespace = %identity.namespace,
+        data_dir = %identity.paths.data_root.display(),
+        "desktop shell identity"
+    );
+
     app.manage(ShellState {
         daemon_url: daemon_url.clone(),
         data_dir,
+        identity,
         web_dist,
         desktop_auth,
         daemon: Mutex::new(Some(daemon)),
@@ -109,14 +142,71 @@ pub fn shutdown(app_handle: &AppHandle) {
     }
 }
 
-/// Data root precedence: explicit `OD_DATA_DIR` (dev/ops override) beats the
-/// app-namespace directory. The daemon never computes its own path — the
-/// shell resolves it here (AGENTS.md data contract).
-fn resolve_data_dir(app: &App) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    if let Some(value) = std::env::var_os("OD_DATA_DIR").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(value));
-    }
-    Ok(app.path().app_data_dir()?)
+/// The release identity of this build: the channel it belongs to, the
+/// namespace it writes into, and the paths that namespace owns.
+///
+/// Parity: `defaultNamespaceForAppVersion` in `tools/pack/src/config/index.ts`
+/// and the packaged layout of `apps/packaged/src/paths.ts`. A build whose
+/// version names a release channel owns that channel's namespace; every other
+/// build (a development build, a local build) owns the default namespace, so
+/// a nightly build never writes into a shipped release's data root.
+fn resolve_identity(app: &App) -> Result<ShellIdentity, Box<dyn std::error::Error>> {
+    // The packaged layout keeps the namespace roots one level under the app's
+    // data directory: `<app data>/namespaces/<namespace>/data`.
+    let app_data_dir = app.path().app_data_dir()?;
+    let namespace_base_root = app_data_dir.join(od_core::namespace::NAMESPACES_DIR_NAME);
+    let resource_root = app
+        .path()
+        .resource_dir()
+        .unwrap_or_else(|_| app_data_dir.clone());
+    // `OD_DATA_DIR` is the operator's override. It names a *base* root, the
+    // same way the packaged runtime reads it: the namespace's data root
+    // lives inside it unless it already points at this namespace's data root.
+    let data_dir_override = std::env::var_os("OD_DATA_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let identity = identity_for_version(
+        &app.package_info().version.to_string(),
+        &namespace_base_root,
+        &resource_root,
+        data_dir_override.as_deref(),
+    )?;
+    Ok(identity)
+}
+
+/// The identity a version buys: the channel it belongs to, the namespace it
+/// writes into, and the paths that namespace owns.
+///
+/// Split out of [`resolve_identity`] so the derivation is testable without a
+/// Tauri application: the version is the only input that comes from the app.
+fn identity_for_version(
+    app_version: &str,
+    namespace_base_root: &Path,
+    resource_root: &Path,
+    data_dir_override: Option<&Path>,
+) -> Result<ShellIdentity, od_core::NamespaceError> {
+    let named_channel = od_core::release::release_channel_from_version(Some(app_version));
+    // A version that names no channel is the stable lane's version shape but
+    // not a published release; the updater still reports it as the stable
+    // lane, while the namespace stays the default one.
+    let channel = named_channel.clone().unwrap_or(ReleaseChannel::Stable);
+    let namespace = match &named_channel {
+        Some(channel) => od_core::release::release_namespace(channel, ReleasePlatform::current()),
+        None => od_core::namespace::DEFAULT_NAMESPACE.to_string(),
+    };
+    let paths = od_core::namespace::resolve_namespace_paths(
+        namespace_base_root,
+        &namespace,
+        resource_root,
+        data_dir_override,
+    )?;
+
+    Ok(ShellIdentity {
+        app_version: app_version.to_string(),
+        channel,
+        namespace,
+        paths,
+    })
 }
 
 /// Bind the daemon, falling back to an ephemeral port if the preferred port
@@ -198,4 +288,83 @@ pub fn web_dist(app: &App) -> Option<PathBuf> {
 /// links with.
 fn has_shell(dir: &Path) -> bool {
     dir.join("index.html").is_file()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_root() -> PathBuf {
+        PathBuf::from("/home/user/.local/share/ai.open-design.desktop/namespaces")
+    }
+
+    #[test]
+    fn a_development_build_owns_the_default_namespace() {
+        let identity =
+            identity_for_version("0.1.0", &base_root(), Path::new("/app/resources"), None)
+                .expect("identity");
+        assert_eq!(identity.namespace, "default");
+        // The channel a plain version does not name is the stable lane's
+        // shape; the updater reports it as such.
+        assert_eq!(identity.channel, ReleaseChannel::Stable);
+        assert_eq!(
+            identity.paths.data_root,
+            base_root().join("default").join("data")
+        );
+    }
+
+    #[test]
+    fn a_release_build_owns_its_channels_namespace() {
+        let identity = identity_for_version(
+            "1.2.3-prerelease.4",
+            &base_root(),
+            Path::new("/app/resources"),
+            None,
+        )
+        .expect("identity");
+        assert_eq!(identity.channel, ReleaseChannel::Prerelease);
+        assert_eq!(
+            identity.namespace,
+            od_core::release::release_namespace(
+                &ReleaseChannel::Prerelease,
+                ReleasePlatform::current()
+            )
+        );
+        assert_eq!(
+            identity.paths.data_root,
+            base_root().join(&identity.namespace).join("data")
+        );
+    }
+
+    #[test]
+    fn the_data_dir_override_names_a_base_root() {
+        let identity = identity_for_version(
+            "0.1.0",
+            &base_root(),
+            Path::new("/app/resources"),
+            Some(Path::new("/var/lib/opendesign")),
+        )
+        .expect("identity");
+        assert_eq!(
+            identity.paths.data_root,
+            PathBuf::from("/var/lib/opendesign/namespaces/default/data")
+        );
+    }
+
+    #[test]
+    fn a_data_dir_override_scoped_to_another_namespace_is_refused() {
+        let error = identity_for_version(
+            "0.1.0",
+            &base_root(),
+            Path::new("/app/resources"),
+            Some(Path::new(
+                "/var/lib/opendesign/namespaces/release-beta/data",
+            )),
+        )
+        .expect_err("mismatch");
+        assert!(matches!(
+            error,
+            od_core::NamespaceError::DataDirNamespaceMismatch { .. }
+        ));
+    }
 }
