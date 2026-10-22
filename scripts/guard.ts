@@ -155,6 +155,13 @@ const residualAllowedPathPrefixes = [
   "apps/daemon/dist/",
   "apps/web/.next/",
   "apps/web/out/",
+  // Cargo build output for the Rust workspace (git-ignored via rust/.gitignore).
+  // The Tauri shell's build script stages the apps/web static export into
+  // `target/**/web/` and embeds it in the binary, so this tree holds vendor JS.
+  "rust/target/",
+  // The staged apps/web static export the shell embeds (also git-ignored via
+  // rust/.gitignore; `npm run build:web` recreates it).
+  "rust/apps/od-tauri/web-export/",
   "generated/",
   "e2e/playwright-report/",
   "e2e/reports/html/",
