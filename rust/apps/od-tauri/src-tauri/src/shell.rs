@@ -111,6 +111,11 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         .initialization_script(bridge_script)
         .build()?;
 
+    // The updater's auto-check loop starts once the window exists. Its first
+    // poll is delayed by the configured initial delay, so startup stays
+    // dedicated to the window and the embedded daemon.
+    crate::host::updater::scheduler::start(app.handle().clone());
+
     // `od://` invite/deeplink arrival → log + notify the webview.
     // Registration itself lives in tauri.conf.json (`plugins.deep-link`).
     let handle = app.handle().clone();

@@ -4,13 +4,15 @@
 //! download with checksums, an installer handoff, native menu labels, and a
 //! status stream. Everything that decides or moves bytes is ported here —
 //! configuration, feed interpretation, the check decision, the resumable
-//! download with checksum verification, the update store, and the installer
-//! handoff — so a macOS or Windows build can update itself from the same feeds
-//! the Electron host reads.
+//! download with checksum verification, the update store, the installer
+//! handoff, the status stream, and the auto-check schedule — so a macOS or
+//! Windows build can update itself from the same feeds the Electron host reads.
 //!
-//! What is not ported: the status stream (a download answers when it finishes
-//! rather than reporting progress while it runs), the update scheduler and its
-//! deferred-launch handling, and the native menu labels. None of them changes
+//! What is not ported: the native menu labels (this shell builds no native
+//! application menu, so `set-menu-labels` reports that rather than pretending
+//! to relabel one), and the launcher *payload* machinery the Electron scheduler
+//! uses for a silent startup update and a deferred relaunch (this shell has no
+//! payload runtime and always asks the feed for the installer). Neither changes
 //! whether an install completes, so `status` advertises the platform as
 //! supported (see `status::CAN_APPLY_PACKAGE_LAUNCHER_UPDATES`).
 //!
@@ -24,11 +26,13 @@ pub mod download;
 pub mod feed;
 pub mod install;
 pub mod model;
+pub mod scheduler;
 pub mod status;
 pub mod store;
 pub mod support;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -52,6 +56,23 @@ pub const STATUS_EVENT: &str = "od:updater-status";
 /// transfer emits one snapshot per chunk — thousands of documents nobody can
 /// read, each one crossing the IPC boundary.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Whether an installer has been opened in this process.
+///
+/// An opened installer is the end of updating for the running build: the app is
+/// about to be replaced, so polling the feed again can only produce a status
+/// nobody acts on. The scheduler reads this to stop (parity: the Electron
+/// scheduler stopping once `installResult != null`).
+static INSTALLER_OPENED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this build has already handed its update to the platform installer.
+pub fn installer_opened() -> bool {
+    INSTALLER_OPENED.load(Ordering::Relaxed)
+}
+
+fn note_installer_opened() {
+    INSTALLER_OPENED.store(true, Ordering::Relaxed);
+}
 
 /// `process.arch`'s spelling, which is what the renderer receives elsewhere.
 pub fn node_arch() -> &'static str {
@@ -133,6 +154,71 @@ fn active_release(
     }
 }
 
+/// Fetch the candidate's release, reporting progress on the status stream.
+///
+/// `Ok` carries the downloaded snapshot and `Err` an error snapshot; both are
+/// answers the renderer can render, which is why the failure is not a `String`.
+/// The unattended path in `scheduler` reads the same distinction to decide
+/// whether the next poll backs off.
+async fn download_candidate(
+    app: &AppHandle,
+    config: &UpdaterConfig,
+    identity: &status::StatusIdentity<'_>,
+    candidate: &feed::UpdateCandidate,
+) -> Result<Value, Value> {
+    let mut last_emit = std::time::Instant::now()
+        .checked_sub(PROGRESS_INTERVAL)
+        .unwrap_or_else(std::time::Instant::now);
+    let mut on_progress = |received: u64, total: Option<u64>| {
+        if last_emit.elapsed() < PROGRESS_INTERVAL {
+            return;
+        }
+        last_emit = std::time::Instant::now();
+        let _ = app.emit(
+            STATUS_EVENT,
+            status::downloading_status(identity, candidate, received, total),
+        );
+    };
+    match download::download_release(config, candidate, &mut on_progress).await {
+        Ok(release) => match active_release(config) {
+            Ok(Some((_, path))) => Ok(status::downloaded_status(identity, &release, &path, None)),
+            Ok(None) => Ok(status::idle_status(identity)),
+            Err(error) => Err(status::error_status(identity, error)),
+        },
+        Err(error) => Err(status::error_status(identity, error)),
+    }
+}
+
+/// Hand the store's active release to the platform installer.
+///
+/// The `bool` is whether the installer opened: that is the point after which
+/// this build stops updating itself, so the scheduler stops polling.
+fn install_active(config: &UpdaterConfig, identity: &status::StatusIdentity<'_>) -> (Value, bool) {
+    match active_release(config) {
+        Ok(Some((release, path))) => match install::open_installer(&config.platform, &path) {
+            Ok(result) => {
+                note_installer_opened();
+                (
+                    status::downloaded_status(identity, &release, &path, Some(&result)),
+                    true,
+                )
+            }
+            Err(error) => (status::error_status(identity, error), false),
+        },
+        Ok(None) => (
+            status::error_status(
+                identity,
+                UpdateError::new(
+                    "no-downloaded-release",
+                    "there is no downloaded update to install",
+                ),
+            ),
+            false,
+        ),
+        Err(error) => (status::error_status(identity, error), false),
+    }
+}
+
 /// `updater.*`: one command for the whole group, dispatched on `action`.
 ///
 /// `status`, `check`, `download`, `install`, and `clear-cache` answer the status
@@ -172,46 +258,11 @@ pub async fn host_updater(
             let Some(candidate) = outcome.candidate.clone() else {
                 return Ok(outcome_status(&identity, outcome));
             };
-            let mut last_emit = std::time::Instant::now()
-                .checked_sub(PROGRESS_INTERVAL)
-                .unwrap_or_else(std::time::Instant::now);
-            let mut on_progress = |received: u64, total: Option<u64>| {
-                if last_emit.elapsed() < PROGRESS_INTERVAL {
-                    return;
-                }
-                last_emit = std::time::Instant::now();
-                let _ = app.emit(
-                    STATUS_EVENT,
-                    status::downloading_status(&identity, &candidate, received, total),
-                );
-            };
-            let downloaded =
-                download::download_release(&config, &candidate, &mut on_progress).await;
-            Ok(match downloaded {
-                Ok(release) => match active_release(&config) {
-                    Ok(Some((_, path))) => {
-                        status::downloaded_status(&identity, &release, &path, None)
-                    }
-                    Ok(None) => status::idle_status(&identity),
-                    Err(error) => status::error_status(&identity, error),
-                },
-                Err(error) => status::error_status(&identity, error),
-            })
+            Ok(download_candidate(&app, &config, &identity, &candidate)
+                .await
+                .unwrap_or_else(|snapshot| snapshot))
         }
-        "install" => Ok(match active_release(&config) {
-            Ok(Some((release, path))) => match install::open_installer(&config.platform, &path) {
-                Ok(result) => status::downloaded_status(&identity, &release, &path, Some(&result)),
-                Err(error) => status::error_status(&identity, error),
-            },
-            Ok(None) => status::error_status(
-                &identity,
-                UpdateError::new(
-                    "no-downloaded-release",
-                    "there is no downloaded update to install",
-                ),
-            ),
-            Err(error) => status::error_status(&identity, error),
-        }),
+        "install" => Ok(install_active(&config, &identity).0),
         "clear-cache" => Ok(match store::clear_cached_releases(&config.download_root) {
             Ok(()) => status::idle_status(&identity),
             Err(error) => status::error_status(&identity, error),
