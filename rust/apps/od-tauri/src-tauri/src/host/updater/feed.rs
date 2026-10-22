@@ -16,6 +16,7 @@ use std::cmp::Ordering;
 
 use od_core::release::{is_release_channel, release_channel_from_name, ReleaseChannel};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use super::config::UpdaterConfig;
 use super::model::{ArtifactSnapshot, ChecksumAlgorithm, ChecksumSnapshot, UpdateState};
@@ -89,6 +90,88 @@ pub fn sanitize_path_segment(value: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// The file extension an artifact is stored under (parity:
+/// `extensionForArtifact`).
+///
+/// The feed's own file name wins when it names a format we know, because that
+/// is what an installer or an archive handler dispatches on; the declared type
+/// is the fallback for a feed that names its artifact something else.
+pub fn extension_for_artifact(name: Option<&str>, artifact_type: &str) -> &'static str {
+    let extension = std::path::Path::new(name.unwrap_or(""))
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("7z") => ".7z",
+        Some("dmg") => ".dmg",
+        Some("zip") => ".zip",
+        Some("exe") => ".exe",
+        Some("appimage") => ".appimage",
+        _ => match artifact_type {
+            "dmg" => ".dmg",
+            "zip" => ".zip",
+            "installer" => ".exe",
+            _ => ".bin",
+        },
+    }
+}
+
+/// The file name a candidate's artifact is stored as (parity:
+/// `artifactFileName`).
+///
+/// Built from the release identity rather than the feed's name so two feeds
+/// cannot write to the same path, and so the name never carries a path
+/// separator out of the version string.
+pub fn artifact_file_name(candidate: &UpdateCandidate) -> String {
+    let extension = extension_for_artifact(
+        candidate.artifact.name.as_deref(),
+        candidate.artifact_type_name(),
+    );
+    format!(
+        "open-design-{}-{}-{}-{}{}",
+        sanitize_path_segment(&candidate.version),
+        sanitize_path_segment(&candidate.platform_key),
+        sanitize_path_segment(&candidate.arch),
+        sanitize_path_segment(candidate.artifact_type_name()),
+        extension
+    )
+}
+
+/// The store key a release is filed under (parity: `releaseKey`).
+///
+/// The digest suffix makes two artifacts that claim the same version and
+/// platform distinct releases, so a re-upload cannot be mistaken for the copy
+/// already on disk.
+pub fn release_key(candidate: &UpdateCandidate, checksum_value: &str) -> String {
+    let hash = Sha256::digest(checksum_value.as_bytes());
+    let digest: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}",
+        sanitize_path_segment(&candidate.version),
+        sanitize_path_segment(&candidate.platform_key),
+        sanitize_path_segment(&candidate.arch),
+        &digest[..12.min(digest.len())]
+    )
+}
+
+/// The digest in a checksum file (parity: `parseChecksumText`).
+///
+/// A checksum file is free-form text with the digest somewhere in it, so the
+/// parser looks for a hex run of exactly the algorithm's length. A longer run
+/// is a different digest and does not match.
+pub fn parse_checksum_text(text: &str, algorithm: ChecksumAlgorithm) -> Result<String, String> {
+    let length = algorithm.hex_length();
+    text.split(|character: char| !character.is_ascii_hexdigit())
+        .find(|run| run.len() == length)
+        .map(|run| run.to_ascii_lowercase())
+        .ok_or_else(|| {
+            format!(
+                "checksum file does not include a {} digest",
+                algorithm.as_str()
+            )
+        })
 }
 
 struct ComparableVersion {
@@ -731,5 +814,49 @@ mod tests {
         assert_eq!(sanitize_path_segment("--weird--"), "weird");
         assert_eq!(sanitize_path_segment("///"), "update");
         assert_eq!(sanitize_path_segment("a  b"), "a-b");
+    }
+
+    #[test]
+    fn an_artifact_is_named_from_the_release_not_the_feed() {
+        let candidate = select_update_candidate(&feed(), &config("darwin", "arm64", "beta"), false)
+            .expect("candidate");
+        assert_eq!(
+            artifact_file_name(&candidate),
+            "open-design-1.2.3-beta.4-mac-arm64-dmg.dmg"
+        );
+        // The feed name is consulted for a format the type does not imply.
+        assert_eq!(extension_for_artifact(Some("x.DMG"), "dmg"), ".dmg");
+        assert_eq!(
+            extension_for_artifact(Some("x.appimage"), "artifact"),
+            ".appimage"
+        );
+        assert_eq!(extension_for_artifact(Some("x.tar.gz"), "dmg"), ".dmg");
+        assert_eq!(extension_for_artifact(None, "installer"), ".exe");
+        assert_eq!(extension_for_artifact(None, "payload"), ".bin");
+
+        let key = release_key(&candidate, "some-digest");
+        assert!(key.starts_with("1.2.3-beta.4-mac-arm64-"), "{key}");
+        assert_eq!(key.rsplit('-').next().expect("suffix").len(), 12);
+        // The key distinguishes two uploads of the same version.
+        assert_ne!(key, release_key(&candidate, "another-digest"));
+    }
+
+    #[test]
+    fn a_checksum_file_yields_the_digest_or_an_error() {
+        let sha256 = "c".repeat(64);
+        let text = format!("{sha256}  OpenDesign.dmg\n");
+        assert_eq!(
+            parse_checksum_text(&text, ChecksumAlgorithm::Sha256).expect("digest"),
+            sha256
+        );
+        assert_eq!(
+            parse_checksum_text(&"D".repeat(64), ChecksumAlgorithm::Sha256).expect("digest"),
+            "d".repeat(64),
+            "digests are compared case-insensitively"
+        );
+        assert!(parse_checksum_text(&"d".repeat(65), ChecksumAlgorithm::Sha256).is_err());
+        assert!(parse_checksum_text("nothing here", ChecksumAlgorithm::Sha512).is_err());
+        // A sha512 digest is not a sha256 digest.
+        assert!(parse_checksum_text(&sha256, ChecksumAlgorithm::Sha512).is_err());
     }
 }

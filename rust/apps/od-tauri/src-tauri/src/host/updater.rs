@@ -2,16 +2,17 @@
 //!
 //! Electron's updater is a whole subsystem: a release feed, a resumable
 //! download with checksums, an installer handoff, native menu labels, and a
-//! status stream. The Rust shell has ported the front half — the configuration
-//! the updater decides with, the release feed's interpretation, and the
-//! `check` decision — and none of the install half yet.
+//! status stream. Everything that decides or moves bytes is ported here —
+//! configuration, feed interpretation, the check decision, the resumable
+//! download with checksum verification, the update store, and the installer
+//! handoff — so a macOS or Windows build can update itself from the same feeds
+//! the Electron host reads.
 //!
-//! What that means for a person running the app: the host can read a release
-//! feed and tell you a newer version exists, but it still reports
-//! `supported: false` (see `status::CAN_APPLY_PACKAGE_LAUNCHER_UPDATES`), so
-//! the renderer keeps rendering no updater control. The alternative — showing a
-//! download button that cannot finish — is the one outcome a status snapshot
-//! must never produce.
+//! What is not ported: the status stream (a download answers when it finishes
+//! rather than reporting progress while it runs), the update scheduler and its
+//! deferred-launch handling, and the native menu labels. None of them changes
+//! whether an install completes, so `status` advertises the platform as
+//! supported (see `status::CAN_APPLY_PACKAGE_LAUNCHER_UPDATES`).
 //!
 //! Every member of the group is answered here, including the two subscriptions,
 //! because `isOpenDesignHostBridge` in `packages/host/src/detection.ts` requires
@@ -19,19 +20,28 @@
 
 pub mod check;
 pub mod config;
+pub mod download;
 pub mod feed;
+pub mod install;
 pub mod model;
 pub mod status;
+pub mod store;
 pub mod support;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use serde_json::Value;
-use tauri::State;
+use tauri::{AppHandle, State};
 
-use super::failure;
+use super::{failure, success};
 use crate::shell::ShellState;
 use config::{resolve_config, UpdaterConfig, UpdaterConfigInput};
+use support::UpdateError;
+
+/// How long a quit waits before exiting, so the command's answer reaches the
+/// renderer first.
+const QUIT_GRACE: Duration = Duration::from_millis(250);
 
 /// `process.arch`'s spelling, which is what the renderer receives elsewhere.
 pub fn node_arch() -> &'static str {
@@ -54,7 +64,7 @@ pub fn resolve(state: &ShellState) -> Result<UpdaterConfig, String> {
         app_version: Some(state.identity.app_version.clone()),
         env: std::env::vars().collect::<HashMap<_, _>>(),
         packaged: true,
-        // The updater's default download root lives under the namespace's data
+        // The updater's download root lives under the namespace's data
         // directory, so an update never writes outside the tree the app owns.
         runtime_base: Some(state.data_dir.clone()),
         ..Default::default()
@@ -85,29 +95,42 @@ fn outcome_status(identity: &status::StatusIdentity<'_>, outcome: check::CheckOu
         model::UpdateState::Unsupported => status::unsupported_status(
             identity,
             outcome.error.unwrap_or_else(|| {
-                support::UpdateError::new(
-                    "updater-unavailable",
-                    "Desktop updater is not available.",
-                )
+                UpdateError::new("updater-unavailable", "Desktop updater is not available.")
             }),
         ),
         _ => status::error_status(
             identity,
             outcome.error.unwrap_or_else(|| {
-                support::UpdateError::new("update-check-failed", "the update check failed")
+                UpdateError::new("update-check-failed", "the update check failed")
             }),
         ),
     }
 }
 
+/// The store's active release, resolved to a path inside the store.
+fn active_release(
+    config: &UpdaterConfig,
+) -> Result<Option<(store::UpdateReleaseRef, std::path::PathBuf)>, UpdateError> {
+    let owned = store::ensure_owned_root(&config.download_root, store::STORE_OWNER)?;
+    // Cloned rather than moved: the path has to be resolved against the store
+    // that holds the record.
+    match owned.metadata.active.clone() {
+        Some(release) => {
+            let path = owned.resolve(&release.artifact_path)?;
+            Ok(Some((release, path)))
+        }
+        None => Ok(None),
+    }
+}
+
 /// `updater.*`: one command for the whole group, dispatched on `action`.
 ///
-/// `status` and `check` answer the status snapshot the renderer expects from
-/// them. The three install-side actions answer with the reason they cannot run
-/// yet instead of pretending to work; `quit` and `setMenuLabels` take the
+/// `status`, `check`, `download`, `install`, and `clear-cache` answer the status
+/// snapshot the renderer expects from them. `quit` and `setMenuLabels` take the
 /// action envelope, because the renderer reads them as action results.
 #[tauri::command]
 pub async fn host_updater(
+    app: AppHandle,
     state: State<'_, ShellState>,
     action: Option<String>,
     options: Option<Value>,
@@ -122,33 +145,65 @@ pub async fn host_updater(
                 &identity,
                 refusal.error.expect("a refusal carries an error"),
             ),
-            None => status::idle_status(&identity),
+            None => match active_release(&config) {
+                Ok(Some((release, path))) => {
+                    status::downloaded_status(&identity, &release, &path, None)
+                }
+                Ok(None) => status::idle_status(&identity),
+                Err(error) => status::error_status(&identity, error),
+            },
         }),
         "check" => Ok(outcome_status(&identity, check::check(&config).await)),
-        "download" => Ok(status::error_status(
-            &identity,
-            support::UpdateError::new(
-                "update-download-unavailable",
-                "this build can see a newer release but cannot download it yet",
+        "download" => {
+            // A download always re-reads the feed: the artifact is chosen by
+            // the same decision that reported it available, so nothing can be
+            // fetched that a check would not have offered.
+            let outcome = check::check(&config).await;
+            let Some(candidate) = outcome.candidate.clone() else {
+                return Ok(outcome_status(&identity, outcome));
+            };
+            Ok(
+                match download::download_release(&config, &candidate).await {
+                    Ok(release) => match active_release(&config) {
+                        Ok(Some((_, path))) => {
+                            status::downloaded_status(&identity, &release, &path, None)
+                        }
+                        Ok(None) => status::idle_status(&identity),
+                        Err(error) => status::error_status(&identity, error),
+                    },
+                    Err(error) => status::error_status(&identity, error),
+                },
+            )
+        }
+        "install" => Ok(match active_release(&config) {
+            Ok(Some((release, path))) => match install::open_installer(&config.platform, &path) {
+                Ok(result) => status::downloaded_status(&identity, &release, &path, Some(&result)),
+                Err(error) => status::error_status(&identity, error),
+            },
+            Ok(None) => status::error_status(
+                &identity,
+                UpdateError::new(
+                    "no-downloaded-release",
+                    "there is no downloaded update to install",
+                ),
             ),
-        )),
-        "install" => Ok(status::error_status(
-            &identity,
-            support::UpdateError::new(
-                "update-install-unavailable",
-                "this build cannot hand an update to an installer yet",
-            ),
-        )),
-        "clear-cache" => Ok(status::error_status(
-            &identity,
-            support::UpdateError::new(
-                "update-store-unavailable",
-                "this build keeps no update store yet",
-            ),
-        )),
-        "quit" => Ok(failure(
-            "the desktop updater is not available in this shell, so there is no update to quit for",
-        )),
+            Err(error) => status::error_status(&identity, error),
+        }),
+        "clear-cache" => Ok(match store::clear_cached_releases(&config.download_root) {
+            Ok(()) => status::idle_status(&identity),
+            Err(error) => status::error_status(&identity, error),
+        }),
+        "quit" => {
+            // The renderer calls this after handing an installer to the
+            // platform; on Windows the installer cannot replace a running
+            // binary, so the app has to go. The answer is sent first, then the
+            // process exits from a detached thread.
+            std::thread::spawn(move || {
+                std::thread::sleep(QUIT_GRACE);
+                app.exit(0);
+            });
+            Ok(success())
+        }
         "set-menu-labels" => Ok(failure(
             "this shell has no native application menu to relabel",
         )),
@@ -161,18 +216,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn the_arch_spelling_is_the_one_the_renderer_compares() {
-        assert!(matches!(node_arch(), "x64" | "arm64" | "ia32" | "arm"));
-    }
-
-    #[test]
-    fn a_download_or_install_request_is_refused_by_name() {
-        // The install half is not ported, and the refusal has to say which
-        // half rather than blaming the platform or the feed.
-        let config = config::resolve_config(&config::UpdaterConfigInput {
+    fn config() -> UpdaterConfig {
+        config::resolve_config(&config::UpdaterConfigInput {
             env: [
                 ("OD_UPDATE_PLATFORM".to_string(), "darwin".to_string()),
+                ("OD_UPDATE_ARCH".to_string(), "arm64".to_string()),
                 ("OD_UPDATE_CHANNEL".to_string(), "beta".to_string()),
                 ("OD_UPDATE_CURRENT_VERSION".to_string(), "1.0.0".to_string()),
             ]
@@ -181,7 +229,17 @@ mod tests {
             packaged: true,
             ..Default::default()
         })
-        .expect("config");
+        .expect("config")
+    }
+
+    #[test]
+    fn the_arch_spelling_is_the_one_the_renderer_compares() {
+        assert!(matches!(node_arch(), "x64" | "arm64" | "ia32" | "arm"));
+    }
+
+    #[test]
+    fn a_check_outcome_maps_onto_the_snapshot_the_renderer_expects() {
+        let config = config();
         let identity = identity(&config);
         assert_eq!(
             outcome_status(
@@ -206,5 +264,46 @@ mod tests {
             )["error"]["code"],
             json!("update-check-failed")
         );
+        assert_eq!(
+            outcome_status(
+                &identity,
+                check::CheckOutcome {
+                    state: model::UpdateState::Unsupported,
+                    candidate: None,
+                    error: None,
+                },
+            )["state"],
+            json!("unsupported")
+        );
+        assert_eq!(
+            outcome_status(
+                &identity,
+                check::CheckOutcome {
+                    state: model::UpdateState::NotAvailable,
+                    candidate: None,
+                    error: None,
+                },
+            )["state"],
+            json!("not-available")
+        );
+    }
+
+    #[test]
+    fn a_store_that_holds_nothing_reports_idle_rather_than_a_stale_release() {
+        let root = std::env::temp_dir().join(format!(
+            "od-updater-active-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ));
+        let mut config = config();
+        config.download_root = root.clone();
+        assert!(
+            active_release(&config).expect("store").is_none(),
+            "a fresh store holds no release"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

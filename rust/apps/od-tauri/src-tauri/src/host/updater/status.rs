@@ -17,14 +17,13 @@ use super::support::UpdateError;
 
 /// Whether this build can carry a package-launcher update through to the end.
 ///
-/// The feed read and the release decision are ported; the resumable download,
-/// the checksum verification, and the installer handoff are not. A status
-/// snapshot must not advertise a capability the host cannot deliver, so the
-/// platform reports `supported: false` — and the renderer accordingly renders
-/// no updater control — until this flips with the download port. `check` still
-/// answers the truth about the feed; the snapshot just does not promise an
-/// install it cannot perform.
-pub const CAN_APPLY_PACKAGE_LAUNCHER_UPDATES: bool = false;
+/// Every step the Electron host takes is ported: the feed read, the release
+/// decision, the resumable download, the checksum verification, the store, and
+/// the installer handoff. What is *not* ported is the status stream (so a
+/// download reports its result when it finishes rather than while it runs), the
+/// scheduler, and the native menu labels; none of those change whether an
+/// install can be completed, so the platform may advertise itself as supported.
+pub const CAN_APPLY_PACKAGE_LAUNCHER_UPDATES: bool = true;
 
 /// The facts every status document reports about the build answering it.
 #[derive(Debug, Clone)]
@@ -114,6 +113,36 @@ pub fn available_status(identity: &StatusIdentity, candidate: &UpdateCandidate) 
 pub fn error_status(identity: &StatusIdentity, error: UpdateError) -> Value {
     let document = identity.document(UpdateState::Error, identity.supported(), None);
     with_error(document, error)
+}
+
+/// The snapshot of a release the store holds, downloaded and verified.
+///
+/// `downloadPath` is what the renderer opens, and a present `installResult` is
+/// how it learns the platform installer is already running — both are read off
+/// this document rather than passed through the command result.
+pub fn downloaded_status(
+    identity: &StatusIdentity,
+    release: &super::store::UpdateReleaseRef,
+    artifact_path: &std::path::Path,
+    install: Option<&super::install::InstallResult>,
+) -> Value {
+    let mut document = identity.document(
+        UpdateState::Downloaded,
+        identity.supported(),
+        release.artifact.artifact_type.as_deref(),
+    );
+    document.insert("availableVersion".into(), json!(release.version));
+    document.insert("artifactUrl".into(), json!(release.artifact.url));
+    document.insert("artifact".into(), release.artifact.to_json());
+    document.insert("checksum".into(), release.checksum.to_json());
+    document.insert(
+        "downloadPath".into(),
+        json!(artifact_path.to_string_lossy().into_owned()),
+    );
+    if let Some(install) = install {
+        document.insert("installResult".into(), install.to_json());
+    }
+    Value::Object(document)
 }
 
 #[cfg(test)]
@@ -209,22 +238,75 @@ mod tests {
     }
 
     #[test]
-    fn an_unported_download_path_is_not_advertised() {
-        // The feed read is ported; the download is not. A supported snapshot
-        // would invite a click the host cannot serve.
-        if !CAN_APPLY_PACKAGE_LAUNCHER_UPDATES {
-            for build in ["darwin", "win32"] {
-                let config = config(build);
-                let status = idle_status(&identity(&config));
-                assert_eq!(status["supported"], json!(false), "{build}");
+    fn the_supported_platforms_advertise_the_flow_they_can_finish() {
+        for build in ["darwin", "win32"] {
+            let config = config(build);
+            for status in [
+                idle_status(&identity(&config)),
+                not_available_status(&identity(&config)),
+            ] {
+                assert_eq!(status["supported"], json!(true), "{build}");
                 assert_eq!(
                     status["capabilities"]["canDownload"],
-                    json!(false),
+                    json!(true),
                     "{build}"
                 );
-                assert_eq!(status["state"], json!("idle"), "{build}");
             }
         }
+        // A distribution package's updates belong to its package manager.
+        let linux = idle_status(&identity(&config("linux")));
+        assert_eq!(linux["supported"], json!(false));
+        assert_eq!(linux["capabilities"]["canDownload"], json!(false));
+    }
+
+    #[test]
+    fn a_downloaded_release_names_its_path_and_can_record_the_installer() {
+        let config = config("darwin");
+        let candidate = select_update_candidate(&feed(), &config, false).expect("candidate");
+        let release = crate::host::updater::store::UpdateReleaseRef {
+            arch: candidate.arch.clone(),
+            artifact: candidate.artifact.clone(),
+            artifact_path: "releases/key/open-design.dmg".into(),
+            checksum: candidate.checksum.clone(),
+            checksum_path: "releases/key/checksum.json".into(),
+            channel: candidate.channel.as_str().into(),
+            downloaded_at: "2026-01-01T00:00:00.000Z".into(),
+            key: "key".into(),
+            metadata: candidate.metadata.clone(),
+            metadata_path: "releases/key/metadata.json".into(),
+            platform_key: candidate.platform_key.clone(),
+            version: candidate.version.clone(),
+        };
+        let path = std::path::Path::new("/tmp/open-design.dmg");
+        let downloaded = downloaded_status(&identity(&config), &release, path, None);
+        assert_eq!(downloaded["state"], json!("downloaded"));
+        assert_eq!(downloaded["availableVersion"], json!("1.2.3-beta.4"));
+        assert_eq!(downloaded["downloadPath"], json!("/tmp/open-design.dmg"));
+        assert_eq!(downloaded["artifact"]["type"], json!("dmg"));
+        assert!(
+            downloaded.get("installResult").is_none(),
+            "a download is not an install"
+        );
+
+        let install = crate::host::updater::install::InstallResult {
+            opened_at: "2026-01-01T00:00:01.000Z".into(),
+            path: "/tmp/open-design.dmg".into(),
+        };
+        let installed = downloaded_status(&identity(&config), &release, path, Some(&install));
+        assert_eq!(installed["state"], json!("downloaded"));
+        assert_eq!(
+            installed["installResult"]["path"],
+            json!("/tmp/open-design.dmg")
+        );
+        assert_eq!(
+            installed["installResult"]["openedAt"],
+            json!("2026-01-01T00:00:01.000Z")
+        );
+        assert_eq!(
+            installed["capabilities"]["canOpenInstaller"],
+            json!(true),
+            "an installer handoff is what this flow offers"
+        );
     }
 
     #[test]

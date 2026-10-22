@@ -17,6 +17,23 @@ pub enum ChecksumAlgorithm {
     Sha512,
 }
 
+impl ChecksumAlgorithm {
+    /// The digest's hex length.
+    pub fn hex_length(self) -> usize {
+        match self {
+            Self::Sha256 => 64,
+            Self::Sha512 => 128,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sha256 => "sha256",
+            Self::Sha512 => "sha512",
+        }
+    }
+}
+
 /// An artifact a feed offers (parity: `DesktopUpdateArtifactSnapshot`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -62,12 +79,14 @@ impl ArtifactSnapshot {
 
 /// The states a status snapshot may report (parity: `DESKTOP_UPDATE_STATES`).
 ///
-/// Only the states this host can reach are variants: the download and install
-/// phases (`checking`, `downloading`, `downloaded`, `installing`) arrive with
-/// the download port, and a state nothing can produce is a promise in the type.
+/// Only the states this host can reach are variants. The transition states
+/// (`checking`, `downloading`, `installing`) are not: a command answers with
+/// its result, so nothing would ever observe them without a status stream, and
+/// a variant nothing constructs is a promise in the type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateState {
     Available,
+    Downloaded,
     Error,
     Idle,
     NotAvailable,
@@ -78,6 +97,7 @@ impl UpdateState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Available => "available",
+            Self::Downloaded => "downloaded",
             Self::Error => "error",
             Self::Idle => "idle",
             Self::NotAvailable => "not-available",
@@ -160,6 +180,7 @@ mod tests {
         assert_eq!(UpdateState::NotAvailable.as_str(), "not-available");
         assert_eq!(UpdateState::Unsupported.as_str(), "unsupported");
         assert_eq!(UpdateState::Available.as_str(), "available");
+        assert_eq!(UpdateState::Downloaded.as_str(), "downloaded");
         assert_eq!(UpdateState::Idle.as_str(), "idle");
         assert_eq!(UpdateState::Error.as_str(), "error");
     }
