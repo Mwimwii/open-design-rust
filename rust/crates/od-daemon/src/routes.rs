@@ -122,6 +122,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/workspace/directory", get(workspace_directory))
         .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/import/folder", post(import_folder))
+        .route(
+            "/api/workspaces/{workspaceId}/projects",
+            get(list_workspace_projects),
+        )
         .route("/api/projects/{id}", get(get_project).patch(patch_project))
         .route(
             "/api/projects/{id}/working-dir",
@@ -324,6 +328,14 @@ async fn list_projects(State(state): State<AppState>) -> Response {
         Ok(Ok(projects)) => {
             let projects: Vec<Value> = projects
                 .iter()
+                // A project that names a project location is only visible when
+                // it belongs to a configured one (parity:
+                // `projectVisibleForLocations`).
+                .filter(|project| {
+                    crate::workspace_projects::metadata_visible_for_locations(
+                        project.metadata_json.as_deref(),
+                    )
+                })
                 .map(|project| {
                     let mut value = project.to_api_json();
                     // The no-scope catalog only ever lists unbound projects.
@@ -335,6 +347,90 @@ async fn list_projects(State(state): State<AppState>) -> Response {
         }
         Ok(Err(err)) => store_error_response(&err),
         Err(join) => internal_error(&join.to_string()),
+    }
+}
+
+/// `GET /api/workspaces/:workspaceId/projects` — the workspace-scoped project
+/// list (parity: `apps/daemon/src/routes/project/index.ts`).
+///
+/// The daemon has no Vela authority verifier, so the header context *is* the
+/// authority — exactly the configuration the TypeScript daemon runs in when
+/// `verifyWorkspaceRequestAuthority` is not wired
+/// (`authoritativeWorkspaceProjectContext` falls back to the same header
+/// reader). A request with no member identity gets a 401
+/// (`WORKSPACE_CONTEXT_REQUIRED`).
+async fn list_workspace_projects(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let Some(mut context) =
+        crate::workspace_context::workspace_resource_context(&headers, &workspace_id)
+    else {
+        return api_error(
+            StatusCode::UNAUTHORIZED,
+            "WORKSPACE_CONTEXT_REQUIRED",
+            "workspace context is required",
+        );
+    };
+    // The request's own capability flags are UI ceilings only: they may hide
+    // an action, but never elevate directory-backed authority.
+    if let crate::workspace_context::WorkspaceAssertion::Complete(asserted) =
+        crate::workspace_context::workspace_resource_context_from_request(&headers)
+    {
+        context.can_share_projects &= asserted.can_share_projects;
+        context.can_write_synced_files &= asserted.can_write_synced_files;
+    }
+    if context.member_status == crate::workspace_context::WorkspaceMemberStatus::Removed {
+        // A removed member keeps its identity but loses every project.
+        return Json(json!({ "projects": [] })).into_response();
+    }
+    let view = single_query_value(query.as_deref(), "view").unwrap_or_else(|| "all".to_string());
+    if !matches!(view.as_str(), "all" | "recent" | "drafts" | "team") {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "view must be all, recent, drafts, or team",
+        );
+    }
+    let owner = single_query_value(query.as_deref(), "owner").unwrap_or_else(|| "all".to_string());
+    let visibility =
+        single_query_value(query.as_deref(), "visibility").unwrap_or_else(|| "all".to_string());
+
+    let store = state.store.clone();
+    let filters = crate::workspace_projects::ListFilters {
+        view,
+        owner,
+        visibility,
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        // A personal workspace adopts the projects no workspace has claimed —
+        // the pre-workspace projects, which would otherwise be lost across
+        // the upgrade (parity: `bindUnboundProjectsToPersonalWorkspace`).
+        crate::workspace_projects::bind_unbound_projects_to_personal_workspace(&store, &context)?;
+        let rows = store.list_workspace_projects(&context.workspace_id)?;
+        let mut projects: Vec<Value> = Vec::new();
+        for row in &rows {
+            if !crate::workspace_projects::row_belongs_to_current_workspace(row, &context) {
+                continue;
+            }
+            if !crate::workspace_projects::row_visible_for_locations(row) {
+                continue;
+            }
+            let summary = crate::workspace_projects::normalize_workspace_project_row(row, &context);
+            if !filters.keeps(&summary, &context) {
+                continue;
+            }
+            projects.push(summary);
+        }
+        Ok::<_, StoreError>(projects)
+    })
+    .await;
+    match result {
+        Ok(Ok(projects)) => Json(json!({ "projects": projects })).into_response(),
+        Ok(Err(err)) => store_error_response(&err),
+        Err(err) => internal_error(&err.to_string()),
     }
 }
 
@@ -684,10 +780,13 @@ async fn list_agents(RawQuery(query): RawQuery) -> Response {
 }
 
 /// `POST /api/projects` — create a managed project (parity:
-/// `apps/daemon/src/routes/project/index.ts`). Workspace attribution, catalog
-/// validation, and plugin snapshot resolution are not ported (see
-/// [`crate::project_create`]).
-async fn create_project(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+/// `apps/daemon/src/routes/project/index.ts`). Catalog validation and plugin
+/// snapshot resolution are not ported (see [`crate::project_create`]).
+async fn create_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     let Some(id) = body.get("id").and_then(Value::as_str) else {
         return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "invalid project id");
     };
@@ -803,6 +902,18 @@ async fn create_project(State(state): State<AppState>, Json(body): Json<Value>) 
     let conversation_id = crate::conversations::random_id();
     let conversation_id_for_task = conversation_id.clone();
     let project_dir = state.config.paths.projects_dir().join(&id);
+    // The workspace attribution is captured from the request headers. It is
+    // local attribution for `personal` + `local_only` routing — never a
+    // permission to publish, and never a reason to look anything up (parity:
+    // `localProjectWorkspaceAttribution`). A missing or partial identity
+    // leaves the project unbound.
+    let workspace_context =
+        match crate::workspace_context::workspace_resource_context_from_request(&headers) {
+            crate::workspace_context::WorkspaceAssertion::Complete(context) => Some(context),
+            crate::workspace_context::WorkspaceAssertion::None
+            | crate::workspace_context::WorkspaceAssertion::Missing => None,
+        };
+    let workspace_context_for_task = workspace_context.clone();
     let result = tokio::task::spawn_blocking(move || {
         let now = crate::conversations::now_ms();
         // The managed project directory is created with the row (parity:
@@ -828,13 +939,25 @@ async fn create_project(State(state): State<AppState>, Json(body): Json<Value>) 
             &session_mode,
             now,
         )?;
+        // The project and its workspace membership form one ownership record.
+        crate::workspace_projects::bind_created_project_to_workspace(
+            &store,
+            workspace_context_for_task.as_ref(),
+            &id,
+            now,
+        )?;
         Ok::<_, StoreError>(project)
     })
     .await;
     match result {
         Ok(Ok(project)) => {
             let mut project_json = project.to_api_json();
-            project_json["workspaceId"] = Value::Null;
+            // The project now belongs to the workspace the request asserted, if
+            // any (parity: the create response carries the binding).
+            project_json["workspaceId"] = match workspace_context.as_ref() {
+                Some(context) => Value::String(context.workspace_id.clone()),
+                None => Value::Null,
+            };
             Json(json!({ "project": project_json, "conversationId": conversation_id }))
                 .into_response()
         }
@@ -847,8 +970,8 @@ async fn create_project(State(state): State<AppState>, Json(body): Json<Value>) 
 /// (parity: `apps/daemon/src/import-export-routes.ts`).
 ///
 /// The desktop import token and the `orchestratorWorkspace` contract are
-/// ported; workspace attribution (`x-od-workspace-*`) is not — this daemon has
-/// no workspace identity, so every import is a headerless local create.
+/// ported, and so is the workspace attribution: a request that names a
+/// workspace gets the imported project bound to it.
 async fn import_folder(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -892,6 +1015,16 @@ async fn import_folder(
     let project_id = crate::conversations::random_id();
     let conversation_id = crate::conversations::random_id();
     let conversation_id_for_task = conversation_id.clone();
+    // The workspace attribution is local attribution only (parity:
+    // `localProjectWorkspaceAttribution`): a missing or partial identity
+    // leaves the import unbound.
+    let workspace_context =
+        match crate::workspace_context::workspace_resource_context_from_request(&headers) {
+            crate::workspace_context::WorkspaceAssertion::Complete(context) => Some(context),
+            crate::workspace_context::WorkspaceAssertion::None
+            | crate::workspace_context::WorkspaceAssertion::Missing => None,
+        };
+    let workspace_context_for_task = workspace_context.clone();
     let store = state.store.clone();
     let result = tokio::task::spawn_blocking(move || {
         // Resolve symlinks once and persist the canonical path (parity: the
@@ -953,13 +1086,23 @@ async fn import_folder(
         store
             .set_tabs(&project_id, &[], None, now)
             .map_err(|err| err.to_string())?;
+        crate::workspace_projects::bind_created_project_to_workspace(
+            &store,
+            workspace_context_for_task.as_ref(),
+            &project_id,
+            now,
+        )
+        .map_err(|err| err.to_string())?;
         Ok::<_, String>((project, entry_file))
     })
     .await;
     match result {
         Ok(Ok((project, entry_file))) => {
             let mut project_json = project.to_api_json();
-            project_json["workspaceId"] = Value::Null;
+            project_json["workspaceId"] = match workspace_context.as_ref() {
+                Some(context) => Value::String(context.workspace_id.clone()),
+                None => Value::Null,
+            };
             Json(json!({
                 "project": project_json,
                 "conversationId": conversation_id,

@@ -109,6 +109,41 @@ async fn http_patch(addr: SocketAddr, path: &str, body: &str) -> (String, String
     (head.to_string(), body.to_string())
 }
 
+/// A raw request with any number of extra header lines.
+async fn http_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> (String, String) {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    if body.is_some() {
+        request.push_str("Content-Type: application/json\r\n");
+    }
+    if let Some(body) = body {
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("Connection: close\r\n\r\n");
+    if let Some(body) = body {
+        request.push_str(body);
+    }
+    tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
+        .await
+        .expect("write");
+    let mut response = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response)
+        .await
+        .expect("read");
+    let response = String::from_utf8_lossy(&response).into_owned();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap_or(("", ""));
+    (head.to_string(), body.to_string())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn project_create_and_import_match_the_web_contract() {
     let paths = temp_paths("project-create");
@@ -1009,10 +1044,185 @@ async fn the_patch_route_keeps_an_imported_project_at_its_folder() {
     );
 }
 
+/// The workspace-scoped project list needs a member identity, and a create
+/// that names a workspace binds the project to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_workspace_attributed_create_is_bound_and_scoped() {
+    let paths = temp_paths("workspace-create");
+    let daemon = RunningDaemon::start(config_with(paths, None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+    let workspace_headers = [
+        ("x-od-workspace-id", "w-1"),
+        ("x-od-workspace-member-id", "m-1"),
+    ];
+
+    // Without a member identity there is no context to list against.
+    let (head, body) = http_get(addr, "/api/workspaces/w-1/projects", None).await;
+    assert!(head.contains("401"), "status: {head}");
+    assert!(body.contains("WORKSPACE_CONTEXT_REQUIRED"), "body: {body}");
+
+    // A create that names a workspace binds the project to it.
+    let (head, body) = http_request(
+        addr,
+        "POST",
+        "/api/projects",
+        &workspace_headers,
+        Some(r#"{"id":"p-bound","name":"Bound"}"#),
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["project"]["workspaceId"], "w-1");
+
+    // The no-scope catalog hides a claimed project.
+    let (_, body) = http_get(addr, "/api/projects", None).await;
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        value["projects"].as_array().map(|items| items.len()),
+        Some(0),
+        "body: {body}"
+    );
+
+    // The scoped list serves it with the summary shape.
+    let (head, body) = http_request(
+        addr,
+        "GET",
+        "/api/workspaces/w-1/projects",
+        &workspace_headers,
+        None,
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let projects = value["projects"].as_array().expect("projects");
+    assert_eq!(projects.len(), 1, "body: {body}");
+    let project = &projects[0];
+    assert_eq!(project["id"], "p-bound");
+    assert_eq!(project["workspaceId"], "w-1");
+    assert_eq!(project["visibility"], "personal");
+    assert_eq!(project["createdByWorkspaceMemberId"], "m-1");
+    assert_eq!(project["syncState"], "local_only");
+    assert_eq!(project["currentUserAccess"]["canOpen"], true);
+    assert_eq!(project["currentUserAccess"]["canRename"], true);
+    assert_eq!(project["project"]["workspaceId"], "w-1");
+
+    // The view filters.
+    let (_, body) = http_request(
+        addr,
+        "GET",
+        "/api/workspaces/w-1/projects?view=team",
+        &workspace_headers,
+        None,
+    )
+    .await;
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        value["projects"].as_array().map(|items| items.len()),
+        Some(0),
+        "body: {body}"
+    );
+    let (_, body) = http_request(
+        addr,
+        "GET",
+        "/api/workspaces/w-1/projects?view=drafts",
+        &workspace_headers,
+        None,
+    )
+    .await;
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        value["projects"].as_array().map(|items| items.len()),
+        Some(1),
+        "body: {body}"
+    );
+
+    // An unknown view is a 400.
+    let (head, body) = http_request(
+        addr,
+        "GET",
+        "/api/workspaces/w-1/projects?view=bogus",
+        &workspace_headers,
+        None,
+    )
+    .await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(
+        body.contains("view must be all, recent, drafts, or team"),
+        "body: {body}"
+    );
+}
+
+/// A personal workspace adopts the projects no workspace has claimed — the
+/// pre-workspace projects, which would otherwise vanish from every list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_personal_workspace_adopts_the_unclaimed_projects() {
+    let paths = temp_paths("workspace-adopt");
+    let daemon = RunningDaemon::start(config_with(paths, None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+    let workspace_headers = [
+        ("x-od-workspace-id", "w-1"),
+        ("x-od-workspace-member-id", "m-1"),
+    ];
+
+    // A headerless create stays in the no-scope catalog.
+    let (head, body) = http_post(
+        addr,
+        "/api/projects",
+        r#"{"id":"p-legacy","name":"Legacy"}"#,
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert!(value["project"]["workspaceId"].is_null(), "body: {body}");
+    let (_, body) = http_get(addr, "/api/projects", None).await;
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        value["projects"].as_array().map(|items| items.len()),
+        Some(1),
+        "body: {body}"
+    );
+
+    // The personal workspace adopts it.
+    let (head, body) = http_request(
+        addr,
+        "GET",
+        "/api/workspaces/w-1/projects",
+        &workspace_headers,
+        None,
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let projects = value["projects"].as_array().expect("projects");
+    assert_eq!(projects.len(), 1, "body: {body}");
+    // An adopted project records no owner: reading it never hands over
+    // ownership.
+    assert!(
+        projects[0]["createdByWorkspaceMemberId"].is_null(),
+        "body: {body}"
+    );
+    // ... and it is not the caller's own, so it stays read-only.
+    assert_eq!(projects[0]["currentUserAccess"]["canRename"], false);
+
+    // The no-scope catalog no longer lists it: it belongs to a workspace now.
+    let (_, body) = http_get(addr, "/api/projects", None).await;
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        value["projects"].as_array().map(|items| items.len()),
+        Some(0),
+        "body: {body}"
+    );
+}
+
 /// The desktop import-token gate: once a desktop has registered a secret,
 /// the folder-import routes only accept a token bound to the picked folder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_desktop_import_gate_binds_a_token_to_one_folder() {    let secret = vec![0x5au8; 32];
+async fn the_desktop_import_gate_binds_a_token_to_one_folder() {
+    let secret = vec![0x5au8; 32];
     let mut config = config_with(temp_paths("desktop-gate"), None);
     config.desktop_auth_secret = Some(secret.clone());
     let daemon = RunningDaemon::start(config).await.expect("start");

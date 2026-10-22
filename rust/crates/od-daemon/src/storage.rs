@@ -39,6 +39,32 @@ pub struct ProjectRow {
 const PROJECT_COLUMNS: &str = "id, name, skill_id, design_system_id, pending_prompt, \
      metadata_json, custom_instructions, created_at, updated_at";
 
+/// The joined project + binding read (parity: `listWorkspaceProjects`).
+const WORKSPACE_PROJECT_SELECT: &str = "SELECT p.id AS id,
+              p.name AS name,
+              p.skill_id AS skill_id,
+              p.design_system_id AS design_system_id,
+              p.pending_prompt AS pending_prompt,
+              p.metadata_json AS metadata_json,
+              p.applied_plugin_snapshot_id AS applied_plugin_snapshot_id,
+              p.custom_instructions AS custom_instructions,
+              p.created_at AS created_at,
+              p.updated_at AS updated_at,
+              wp.project_id AS workspace_project_id,
+              wp.workspace_id AS workspace_id,
+              wp.visibility AS workspace_visibility,
+              wp.resource_state AS resource_state,
+              wp.created_by_workspace_member_id AS created_by_workspace_member_id,
+              wp.updated_by_workspace_member_id AS updated_by_workspace_member_id,
+              wp.resource_hub_resource_id AS resource_hub_resource_id,
+              wp.cloud_tombstoned_at AS cloud_tombstoned_at,
+              wp.sync_state AS sync_state,
+              wp.version AS workspace_version,
+              wp.created_at AS workspace_created_at,
+              wp.updated_at AS workspace_updated_at
+         FROM workspace_projects wp
+         JOIN projects p ON p.id = wp.project_id";
+
 impl ProjectRow {
     /// The camelCase project shape `apps/web` reads.
     ///
@@ -93,6 +119,50 @@ pub struct ProjectUpdate {
     pub pending_prompt: Option<String>,
     pub metadata_json: Option<String>,
     pub custom_instructions: Option<String>,
+    pub updated_at: i64,
+}
+
+/// A `workspace_projects` binding row, joined with the project it binds.
+///
+/// Parity: the row shape `listWorkspaceProjects` returns (db.ts:1136).
+#[derive(Debug, Clone)]
+pub struct WorkspaceProjectRow {
+    pub id: String,
+    pub name: String,
+    pub skill_id: Option<String>,
+    pub design_system_id: Option<String>,
+    pub pending_prompt: Option<String>,
+    pub metadata_json: Option<String>,
+    pub applied_plugin_snapshot_id: Option<String>,
+    pub custom_instructions: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub workspace_id: String,
+    pub workspace_visibility: String,
+    pub resource_state: String,
+    pub created_by_workspace_member_id: Option<String>,
+    pub updated_by_workspace_member_id: Option<String>,
+    pub resource_hub_resource_id: Option<String>,
+    pub cloud_tombstoned_at: Option<i64>,
+    pub sync_state: Option<String>,
+    pub workspace_version: i64,
+    pub workspace_created_at: i64,
+    pub workspace_updated_at: i64,
+}
+
+/// The binding row a freshly created project gets (parity:
+/// `bindCreatedProjectToWorkspace` → `ensureWorkspaceProject`).
+#[derive(Debug, Clone)]
+pub struct NewWorkspaceProject<'a> {
+    pub project_id: &'a str,
+    pub workspace_id: &'a str,
+    pub visibility: &'a str,
+    pub resource_state: &'a str,
+    /// `None` for an adopted orphan: a lazily projected row records no owner.
+    pub created_by_workspace_member_id: Option<&'a str>,
+    pub updated_by_workspace_member_id: Option<&'a str>,
+    pub sync_state: &'a str,
+    pub created_at: i64,
     pub updated_at: i64,
 }
 
@@ -340,6 +410,81 @@ impl Store {
         Ok(row)
     }
 
+    /// Bind a project to a workspace (parity: `ensureWorkspaceProject`).
+    ///
+    /// Deliberately keyed on the PROJECT, not on `(workspace, project)`: a
+    /// project already bound elsewhere is returned as-is rather than bound a
+    /// second time.
+    pub fn ensure_workspace_project(
+        &self,
+        input: &NewWorkspaceProject<'_>,
+    ) -> Result<WorkspaceProjectRow, StoreError> {
+        if let Some(existing) = self.workspace_project_row(input.project_id)? {
+            return Ok(existing);
+        }
+        {
+            let conn = self.lock()?;
+            conn.execute(
+                "INSERT INTO workspace_projects
+                   (project_id, workspace_id, visibility, resource_state,
+                    created_by_workspace_member_id, updated_by_workspace_member_id,
+                    resource_hub_resource_id, cloud_tombstoned_at,
+                    sync_state, version, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, 1, ?8, ?9)",
+                rusqlite::params![
+                    input.project_id,
+                    input.workspace_id,
+                    input.visibility,
+                    input.resource_state,
+                    input.created_by_workspace_member_id,
+                    input.updated_by_workspace_member_id,
+                    input.sync_state,
+                    input.created_at,
+                    input.updated_at,
+                ],
+            )?;
+        }
+        self.workspace_project_row(input.project_id)?
+            .ok_or_else(|| {
+                StoreError::Migration("the workspace binding was not written".to_string())
+            })
+    }
+
+    /// The binding row of one project (parity: `getWorkspaceProject`).
+    pub fn workspace_project_row(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<WorkspaceProjectRow>, StoreError> {
+        let rows = self.list_workspace_projects_for_project(project_id)?;
+        Ok(rows.into_iter().next())
+    }
+
+    fn list_workspace_projects_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<WorkspaceProjectRow>, StoreError> {
+        self.query(
+            &format!("{WORKSPACE_PROJECT_SELECT} WHERE wp.project_id = ?1"),
+            [project_id],
+            map_workspace_project_row,
+        )
+    }
+
+    /// Every project a workspace holds (parity: `listWorkspaceProjects`).
+    pub fn list_workspace_projects(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<WorkspaceProjectRow>, StoreError> {
+        self.query(
+            &format!(
+                "{WORKSPACE_PROJECT_SELECT} WHERE wp.workspace_id = ?1 \
+                      ORDER BY MAX(p.updated_at, wp.updated_at) DESC"
+            ),
+            [workspace_id],
+            map_workspace_project_row,
+        )
+    }
+
     /// Test/ops helper: run a statement outside the route layer.
     pub fn execute<P: rusqlite::Params>(&self, sql: &str, params: P) -> Result<usize, StoreError> {
         let conn = self.lock()?;
@@ -381,6 +526,32 @@ fn map_project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRow> {
         custom_instructions: row.get("custom_instructions")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
+    })
+}
+
+fn map_workspace_project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceProjectRow> {
+    Ok(WorkspaceProjectRow {
+        id: row.get("id")?,
+        name: row.get("name")?,
+        skill_id: row.get("skill_id")?,
+        design_system_id: row.get("design_system_id")?,
+        pending_prompt: row.get("pending_prompt")?,
+        metadata_json: row.get("metadata_json")?,
+        applied_plugin_snapshot_id: row.get("applied_plugin_snapshot_id")?,
+        custom_instructions: row.get("custom_instructions")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        workspace_id: row.get("workspace_id")?,
+        workspace_visibility: row.get("workspace_visibility")?,
+        resource_state: row.get("resource_state")?,
+        created_by_workspace_member_id: row.get("created_by_workspace_member_id")?,
+        updated_by_workspace_member_id: row.get("updated_by_workspace_member_id")?,
+        resource_hub_resource_id: row.get("resource_hub_resource_id")?,
+        cloud_tombstoned_at: row.get("cloud_tombstoned_at")?,
+        sync_state: row.get("sync_state")?,
+        workspace_version: row.get("workspace_version")?,
+        workspace_created_at: row.get("workspace_created_at")?,
+        workspace_updated_at: row.get("workspace_updated_at")?,
     })
 }
 
