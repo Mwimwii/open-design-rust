@@ -31,8 +31,9 @@ pub mod status;
 pub mod store;
 pub mod support;
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -67,11 +68,11 @@ static INSTALLER_OPENED: AtomicBool = AtomicBool::new(false);
 
 /// Whether this build has already handed its update to the platform installer.
 pub fn installer_opened() -> bool {
-    INSTALLER_OPENED.load(Ordering::Relaxed)
+    INSTALLER_OPENED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn note_installer_opened() {
-    INSTALLER_OPENED.store(true, Ordering::Relaxed);
+    INSTALLER_OPENED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `process.arch`'s spelling, which is what the renderer receives elsewhere.
@@ -139,18 +140,50 @@ fn outcome_status(identity: &status::StatusIdentity<'_>, outcome: check::CheckOu
 }
 
 /// The store's active release, resolved to a path inside the store.
+///
+/// A release this build already runs is not an update. After the external
+/// installer hands off and the app relaunches onto that version, the store's
+/// record is left over from the run that downloaded it: reporting it would keep
+/// offering the version already running, and `install` would open the same
+/// installer again on every relaunch. Such a record is dropped here (parity:
+/// `loadActiveRelease` refusing `active.version <= currentVersion` while the
+/// store is restored at startup).
 fn active_release(
     config: &UpdaterConfig,
 ) -> Result<Option<(store::UpdateReleaseRef, std::path::PathBuf)>, UpdateError> {
     let owned = store::ensure_owned_root(&config.download_root, store::STORE_OWNER)?;
+    let Some(release) = owned.metadata.active.clone() else {
+        return Ok(None);
+    };
+    if feed::compare_versions(&release.version, &config.current_version) != Ordering::Greater {
+        // The `currentVersion` exception the Electron host keeps is its
+        // launcher reinstall gate; this shell has no launcher runtime, so a
+        // release that is not strictly newer is always stale here.
+        clear_applied_release(&owned);
+        return Ok(None);
+    }
     // Cloned rather than moved: the path has to be resolved against the store
     // that holds the record.
-    match owned.metadata.active.clone() {
-        Some(release) => {
-            let path = owned.resolve(&release.artifact_path)?;
-            Ok(Some((release, path)))
-        }
-        None => Ok(None),
+    let path = owned.resolve(&release.artifact_path)?;
+    Ok(Some((release, path)))
+}
+
+/// Forget the store's active release because this build already runs it.
+///
+/// A failed write is logged, not returned: the caller only wanted to know
+/// whether an update is pending, and reporting a store error instead would
+/// hide a status the renderer can still act on. The next read retries.
+fn clear_applied_release(owned: &store::OwnedRoot) {
+    let metadata = store::StoreMetadata {
+        active: None,
+        ..owned.metadata.clone()
+    };
+    if let Err(error) = store::write_metadata(&owned.layout, &metadata) {
+        tracing::warn!(
+            code = %error.code,
+            message = %error.message,
+            "could not clear the applied update from the store"
+        );
     }
 }
 
@@ -378,6 +411,87 @@ mod tests {
             active_release(&config).expect("store").is_none(),
             "a fresh store holds no release"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// A store holding one release at `version`, with the artifact on disk.
+    fn store_holding(root: &std::path::Path, version: &str) -> UpdaterConfig {
+        let owned = store::ensure_owned_root(root, store::STORE_OWNER).expect("store");
+        std::fs::create_dir_all(root.join("releases/key")).expect("releases dir");
+        std::fs::write(root.join("releases/key/OpenDesign.dmg"), b"artifact").expect("artifact");
+        let mut metadata = owned.metadata.clone();
+        metadata.active = Some(store::UpdateReleaseRef {
+            arch: "arm64".into(),
+            artifact: model::ArtifactSnapshot {
+                name: Some("OpenDesign.dmg".into()),
+                platform_key: Some("mac".into()),
+                size: Some(8),
+                artifact_type: Some("dmg".into()),
+                url: "https://example.test/OpenDesign.dmg".into(),
+            },
+            artifact_path: "releases/key/OpenDesign.dmg".into(),
+            checksum: model::ChecksumSnapshot {
+                algorithm: model::ChecksumAlgorithm::Sha256,
+                url: None,
+                value: Some("a".repeat(64)),
+            },
+            checksum_path: "releases/key/checksum.json".into(),
+            channel: "beta".into(),
+            downloaded_at: "2026-01-01T00:00:00.000Z".into(),
+            key: "1.2.3-mac-arm64-abcdef123456".into(),
+            metadata: serde_json::Map::new(),
+            metadata_path: "releases/key/metadata.json".into(),
+            platform_key: "mac".into(),
+            version: version.into(),
+        });
+        store::write_metadata(&owned.layout, &metadata).expect("write metadata");
+        let mut config = config();
+        config.download_root = root.to_path_buf();
+        config
+    }
+
+    fn scratch_root(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "od-updater-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ))
+    }
+
+    #[test]
+    fn a_release_this_build_already_runs_is_not_offered_again() {
+        let root = scratch_root("applied");
+        // `config()` runs 1.0.0; the store's release is the one already applied.
+        let config = store_holding(&root, "1.0.0");
+        assert!(
+            active_release(&config).expect("store").is_none(),
+            "the running version must not be offered as an update"
+        );
+        let reopened = store::ensure_owned_root(&root, store::STORE_OWNER).expect("reopen");
+        assert_eq!(
+            reopened.metadata.active, None,
+            "the stale record is cleared, not just ignored, so the UI cannot revive it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_older_release_left_in_the_store_is_dropped_too() {
+        let root = scratch_root("older");
+        let config = store_holding(&root, "0.9.0");
+        assert!(active_release(&config).expect("store").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_newer_release_in_the_store_stays_actionable() {
+        let root = scratch_root("newer");
+        let config = store_holding(&root, "1.1.0");
+        let active = active_release(&config).expect("store").expect("release");
+        assert_eq!(active.0.version, "1.1.0");
+        assert!(active.1.ends_with("OpenDesign.dmg"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
