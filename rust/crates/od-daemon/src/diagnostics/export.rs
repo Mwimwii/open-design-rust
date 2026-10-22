@@ -597,7 +597,7 @@ mod tests {
     #[test]
     fn packaged_runtime_follows_the_exec_path() {
         assert!(is_packaged_runtime(None, Some("/r")));
-        assert!(is_packaged_runtime(Some("/usr/share/OpenDesign/od-tauri"), None));
+        assert!(is_packaged_runtime(Some("/usr/share/OpenDesign/OpenDesign"), None));
         assert!(is_packaged_runtime(Some("/opt/OpenDesign/x"), None));
         assert!(!is_packaged_runtime(Some("/home/me/target/debug/od-tauri"), None));
         assert!(!is_packaged_runtime(None, None));
