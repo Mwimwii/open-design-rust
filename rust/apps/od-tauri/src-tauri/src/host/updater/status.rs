@@ -115,6 +115,36 @@ pub fn error_status(identity: &StatusIdentity, error: UpdateError) -> Value {
     with_error(document, error)
 }
 
+/// The snapshot a status stream reports while a transfer runs.
+///
+/// `progress` is what the renderer's percentage reads (`downloadProgressFromStatus`
+/// in `apps/web/src/lib/updater.ts`); a feed that declared no size leaves
+/// `totalBytes` absent and the renderer shows an indeterminate bar rather than
+/// inventing a denominator.
+pub fn downloading_status(
+    identity: &StatusIdentity,
+    candidate: &UpdateCandidate,
+    received_bytes: u64,
+    total_bytes: Option<u64>,
+) -> Value {
+    let mut document = identity.document(
+        UpdateState::Downloading,
+        identity.supported(),
+        Some(candidate.artifact_type_name()),
+    );
+    let mut progress = serde_json::Map::new();
+    progress.insert("receivedBytes".into(), json!(received_bytes));
+    if let Some(total) = total_bytes {
+        progress.insert("totalBytes".into(), json!(total));
+    }
+    document.insert("availableVersion".into(), json!(candidate.version));
+    document.insert("artifactUrl".into(), json!(candidate.artifact.url));
+    document.insert("artifact".into(), candidate.artifact.to_json());
+    document.insert("checksum".into(), candidate.checksum.to_json());
+    document.insert("progress".into(), Value::Object(progress));
+    Value::Object(document)
+}
+
 /// The snapshot of a release the store holds, downloaded and verified.
 ///
 /// `downloadPath` is what the renderer opens, and a present `installResult` is
@@ -257,6 +287,26 @@ mod tests {
         let linux = idle_status(&identity(&config("linux")));
         assert_eq!(linux["supported"], json!(false));
         assert_eq!(linux["capabilities"]["canDownload"], json!(false));
+    }
+
+    #[test]
+    fn a_running_download_reports_the_progress_the_renderer_draws() {
+        let config = config("darwin");
+        let candidate = select_update_candidate(&feed(), &config, false).expect("candidate");
+        let status = downloading_status(&identity(&config), &candidate, 4, Some(10));
+        assert_eq!(status["state"], json!("downloading"));
+        assert_eq!(status["availableVersion"], json!("1.2.3-beta.4"));
+        assert_eq!(status["progress"]["receivedBytes"], json!(4));
+        assert_eq!(status["progress"]["totalBytes"], json!(10));
+
+        // A feed that declared no size leaves the denominator out, so the
+        // renderer shows an indeterminate bar instead of inventing one.
+        let indeterminate = downloading_status(&identity(&config), &candidate, 4, None);
+        assert_eq!(indeterminate["progress"]["receivedBytes"], json!(4));
+        assert!(
+            indeterminate["progress"].get("totalBytes").is_none(),
+            "an unknown total is absent, not zero"
+        );
     }
 
     #[test]

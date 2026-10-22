@@ -151,10 +151,47 @@ const BRIDGE_SOURCE: &str = r#"(function () {
     return snapshot('host_updater', { action: action, options: options || null });
   }
 
-  // No native surface ever pushes an update status in this shell, so there is
-  // nothing to unsubscribe from.
+  // The open-dialog stream has no producer in this shell, so there is nothing
+  // to unsubscribe from.
   function never() {
     return function () {};
+  }
+
+  // The updater's status stream. Tauri events reach the page through the same
+  // internals object commands go through; a build whose event plugin is absent
+  // (or whose API moved) degrades to no stream rather than a throwing bridge.
+  var UPDATER_STATUS_EVENT = 'od:updater-status';
+  function subscribeUpdaterStatus(listener) {
+    var internals = window.__TAURI_INTERNALS__;
+    if (!internals || typeof internals.invoke !== 'function' || typeof internals.transformCallback !== 'function') {
+      return function () {};
+    }
+    var stopped = false;
+    var eventId = null;
+    try {
+      var handler = internals.transformCallback(function (event) {
+        if (stopped) return;
+        try {
+          listener(event && event.payload);
+        } catch (_) {}
+      });
+      Promise.resolve(internals.invoke('plugin:event|listen', {
+        event: UPDATER_STATUS_EVENT,
+        target: { kind: 'Any' },
+        handler: handler
+      })).then(function (id) {
+        eventId = id;
+      }, function () {});
+    } catch (_) {
+      return function () {};
+    }
+    return function () {
+      stopped = true;
+      if (eventId == null) return;
+      try {
+        internals.invoke('plugin:event|unlisten', { event: UPDATER_STATUS_EVENT, eventId: eventId });
+      } catch (_) {}
+    };
   }
 
   var bridge = {
@@ -221,7 +258,7 @@ const BRIDGE_SOURCE: &str = r#"(function () {
       setMenuLabels: function (labels) {
         return envelope('host_updater', { action: 'set-menu-labels', labels: labels });
       },
-      subscribe: never,
+      subscribe: subscribeUpdaterStatus,
       subscribeOpenDialog: never
     }
   };
@@ -351,6 +388,25 @@ mod tests {
     }
 
     #[test]
+    fn the_updater_subscription_listens_for_the_hosts_status_stream() {
+        // The renderer's `subscribeToUpdaterStatus` goes through this method, so
+        // a bridge that bound `subscribe` to a no-op would leave the update UI
+        // without progress for ever. The event name is owned by the shell's
+        // updater module (`updater::STATUS_EVENT`), not by this script.
+        let script = script(&facts());
+        assert!(
+            script.contains("subscribe: subscribeUpdaterStatus"),
+            "subscribe must reach the event listener"
+        );
+        assert!(
+            script.contains(super::super::updater::STATUS_EVENT),
+            "the bridge must listen on the event the shell emits"
+        );
+        assert!(script.contains("plugin:event|listen"));
+        assert!(script.contains("plugin:event|unlisten"));
+    }
+
+    #[test]
     fn script_declares_every_group_the_validator_requires() {
         // `isOpenDesignHostBridge` (packages/host/src/detection.ts) checks the
         // version, the client type, and these capability methods. A group that
@@ -409,7 +465,8 @@ mod tests {
     /// Catches a syntax error in the injected script, which would otherwise
     /// only show up as an app that silently has no host bridge.
     #[test]
-    fn script_parses_as_javascript_when_node_is_available() {        let script = script(&facts());
+    fn script_parses_as_javascript_when_node_is_available() {
+        let script = script(&facts());
         let dir = std::env::temp_dir().join("od-tauri-bridge-check");
         if std::fs::create_dir_all(&dir).is_err() {
             return;

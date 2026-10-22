@@ -79,14 +79,14 @@ impl ArtifactSnapshot {
 
 /// The states a status snapshot may report (parity: `DESKTOP_UPDATE_STATES`).
 ///
-/// Only the states this host can reach are variants. The transition states
-/// (`checking`, `downloading`, `installing`) are not: a command answers with
-/// its result, so nothing would ever observe them without a status stream, and
-/// a variant nothing constructs is a promise in the type.
+/// The transition states (`checking`, `installing`) are not variants: a command
+/// answers with its result, so nothing would ever observe them. `downloading`
+/// is a variant because the status stream reports it while the transfer runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateState {
     Available,
     Downloaded,
+    Downloading,
     Error,
     Idle,
     NotAvailable,
@@ -98,6 +98,7 @@ impl UpdateState {
         match self {
             Self::Available => "available",
             Self::Downloaded => "downloaded",
+            Self::Downloading => "downloading",
             Self::Error => "error",
             Self::Idle => "idle",
             Self::NotAvailable => "not-available",
@@ -181,6 +182,7 @@ mod tests {
         assert_eq!(UpdateState::Unsupported.as_str(), "unsupported");
         assert_eq!(UpdateState::Available.as_str(), "available");
         assert_eq!(UpdateState::Downloaded.as_str(), "downloaded");
+        assert_eq!(UpdateState::Downloading.as_str(), "downloading");
         assert_eq!(UpdateState::Idle.as_str(), "idle");
         assert_eq!(UpdateState::Error.as_str(), "error");
     }

@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use serde_json::Value;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use super::{failure, success};
 use crate::shell::ShellState;
@@ -42,6 +42,16 @@ use support::UpdateError;
 /// How long a quit waits before exiting, so the command's answer reaches the
 /// renderer first.
 const QUIT_GRACE: Duration = Duration::from_millis(250);
+
+/// The event the updater's status stream is published on. The injected bridge
+/// subscribes to this name (`host/bridge.rs`), and the renderer's
+/// `subscribeToUpdaterStatus` reaches it.
+pub const STATUS_EVENT: &str = "od:updater-status";
+
+/// How often a running transfer may report progress. Without a floor, a fast
+/// transfer emits one snapshot per chunk — thousands of documents nobody can
+/// read, each one crossing the IPC boundary.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 
 /// `process.arch`'s spelling, which is what the renderer receives elsewhere.
 pub fn node_arch() -> &'static str {
@@ -162,18 +172,31 @@ pub async fn host_updater(
             let Some(candidate) = outcome.candidate.clone() else {
                 return Ok(outcome_status(&identity, outcome));
             };
-            Ok(
-                match download::download_release(&config, &candidate).await {
-                    Ok(release) => match active_release(&config) {
-                        Ok(Some((_, path))) => {
-                            status::downloaded_status(&identity, &release, &path, None)
-                        }
-                        Ok(None) => status::idle_status(&identity),
-                        Err(error) => status::error_status(&identity, error),
-                    },
+            let mut last_emit = std::time::Instant::now()
+                .checked_sub(PROGRESS_INTERVAL)
+                .unwrap_or_else(std::time::Instant::now);
+            let mut on_progress = |received: u64, total: Option<u64>| {
+                if last_emit.elapsed() < PROGRESS_INTERVAL {
+                    return;
+                }
+                last_emit = std::time::Instant::now();
+                let _ = app.emit(
+                    STATUS_EVENT,
+                    status::downloading_status(&identity, &candidate, received, total),
+                );
+            };
+            let downloaded =
+                download::download_release(&config, &candidate, &mut on_progress).await;
+            Ok(match downloaded {
+                Ok(release) => match active_release(&config) {
+                    Ok(Some((_, path))) => {
+                        status::downloaded_status(&identity, &release, &path, None)
+                    }
+                    Ok(None) => status::idle_status(&identity),
                     Err(error) => status::error_status(&identity, error),
                 },
-            )
+                Err(error) => status::error_status(&identity, error),
+            })
         }
         "install" => Ok(match active_release(&config) {
             Ok(Some((release, path))) => match install::open_installer(&config.platform, &path) {

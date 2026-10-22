@@ -23,7 +23,7 @@ use super::feed::{artifact_file_name, parse_checksum_text, release_key, UpdateCa
 use super::model::{ChecksumAlgorithm, ChecksumSnapshot};
 use super::store::{
     contains_path, ensure_owned_root, timestamp_now, write_json, write_metadata, ResolvedChecksum,
-    UpdateReleaseRef,
+    UpdateReleaseRef, STORE_OWNER,
 };
 use super::support::UpdateError;
 
@@ -133,13 +133,21 @@ pub fn hash_file(path: &Path, algorithm: ChecksumAlgorithm) -> Result<String, Up
     }
 }
 
+/// Reports how many bytes have landed, and how many the feed promised when it
+/// declared a size.
+pub type ProgressHandler<'a> = &'a mut (dyn FnMut(u64, Option<u64>) + Send);
+
 /// One transfer attempt, appending to whatever a previous attempt left.
 ///
-/// `Ok(bytes)` is the artifact's size on disk after the attempt.
+/// `Ok(bytes)` is the artifact's size on disk after the attempt. Progress is
+/// reported from inside the read loop, so the status stream sees the transfer
+/// move rather than hearing about it once at the end.
 async fn transfer_once(
     client: &reqwest::Client,
     url: &str,
     destination: &Path,
+    total_bytes: Option<u64>,
+    on_progress: ProgressHandler<'_>,
 ) -> Result<u64, String> {
     let existing = fs::metadata(destination)
         .map(|metadata| metadata.len())
@@ -156,6 +164,9 @@ async fn transfer_once(
 
     let resuming = existing > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
     let mut written = existing;
+    if resuming {
+        on_progress(written, total_bytes);
+    }
     let mut file = if resuming {
         OpenOptions::new()
             .append(true)
@@ -180,6 +191,7 @@ async fn transfer_once(
         file.write_all(&chunk)
             .map_err(|error| format!("artifact could not be written: {error}"))?;
         written += chunk.len() as u64;
+        on_progress(written, total_bytes);
     }
     file.sync_all()
         .map_err(|error| format!("artifact could not be written: {error}"))?;
@@ -194,8 +206,9 @@ async fn transfer_once(
 pub async fn download_release(
     config: &UpdaterConfig,
     candidate: &UpdateCandidate,
+    on_progress: ProgressHandler<'_>,
 ) -> Result<UpdateReleaseRef, UpdateError> {
-    let owned = ensure_owned_root(&config.download_root, "open-design-updater")?;
+    let owned = ensure_owned_root(&config.download_root, STORE_OWNER)?;
     let layout = owned.layout.clone();
 
     let cycle = format!(
@@ -245,9 +258,18 @@ pub async fn download_release(
         }
     };
 
+    let total_bytes = candidate.artifact.size.filter(|size| *size > 0);
     let mut last_error = String::new();
     for _ in 0..DOWNLOAD_MAX_ATTEMPTS {
-        match transfer_once(&client, &candidate.artifact.url, &target).await {
+        match transfer_once(
+            &client,
+            &candidate.artifact.url,
+            &target,
+            total_bytes,
+            &mut *on_progress,
+        )
+        .await
+        {
             Ok(_) => {
                 last_error.clear();
                 break;
@@ -498,18 +520,27 @@ mod tests {
         (format!("http://{address}/artifact.dmg"), server)
     }
 
-    fn candidate_at(config: &UpdaterConfig, url: &str, digest: &str) -> UpdateCandidate {
+    fn candidate_at(
+        config: &UpdaterConfig,
+        url: &str,
+        digest: &str,
+        size: Option<u64>,
+    ) -> UpdateCandidate {
+        let mut artifact = json!({
+            "url": url,
+            "name": "OpenDesign.dmg",
+            "sha256": digest,
+        });
+        if let Some(size) = size {
+            artifact["size"] = json!(size);
+        }
         let metadata = json!({
             "channel": "beta",
             "releaseVersion": "1.2.3-beta.4",
             "platforms": {
                 "mac": {
                     "enabled": true,
-                    "artifacts": {"dmg": {
-                        "url": url,
-                        "name": "OpenDesign.dmg",
-                        "sha256": digest,
-                    }},
+                    "artifacts": {"dmg": artifact},
                 },
             },
         });
@@ -524,13 +555,26 @@ mod tests {
         let (url, server) = serve_once(body.clone());
         let root = scratch("promote");
         let config = config(&root);
-        let candidate = candidate_at(&config, &url, &digest);
+        let candidate = candidate_at(&config, &url, &digest, Some(body.len() as u64));
 
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let mut seen: Vec<(u64, Option<u64>)> = Vec::new();
         let release = runtime
-            .block_on(download_release(&config, &candidate))
+            .block_on(download_release(
+                &config,
+                &candidate,
+                &mut |received, total| {
+                    seen.push((received, total));
+                },
+            ))
             .expect("download");
         server.join().expect("server");
+
+        assert_eq!(
+            seen.last().copied(),
+            Some((body.len() as u64, Some(body.len() as u64))),
+            "the last progress report is the finished transfer"
+        );
 
         assert_eq!(release.version, "1.2.3-beta.4");
         assert_eq!(release.channel, "beta");
@@ -569,11 +613,11 @@ mod tests {
         let (url, server) = serve_once(body);
         let root = scratch("mismatch");
         let config = config(&root);
-        let candidate = candidate_at(&config, &url, &digest);
+        let candidate = candidate_at(&config, &url, &digest, None);
 
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let error = runtime
-            .block_on(download_release(&config, &candidate))
+            .block_on(download_release(&config, &candidate, &mut |_, _| {}))
             .expect_err("mismatch");
         server.join().expect("server");
 
