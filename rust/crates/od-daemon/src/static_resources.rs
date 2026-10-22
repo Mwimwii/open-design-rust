@@ -481,6 +481,15 @@ fn roots_for(data_dir: &Path, segment: &str) -> Vec<PathBuf> {
     roots
 }
 
+/// The skill roots the daemon reads (parity: `ALL_SKILL_LIKE_ROOTS` for the
+/// `skills` segment).
+///
+/// The project patch route validates a `skillId` against the same catalogue
+/// the skill routes serve, so the roots are shared instead of re-derived.
+pub(crate) fn skill_roots(data_dir: &Path) -> Vec<PathBuf> {
+    roots_for(data_dir, "skills")
+}
+
 /// Parity: `resolveDaemonResourceRoot` reading `OD_RESOURCE_ROOT`
 /// (daemon-paths.ts:76). The TypeScript safe-base validation has no Rust
 /// counterpart (no project root exists here), and a relative value resolves

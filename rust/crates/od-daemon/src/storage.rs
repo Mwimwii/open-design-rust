@@ -81,6 +81,21 @@ pub struct NewProject<'a> {
     pub updated_at: i64,
 }
 
+/// The merged row a project patch writes (parity: `updateProject`'s `merged`).
+///
+/// The patch is resolved before it reaches the store: the route composes the
+/// whole document (metadata included) so the write stays one statement.
+#[derive(Debug, Clone)]
+pub struct ProjectUpdate {
+    pub name: String,
+    pub skill_id: Option<String>,
+    pub design_system_id: Option<String>,
+    pub pending_prompt: Option<String>,
+    pub metadata_json: Option<String>,
+    pub custom_instructions: Option<String>,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error(transparent)]
@@ -269,6 +284,40 @@ impl Store {
             let updated = conn.execute(
                 "UPDATE projects SET metadata_json = ?1, updated_at = ?2 WHERE id = ?3",
                 rusqlite::params![metadata_json, now, id],
+            )?;
+            if updated == 0 {
+                return Ok(None);
+            }
+        }
+        self.get_project(id)
+    }
+
+    /// Replace a project's row with the merged values (parity: `updateProject`).
+    ///
+    /// The patch is merged by the caller (the route composes the whole
+    /// document), so this writes the resolved row in one statement.
+    pub fn update_project(
+        &self,
+        id: &str,
+        update: &ProjectUpdate,
+    ) -> Result<Option<ProjectRow>, StoreError> {
+        {
+            let conn = self.lock()?;
+            let updated = conn.execute(
+                "UPDATE projects SET name = ?1, skill_id = ?2, design_system_id = ?3,
+                    pending_prompt = ?4, metadata_json = ?5, custom_instructions = ?6,
+                    updated_at = ?7
+                  WHERE id = ?8",
+                rusqlite::params![
+                    update.name,
+                    update.skill_id,
+                    update.design_system_id,
+                    update.pending_prompt,
+                    update.metadata_json,
+                    update.custom_instructions,
+                    update.updated_at,
+                    id,
+                ],
             )?;
             if updated == 0 {
                 return Ok(None);

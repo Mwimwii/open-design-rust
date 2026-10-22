@@ -122,7 +122,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/workspace/directory", get(workspace_directory))
         .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/import/folder", post(import_folder))
-        .route("/api/projects/{id}", get(get_project))
+        .route("/api/projects/{id}", get(get_project).patch(patch_project))
         .route(
             "/api/projects/{id}/working-dir",
             post(replace_project_working_dir),
@@ -368,6 +368,78 @@ async fn get_project(State(state): State<AppState>, Path(id): Path<String>) -> R
         _ => Value::Null,
     };
     Json(json!({ "project": project_json, "resolvedDir": resolved_dir })).into_response()
+}
+
+/// `PATCH /api/projects/:id` — patch a project (parity:
+/// `apps/daemon/src/routes/project/index.ts`).
+///
+/// The web app renames a project and edits its custom instructions through
+/// this route, and the daemon-owned metadata rules live in
+/// [`crate::project_patch`]: a patch may repeat the daemon's own bindings but
+/// never change them, and an imported project keeps the folder it was
+/// imported from.
+async fn patch_project(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let existing = match state.store.get_project(&id) {
+        Ok(Some(project)) => project,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "PROJECT_NOT_FOUND", "not found"),
+        Err(err) => return store_error_response(&err),
+    };
+    let data_dir = state.config.paths.data_dir().to_path_buf();
+    let store = state.store.clone();
+    let now = crate::conversations::now_ms();
+    let result = tokio::task::spawn_blocking(move || {
+        let catalogue = project_catalogue(&data_dir);
+        let update =
+            match crate::project_patch::compose_project_patch(&existing, &body, &catalogue, now) {
+                Ok(update) => update,
+                Err(err) => {
+                    return Err((StatusCode::BAD_REQUEST, err.code, err.message));
+                }
+            };
+        match store.update_project(&id, &update) {
+            Ok(Some(project)) => Ok(project),
+            Ok(None) => Err((
+                StatusCode::NOT_FOUND,
+                "PROJECT_NOT_FOUND".to_string(),
+                "not found".to_string(),
+            )),
+            Err(err) => {
+                tracing::error!(error = %err, "storage error");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR".to_string(),
+                    "storage error".to_string(),
+                ))
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(project)) => Json(json!({ "project": project.to_api_json() })).into_response(),
+        Ok(Err((status, code, message))) => api_error(status, &code, &message),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// The catalogue ids a project patch may reference (parity: the
+/// `listAllSkills` / `listAllDesignSystems` reads behind the TypeScript
+/// validators).
+fn project_catalogue(data_dir: &StdPath) -> crate::project_patch::Catalogue {
+    let skills = crate::skill_catalog::list_skills(&crate::static_resources::skill_roots(data_dir));
+    let (user_root, builtin_root) = crate::design_system_catalog::design_system_roots(data_dir);
+    let design_systems =
+        crate::design_system_catalog::list_all_design_systems(&user_root, builtin_root.as_deref());
+    crate::project_patch::Catalogue {
+        skills: skills.into_iter().map(|skill| skill.id).collect(),
+        design_systems: design_systems
+            .into_iter()
+            .map(|system| (system.id, system.status))
+            .collect(),
+    }
 }
 
 /// `POST /api/dir-exists` — the composer's live "is this folder still there"

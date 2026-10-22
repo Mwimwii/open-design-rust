@@ -35,6 +35,7 @@ pub mod migrations;
 pub mod plain_stream;
 pub mod project_create;
 pub mod project_dir;
+pub mod project_patch;
 pub mod proxy;
 pub mod project_files;
 pub mod prompt_telemetry;

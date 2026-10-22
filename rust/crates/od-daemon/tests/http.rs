@@ -90,6 +90,25 @@ async fn http_post_with_header(
     (head.to_string(), body.to_string())
 }
 
+/// PATCH with a JSON body.
+async fn http_patch(addr: SocketAddr, path: &str, body: &str) -> (String, String) {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let request = format!(
+        "PATCH {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
+        .await
+        .expect("write");
+    let mut response = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response)
+        .await
+        .expect("read");
+    let response = String::from_utf8_lossy(&response).into_owned();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap_or(("", ""));
+    (head.to_string(), body.to_string())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn project_create_and_import_match_the_web_contract() {
     let paths = temp_paths("project-create");
@@ -819,11 +838,181 @@ async fn the_working_dir_route_rebinds_a_project_at_a_picked_folder() {
     assert!(body.contains("baseDir must be absolute"), "body: {body}");
 }
 
+/// The web app renames a project and edits its custom instructions through
+/// `PATCH /api/projects/:id`; the daemon-owned metadata rules ride along.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_patch_route_renames_a_project_and_guards_the_daemon_owned_metadata() {
+    let paths = temp_paths("project-patch");
+    let daemon = RunningDaemon::start(config_with(paths, None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+
+    let (head, body) = http_post(
+        addr,
+        "/api/projects",
+        r#"{"id":"p-patch","name":"Deck","metadata":{"kind":"prototype","scenarioBinding":{"id":"s-1"}}}"#,
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+
+    // A missing project is a 404, not a silent create.
+    let (head, body) = http_patch(addr, "/api/projects/p-absent", r#"{"name":"Nope"}"#).await;
+    assert!(head.contains("404"), "status: {head}");
+    assert!(body.contains("PROJECT_NOT_FOUND"), "body: {body}");
+
+    // A rename keeps every other field, including the daemon-owned binding.
+    let (head, body) = http_patch(addr, "/api/projects/p-patch", r#"{"name":"Deck 2"}"#).await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["project"]["name"], "Deck 2");
+    assert_eq!(value["project"]["metadata"]["kind"], "prototype");
+    assert_eq!(value["project"]["metadata"]["scenarioBinding"]["id"], "s-1");
+
+    // The daemon owns the scenario binding: a patch may not change it.
+    let (head, body) = http_patch(
+        addr,
+        "/api/projects/p-patch",
+        r#"{"metadata":{"scenarioBinding":{"id":"s-2"}}}"#,
+    )
+    .await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(body.contains("scenarioBinding is daemon-owned"), "body: {body}");
+
+    // Repeating the same binding is allowed.
+    let (head, body) = http_patch(
+        addr,
+        "/api/projects/p-patch",
+        r#"{"metadata":{"scenarioBinding":{"id":"s-1"}}}"#,
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+
+    // The custom instructions are bounded.
+    let (head, body) = http_patch(addr, "/api/projects/p-patch", r#"{"customInstructions":42}"#).await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(
+        body.contains("customInstructions must be a string or null"),
+        "body: {body}"
+    );
+    let long = "x".repeat(5001);
+    let payload = serde_json::json!({ "customInstructions": long }).to_string();
+    let (head, body) = http_patch(addr, "/api/projects/p-patch", &payload).await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(
+        body.contains("customInstructions exceeds 5 000 character limit"),
+        "body: {body}"
+    );
+    let (head, body) = http_patch(
+        addr,
+        "/api/projects/p-patch",
+        r#"{"customInstructions":"Be brief."}"#,
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["project"]["customInstructions"], "Be brief.");
+
+    // The catalogue ids are checked against the local catalogue.
+    let (head, body) = http_patch(
+        addr,
+        "/api/projects/p-patch",
+        r#"{"skillId":"no-such-skill"}"#,
+    )
+    .await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(body.contains("SKILL_NOT_FOUND"), "body: {body}");
+    let (head, body) = http_patch(
+        addr,
+        "/api/projects/p-patch",
+        r#"{"designSystemId":"no-such-system"}"#,
+    )
+    .await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(body.contains("DESIGN_SYSTEM_NOT_FOUND"), "body: {body}");
+
+    // A project with no folder cannot acquire one through a patch.
+    let (head, body) = http_patch(
+        addr,
+        "/api/projects/p-patch",
+        r#"{"metadata":{"baseDir":"/tmp"}}"#,
+    )
+    .await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(
+        body.contains("baseDir can only be set via POST /api/import/folder"),
+        "body: {body}"
+    );
+}
+
+/// An imported project stays at the folder it was imported from: the patch
+/// route re-stamps the import-owned metadata instead of letting a patch
+/// detach it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_patch_route_keeps_an_imported_project_at_its_folder() {
+    let paths = temp_paths("project-patch-import");
+    let daemon = RunningDaemon::start(config_with(paths, None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+
+    let (head, body) = http_post(addr, "/api/projects", r#"{"id":"p-imported","name":"Imported"}"#).await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+
+    let folder = std::env::temp_dir().join(format!("od-patch-import-{}", std::process::id()));
+    std::fs::create_dir_all(&folder).expect("folder");
+    std::fs::write(folder.join("index.html"), b"<html>imported</html>").expect("write");
+    let canonical = folder.canonicalize().expect("canonical");
+    let (head, body) = http_post(
+        addr,
+        "/api/projects/p-imported/working-dir",
+        &serde_json::json!({ "baseDir": folder.to_string_lossy() }).to_string(),
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+
+    // A metadata patch keeps the folder.
+    let (head, body) = http_patch(
+        addr,
+        "/api/projects/p-imported",
+        r#"{"metadata":{"kind":"deck"}}"#,
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["project"]["metadata"]["kind"], "deck");
+    assert_eq!(
+        value["project"]["metadata"]["baseDir"],
+        canonical.to_string_lossy().as_ref()
+    );
+    assert_eq!(value["project"]["metadata"]["importedFrom"], "folder");
+
+    // Moving the folder through a patch is refused.
+    let (head, body) = http_patch(
+        addr,
+        "/api/projects/p-imported",
+        r#"{"metadata":{"baseDir":"/tmp/elsewhere"}}"#,
+    )
+    .await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(
+        body.contains("baseDir is immutable after import; use a new import to change it"),
+        "body: {body}"
+    );
+
+    // Clearing the metadata of an imported project is refused.
+    let (head, body) = http_patch(addr, "/api/projects/p-imported", r#"{"metadata":null}"#).await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(
+        body.contains("metadata cannot be cleared for imported projects"),
+        "body: {body}"
+    );
+}
+
 /// The desktop import-token gate: once a desktop has registered a secret,
 /// the folder-import routes only accept a token bound to the picked folder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_desktop_import_gate_binds_a_token_to_one_folder() {
-    let secret = vec![0x5au8; 32];
+async fn the_desktop_import_gate_binds_a_token_to_one_folder() {    let secret = vec![0x5au8; 32];
     let mut config = config_with(temp_paths("desktop-gate"), None);
     config.desktop_auth_secret = Some(secret.clone());
     let daemon = RunningDaemon::start(config).await.expect("start");
