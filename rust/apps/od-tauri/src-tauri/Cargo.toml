@@ -41,3 +41,6 @@ webkit2gtk = "2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[dev-dependencies]
+serde_json.workspace = true

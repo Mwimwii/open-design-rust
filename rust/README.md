@@ -8,7 +8,7 @@ implementation in `apps/daemon/` and `apps/web/`.
 
 | Path | Role |
 | --- | --- |
-| `crates/od-core` | Shared foundation: runtime path resolution (`paths.rs`), error types. |
+| `crates/od-core` | Shared foundation: runtime path resolution (`paths.rs`), the release channel identity and the namespace-scoped path layout (`release.rs`, `namespace.rs`), error types. |
 | `crates/od-daemon` | The daemon: axum router, auth, SQLite storage, migrations, and route modules ported from TS. |
 | `apps/od-tauri` | Tauri v2 desktop shell embedding `od-daemon`; Rust glue in `src-tauri/`, no UI source of its own. |
 
@@ -120,11 +120,58 @@ cd rust && dpkg-deb -x target/debug/bundle/deb/OpenDesign_*_amd64.deb /tmp/od-de
 # must still render: it can only come from /tmp/od-deb/usr/lib/OpenDesign/web
 ```
 
+### The packaged release smoke path
+
+`scripts/release-smoke.sh` is the smoke path the cutover is gated on. It
+stages the web export, builds the bundle, runs the binary **out of the
+bundle**, and asks the running app for the web app:
+
+```sh
+cd rust/apps/od-tauri && npm install   # the tauri CLI
+cd ../.. && ./scripts/release-smoke.sh
+```
+
+Each check proves one thing, and the report lands in
+`.tmp/release-report/<platform>/report.json`:
+
+- **the export reached the bundle** — the staged export carries a run marker,
+  and the page the daemon serves must contain it. A page served from the
+  source checkout (the `apps/web/out` fallback) cannot carry the marker, so a
+  bundle that forgot to ship the export fails here instead of quietly serving
+  the checkout.
+- **the daemon came up inside the packaged app** — `GET /api/health` must
+  answer on the loopback port the app was given (`OD_PORT`).
+- **the daemon serves the export** — `GET /` must answer the export's shell.
+- **the app wrote into the namespaced data root** — the namespace directory
+  must exist under the data root the run was given.
+
+The script stages `apps/web/out` when the web app has been built, and the
+`host-probe` fixture otherwise (the report says which). Bundle formats: `deb`
+and `rpm` on Linux, `app` on macOS, `nsis`/`msi` on Windows. Only the Linux
+`deb` path has been exercised here; the other formats follow the same layout
+rules but need a machine of that platform.
+
+`src-tauri/tests/packaging.rs` pins the bundle layout the smoke path depends
+on: `bundle.resources` maps the staged export to `web`, the window's
+`frontendDist` stays a placeholder (the export is never embedded in the
+binary), and the shell looks for the export exactly where the bundler puts it.
+
 ## Data directory
 
 `OD_DATA_DIR` is the single data-root truth source. This README deliberately
 does not restate path rules — read **"Daemon data directory contract"** in the
 repository-root `AGENTS.md` and follow it.
+
+The desktop shell is the packaged runtime, so it resolves the *final*
+namespace-scoped data root before the daemon starts and hands that root to the
+daemon as `OD_DATA_DIR`. The namespace comes from the build's version: a build
+whose version names a release channel owns that channel's namespace
+(`release-<channel>`, plus a platform suffix where one applies — `linux`,
+`win`, `intel`), and every other build (a development build, a local build)
+owns `default`. An `OD_DATA_DIR` override names a *base* root — the data root
+is `<base>/namespaces/<namespace>/data` — unless it already points at this
+namespace's data root, which is then used as it stands; a relative override, or
+one scoped to another namespace, is refused.
 
 ## Parity rules
 
@@ -181,7 +228,7 @@ Tracked with beads (`bd list`); the epic is `open_design_rust-7c7`.
 | `PATCH /api/projects/:id` | `open_design_rust-tvg`: `project_patch.rs` ports the guard block of the TypeScript patch route (`apps/daemon/src/routes/project/index.ts`) — the daemon-owned metadata rules, the import immutability, the catalogue id validation and the merge. A patch may repeat the daemon's own bindings (`scenarioBinding`, `strategyBinding`, `exampleBinding`, `fromTrustedPicker`, `localCatalogScopes`) but never change them; an imported project keeps the folder it was imported from (`baseDir`, `importedFrom`, `projectLocationId`, `fromTrustedPicker`, `orchestratorWorkspace` are re-stamped, and moving the folder or clearing the metadata is a 400); a project with no folder cannot acquire one through a patch. `skillId`/`designSystemId` are checked against the local skill and design-system catalogues (`SKILL_NOT_FOUND`, `DESIGN_SYSTEM_NOT_FOUND`, `DESIGN_SYSTEM_NOT_PUBLISHED` for a draft), `customInstructions` is a string or null within 5 000 characters, `linkedDirs` is canonicalized, and rebinding the skill or the design system drops the catalogue scope it pinned. The write is the TypeScript `updateProject` merge (the patch replaces only the fields it names) with the `__od.sync-keeps-updated-at__` stamp honoured. Not ported: the workspace mutation gate and the team-catalog rename propagation (this daemon has no Vela authority to check the binding against, and no user design-system registry bound to one) |
 | Workspace-attributed creates and the workspace-scoped project list | `open_design_rust-tvg`: `workspace_context.rs` ports the header seam of `apps/daemon/src/collab/workspace-resource-mutation.ts` (the `x-od-workspace-id` / `-member-id` / `-type` / `-role` / `-member-status` / `-lifecycle-state` / `-can-share-projects` / `-can-write-synced-files` readers, the "no workspace at all" / "half an identity" / "complete identity" trichotomy, and the locked-workspace test) and `workspace_projects.rs` ports the local half of `apps/daemon/src/collab/created-project-workspace.ts` plus the scoped list route `GET /api/workspaces/:workspaceId/projects`. A create that names a workspace binds the project to it (`personal` + `local_only`, the binding keyed on the project so it is never bound twice) and the response carries the `workspaceId`; a headerless or half-identified create stays unbound, exactly like the TypeScript local path. The scoped list answers `401 WORKSPACE_CONTEXT_REQUIRED` without a member identity, adopts the projects no workspace has claimed into a personal workspace (the pre-workspace projects, which would otherwise vanish from every list), and returns the `WorkspaceProjectsResponse` summaries with the `currentUserAccess` flags (`canOpen`/`canRename`/`canDelete`/`canDuplicate`/`canMoveToTeam`/`canMoveToPersonal`/`canExport`/`canSendTo`/`canRestoreVersion`/`disabledReason`) and the `view` / `owner` / `visibility` filters (`view` must be `all`, `recent`, `drafts`, or `team`). `GET /api/projects` keeps hiding every claimed project (the no-scope catalog). The daemon has no Vela authority verifier, so the header context *is* the authority — the same configuration the TypeScript daemon runs in when `verifyWorkspaceRequestAuthority` is not wired. Not ported: the remote team-project catalogue (a Vela CLI call, so a team workspace lists only the projects this daemon holds locally), the workspace type registry (only the caller's own `x-od-workspace-type` claim can refuse a team share), the group-count telemetry, and the workspace mutation gate on the folder-rebind route (it needs the Vela team-share machinery) |
 | Workspace project moves (`POST /api/workspaces/:workspaceId/projects/:projectId/move`, `.../batch-move`) | `open_design_rust-tvg`: `workspace_move.rs` ports the local half of the TypeScript move route — the `validVisibility` check, the `refuseTeamShareScope` refusal (a caller that says "personal" and asks for a team share is refused with `409 WORKSPACE_TEAM_SHARE_REQUIRES_TEAM_WORKSPACE`), the `workspaceMoveAllowed` / `workspaceMoveRetryAllowed` access rules (the owner of a failed share may retry it; nobody else may), the `workspaceProjectMovePatch` binding patch (visibility, owner, `resourceHubResourceId` scoped to the team and member, `cloudTombstonedAt`, `syncState`) and the `projectResourceIdFor` id. A team move records `pending_upload` and the `project_team_share_requested` intent; a move back to personal drops the resource id, tombstones the cloud copy and returns the row to `local_only`. The batch move moves every project it names or none of them (`403 PROJECT_BATCH_CONTAINS_FORBIDDEN_ITEMS`). Not ported: the remote team share/unshare (`collabSync.requestTeamShare` — a Vela CLI call), the team-project catalogue reconciliation (so a "move to personal" of a project no workspace has claimed is refused with `503 UPSTREAM_UNAVAILABLE` rather than reconciled), and the team comment anchors |
-| Production cutover | not started (`open_design_rust-e4e`) |
+| Production cutover | `open_design_rust-e4e`: the shell's release identity and namespace layout are ported — `crates/od-core/src/release.rs` is the Rust port of `packages/release/src/index.ts` (the channel names, the channel descriptor with its app id and storage prefix, the version parsing/formatting, and the per-platform release namespace) and `crates/od-core/src/namespace.rs` ports `apps/packaged/src/paths.ts` plus `normalizeNamespace` (the namespace-scoped directory layout and the `OD_DATA_DIR` rules). The packaged daemon data root follows the packaged layout (`<app data>/namespaces/<namespace>/data`), the shell hands the daemon that final root, and the updater snapshot reports the build's own channel and version instead of the Electron helper's constants. `scripts/release-smoke.sh` is the packaged smoke path: it stages the export, builds the bundle, runs the binary out of it, and proves the served page came out of the bundle (a run marker), that the daemon answered `GET /api/health`, that `GET /` served the export, and that the app wrote into the namespaced data root; `src-tauri/tests/packaging.rs` pins the bundle layout it depends on. Not ported: the Electron updater's download/install subsystem (release feed, resumable download, checksums, installer handoff — the snapshot stays inert), the launcher/sidecar runtime (the Rust shell embeds the daemon in-process), and the Electron-specific packaged smoke workflow |
 
 `cargo build/test/clippy --workspace` cannot cover the Tauri shell on a machine
 without the webkit2gtk system libraries; those crates are part of the workspace,

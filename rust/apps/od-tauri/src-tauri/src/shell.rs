@@ -267,27 +267,21 @@ pub fn web_dist(app: &App) -> Option<PathBuf> {
         .path()
         .resource_dir()
         .ok()
-        .map(|dir| dir.join("web"))
-        .filter(|dir| has_shell(dir));
+        .map(|dir| crate::packaging::packaged_web_dir(&dir))
+        .filter(|dir| crate::packaging::has_web_shell(dir));
     if packaged.is_some() {
         return packaged;
     }
 
     let app_dist = manifest_dir.join("../dist");
-    if has_shell(&app_dist) {
+    if crate::packaging::has_web_shell(&app_dist) {
         return Some(app_dist);
     }
 
     // `apps/web/out` in the source checkout: src-tauri → od-tauri → apps →
     // rust → repository root.
     let checkout_export = manifest_dir.join("../../../../apps/web/out");
-    has_shell(&checkout_export).then_some(checkout_export)
-}
-
-/// A usable static export contains the SPA shell the daemon answers deep
-/// links with.
-fn has_shell(dir: &Path) -> bool {
-    dir.join("index.html").is_file()
+    crate::packaging::has_web_shell(&checkout_export).then_some(checkout_export)
 }
 
 #[cfg(test)]

@@ -206,22 +206,21 @@ pub fn scoped_data_root_namespace(path: &Path) -> Option<String> {
 /// `expandHomePrefix`).
 pub fn expand_home_prefix(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
-    let home = home_dir();
-    let rest = if raw == "~" || raw == "$HOME" || raw == "${HOME}" {
-        Some("")
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-        Some(rest)
-    } else if let Some(rest) = raw.strip_prefix("$HOME/") {
-        Some(rest)
-    } else if let Some(rest) = raw.strip_prefix("${HOME}/") {
-        Some(rest)
-    } else {
-        None
+    let Some(home) = home_dir() else {
+        return path.to_path_buf();
     };
-    match (home, rest) {
-        (Some(home), Some(rest)) => home.join(rest),
-        _ => path.to_path_buf(),
-    }
+    let rest = if raw == "~" || raw == "$HOME" || raw == "${HOME}" {
+        ""
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("$HOME/") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("${HOME}/") {
+        rest
+    } else {
+        return path.to_path_buf();
+    };
+    home.join(rest)
 }
 
 /// The user's home directory.

@@ -21,8 +21,12 @@
 
 mod commands;
 mod host;
+pub mod packaging;
 mod shell;
 
+pub use packaging::{
+    has_web_shell, packaged_web_dir, WEB_EXPORT_SOURCE, WEB_RESOURCE_DIR, WEB_SHELL_FILE,
+};
 pub use shell::ShellState;
 
 pub fn run() {
