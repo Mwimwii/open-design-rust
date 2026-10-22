@@ -120,6 +120,19 @@ if [[ -z "$port" ]]; then
   port="$(free_port)"
 fi
 
+# The binary the bundle installs. The bundler names it after the Cargo bin
+# target, which the packaging contract test pins to the product name; the
+# fallback keeps the smoke honest if that name ever moves, and the report
+# records which binary actually ran.
+find_binary() {
+  local dir="$1"
+  if [[ -x "$dir/$product_name" ]]; then
+    printf '%s' "$dir/$product_name"
+    return
+  fi
+  find "$dir" -maxdepth 1 -type f -perm -u+x 2>/dev/null | head -1
+}
+
 run_root="$(mktemp -d "${TMPDIR:-/tmp}/od-release-smoke-XXXXXX")"
 data_root="$run_root/data"
 mkdir -p "$data_root"
@@ -180,7 +193,7 @@ case "$bundle_format" in
     root="$run_root/deb"
     mkdir -p "$root"
     dpkg-deb -x "$artifact" "$root"
-    binary="$root/usr/bin/$product_name"
+    binary="$(find_binary "$root/usr/bin")"
     export_dir="$root/usr/lib/$product_name/web"
     ;;
   rpm)
@@ -190,7 +203,7 @@ case "$bundle_format" in
     root="$run_root/rpm"
     mkdir -p "$root"
     (cd "$root" && rpm2cpio "$artifact" | cpio -idm)
-    binary="$root/usr/bin/$product_name"
+    binary="$(find_binary "$root/usr/bin")"
     export_dir="$root/usr/lib/$product_name/web"
     ;;
   app)
@@ -212,7 +225,7 @@ case "$bundle_format" in
     root="$run_root/appimage"
     mkdir -p "$root"
     (cd "$root" && "$artifact" --appimage-extract >/dev/null)
-    binary="$root/squashfs-root/usr/bin/$product_name"
+    binary="$(find_binary "$root/squashfs-root/usr/bin")"
     export_dir="$root/squashfs-root/usr/lib/$product_name/web"
     ;;
   *)
@@ -233,10 +246,19 @@ if [[ "$platform" == linux ]]; then
     if ! command -v Xvfb >/dev/null; then
       die "Xvfb is needed to run the packaged app headlessly"
     fi
-    Xvfb :99 -screen 0 1440x900x24 >"$run_root/xvfb.log" 2>&1 &
+    # A display number nobody else holds: the smoke must not collide with a
+    # developer's own X server.
+    display_number=$((90 + ($$ % 9)))
+    display=":$display_number"
+    Xvfb "$display" -screen 0 1440x900x24 >"$run_root/xvfb.log" 2>&1 &
     xvfb_pid=$!
-    display=":99"
     trap 'kill "$xvfb_pid" 2>/dev/null || true; cleanup' EXIT
+    # Give the server a moment to claim the display, so the app does not
+    # fail on a race it cannot recover from.
+    for _ in $(seq 1 50); do
+      [[ -e "/tmp/.X11-unix/X${display_number}" ]] && break
+      sleep 0.1
+    done
   else
     display="$DISPLAY"
   fi
@@ -293,6 +315,7 @@ jq -n \
   --arg bundle "$bundle_format" \
   --arg version "$app_version" \
   --arg product "$product_name" \
+  --arg binary "$(basename "$binary")" \
   --arg export "$export_kind" \
   --arg namespace "$namespace" \
   --arg dataRoot "$namespace_dir/data" \
@@ -300,8 +323,8 @@ jq -n \
   --arg health "$health" \
   --arg servedFrom "$export_dir" \
   '{platform: $platform, bundle: $bundle, version: $version, product: $product,
-    export: $export, namespace: $namespace, dataRoot: $dataRoot, port: $port,
-    health: $health, servedFrom: $servedFrom, ok: true}' \
+    binary: $binary, export: $export, namespace: $namespace, dataRoot: $dataRoot,
+    port: $port, health: $health, servedFrom: $servedFrom, ok: true}' \
   >"$report_dir/report.json"
 
 echo "release-smoke: ok — the packaged app served the export out of $export_dir" >&2

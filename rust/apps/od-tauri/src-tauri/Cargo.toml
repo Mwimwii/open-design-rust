@@ -10,6 +10,16 @@ description = "OpenDesign desktop shell: Tauri v2 app embedding the in-process o
 name = "od_tauri_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# The binary carries the product name, not the package name: the bundler
+# installs it as `OpenDesign` (a Linux deb puts it in `/usr/bin/OpenDesign`,
+# a Windows installer in `OpenDesign.exe`), and a user-facing app should not
+# be installed as `od-tauri`. Tauri reads the bin target's name to decide
+# what it bundles, so the name is pinned here rather than in the bundler
+# config.
+[[bin]]
+name = "OpenDesign"
+path = "src/main.rs"
+
 [dependencies]
 od-core.workspace = true
 od-daemon.workspace = true

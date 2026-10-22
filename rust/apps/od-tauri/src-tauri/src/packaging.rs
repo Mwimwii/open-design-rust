@@ -23,6 +23,15 @@ pub const WEB_EXPORT_SOURCE: &str = "../web-export";
 /// The file that makes an export a usable SPA shell.
 pub const WEB_SHELL_FILE: &str = "index.html";
 
+/// The name the bundler installs the binary under.
+///
+/// The bundler takes the binary's name from the Cargo bin target, so this is
+/// the name the manifest must give that target: a user-facing app is
+/// installed as `OpenDesign` (a Linux deb puts it in `/usr/bin/OpenDesign`,
+/// a Windows installer in `OpenDesign.exe`), not under the package name
+/// `od-tauri`. The release smoke path looks the binary up by this name.
+pub const MAIN_BINARY_NAME: &str = "OpenDesign";
+
 /// The directory inside a bundle that holds the web export.
 pub fn packaged_web_dir(resource_dir: &Path) -> PathBuf {
     resource_dir.join(WEB_RESOURCE_DIR)

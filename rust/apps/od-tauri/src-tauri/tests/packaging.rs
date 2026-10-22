@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use od_tauri_lib::packaging::{
-    has_web_shell, packaged_web_dir, WEB_EXPORT_SOURCE, WEB_RESOURCE_DIR,
+    has_web_shell, packaged_web_dir, MAIN_BINARY_NAME, WEB_EXPORT_SOURCE, WEB_RESOURCE_DIR,
 };
 
 fn manifest_dir() -> PathBuf {
@@ -20,6 +20,28 @@ fn tauri_config() -> serde_json::Value {
     let raw = std::fs::read_to_string(manifest_dir().join("tauri.conf.json"))
         .expect("tauri.conf.json must be readable");
     serde_json::from_str(&raw).expect("tauri.conf.json must be JSON")
+}
+
+/// The name the Cargo bin target carries — the name the bundler installs.
+///
+/// Read straight out of the manifest, the way cargo reads it: the `name` key
+/// of the `[[bin]]` table.
+fn manifest_bin_name() -> String {
+    let raw = std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("Cargo.toml");
+    let mut in_bin = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_bin = line == "[[bin]]";
+            continue;
+        }
+        if in_bin {
+            if let Some(name) = line.strip_prefix("name = ") {
+                return name.trim().trim_matches('"').to_string();
+            }
+        }
+    }
+    panic!("the manifest declares no [[bin]] target");
 }
 
 #[test]
@@ -61,10 +83,23 @@ fn the_bundle_carries_the_release_identity() {
     );
     assert_eq!(
         config["productName"].as_str(),
-        Some("OpenDesign"),
+        Some(MAIN_BINARY_NAME),
         "the smoke path finds the bundle's resources by the product name"
     );
     assert!(config["identifier"].as_str().is_some_and(|v| !v.is_empty()));
+}
+
+#[test]
+fn the_bundle_installs_the_binary_under_the_product_name() {
+    // The bundler names the installed binary after the Cargo bin target, so
+    // that target has to carry the product name: an app installed as
+    // `od-tauri` is a package name leaking into a user's program directory.
+    let config = tauri_config();
+    let product_name = config["productName"]
+        .as_str()
+        .expect("the bundle must name the product");
+    assert_eq!(manifest_bin_name(), product_name);
+    assert_eq!(product_name, MAIN_BINARY_NAME);
 }
 
 #[test]
