@@ -56,6 +56,7 @@ pub mod tool_loop_guard;
 pub mod storage;
 pub mod telemetry_environment;
 pub mod workspace_context;
+pub mod workspace_move;
 pub mod workspace_projects;
 
 pub use config::DaemonConfig;

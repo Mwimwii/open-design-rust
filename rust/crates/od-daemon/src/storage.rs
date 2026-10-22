@@ -150,6 +150,21 @@ pub struct WorkspaceProjectRow {
     pub workspace_updated_at: i64,
 }
 
+/// The binding columns a move may set (parity: the patch
+/// `workspaceProjectMovePatch` builds and `updateWorkspaceProject` writes).
+///
+/// Every column is written: `None` means SQL `NULL`, not "leave alone".
+#[derive(Debug, Clone)]
+pub struct WorkspaceProjectUpdate {
+    pub visibility: String,
+    pub created_by_workspace_member_id: Option<String>,
+    pub updated_by_workspace_member_id: Option<String>,
+    pub resource_hub_resource_id: Option<String>,
+    pub cloud_tombstoned_at: Option<i64>,
+    pub sync_state: String,
+    pub updated_at: i64,
+}
+
 /// The binding row a freshly created project gets (parity:
 /// `bindCreatedProjectToWorkspace` → `ensureWorkspaceProject`).
 #[derive(Debug, Clone)]
@@ -448,6 +463,48 @@ impl Store {
             .ok_or_else(|| {
                 StoreError::Migration("the workspace binding was not written".to_string())
             })
+    }
+
+    /// Update a project's binding row (parity: `updateWorkspaceProject`).
+    ///
+    /// The row is addressed by `(workspace, project)`: a project that belongs
+    /// to another workspace is not touched. The binding's `version` is left
+    /// alone — only the remote sync owns that counter.
+    pub fn update_workspace_project(
+        &self,
+        workspace_id: &str,
+        project_id: &str,
+        patch: &WorkspaceProjectUpdate,
+    ) -> Result<Option<WorkspaceProjectRow>, StoreError> {
+        {
+            let conn = self.lock()?;
+            let changed = conn.execute(
+                "UPDATE workspace_projects
+                    SET visibility = ?1,
+                        created_by_workspace_member_id = ?2,
+                        updated_by_workspace_member_id = ?3,
+                        resource_hub_resource_id = ?4,
+                        cloud_tombstoned_at = ?5,
+                        sync_state = ?6,
+                        updated_at = ?7
+                  WHERE workspace_id = ?8 AND project_id = ?9",
+                rusqlite::params![
+                    patch.visibility,
+                    patch.created_by_workspace_member_id,
+                    patch.updated_by_workspace_member_id,
+                    patch.resource_hub_resource_id,
+                    patch.cloud_tombstoned_at,
+                    patch.sync_state,
+                    patch.updated_at,
+                    workspace_id,
+                    project_id,
+                ],
+            )?;
+            if changed == 0 {
+                return Ok(None);
+            }
+        }
+        self.workspace_project_row(project_id)
     }
 
     /// The binding row of one project (parity: `getWorkspaceProject`).

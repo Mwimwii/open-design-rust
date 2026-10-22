@@ -1218,6 +1218,227 @@ async fn a_personal_workspace_adopts_the_unclaimed_projects() {
     );
 }
 
+/// Moving a project between personal and team visibility inside a workspace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_workspace_move_records_the_visibility_change() {
+    let paths = temp_paths("workspace-move");
+    let daemon = RunningDaemon::start(config_with(paths, None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+    let workspace_headers = [
+        ("x-od-workspace-id", "w-1"),
+        ("x-od-workspace-member-id", "m-1"),
+    ];
+
+    // Without a member identity there is no context to move in.
+    let (head, body) = http_request(
+        addr,
+        "POST",
+        "/api/workspaces/w-1/projects/p-1/move",
+        &[],
+        Some(r#"{"visibility":"team"}"#),
+    )
+    .await;
+    assert!(head.contains("401"), "status: {head}");
+    assert!(body.contains("WORKSPACE_CONTEXT_REQUIRED"), "body: {body}");
+
+    // A project of the workspace, created by the caller.
+    let (head, body) = http_request(
+        addr,
+        "POST",
+        "/api/projects",
+        &workspace_headers,
+        Some(r#"{"id":"p-1","name":"Shared"}"#),
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+
+    // An unknown visibility is refused.
+    let (head, body) = http_request(
+        addr,
+        "POST",
+        "/api/workspaces/w-1/projects/p-1/move",
+        &workspace_headers,
+        Some(r#"{"visibility":"draft"}"#),
+    )
+    .await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(
+        body.contains("visibility must be personal or team"),
+        "body: {body}"
+    );
+
+    // The move to team records the share intent.
+    let (head, body) = http_request(
+        addr,
+        "POST",
+        "/api/workspaces/w-1/projects/p-1/move",
+        &workspace_headers,
+        Some(r#"{"visibility":"team"}"#),
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let project = &value["project"];
+    assert_eq!(project["visibility"], "team");
+    assert_eq!(project["createdByWorkspaceMemberId"], "m-1");
+    assert_eq!(project["updatedByWorkspaceMemberId"], "m-1");
+    // The remote upload is not ported, so the row asks for it.
+    assert_eq!(project["syncState"], "pending_upload");
+    assert_eq!(
+        project["pendingSyncIntent"]["event"],
+        "project_team_share_requested"
+    );
+    assert!(project["resourceHubResourceId"].is_string(), "body: {body}");
+    assert!(project["currentUserAccess"]["canMoveToPersonal"]
+        .as_bool()
+        .unwrap());
+
+    // The scoped list now serves it as a team project.
+    let (_, body) = http_request(
+        addr,
+        "GET",
+        "/api/workspaces/w-1/projects?view=team",
+        &workspace_headers,
+        None,
+    )
+    .await;
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        value["projects"].as_array().map(|items| items.len()),
+        Some(1),
+        "body: {body}"
+    );
+
+    // Moving it back drops the published resource and tombstones the copy.
+    let (head, body) = http_request(
+        addr,
+        "POST",
+        "/api/workspaces/w-1/projects/p-1/move",
+        &workspace_headers,
+        Some(r#"{"visibility":"personal"}"#),
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let project = &value["project"];
+    assert_eq!(project["visibility"], "personal");
+    assert_eq!(project["syncState"], "local_only");
+    assert!(project["resourceHubResourceId"].is_null(), "body: {body}");
+    assert!(project["cloudTombstonedAt"].is_number(), "body: {body}");
+}
+
+/// A team share needs a workspace that can host one: a caller that says
+/// "personal" and asks for a team share has stated the contradiction itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_team_share_into_a_personal_workspace_is_refused() {
+    let paths = temp_paths("workspace-move-refusal");
+    let daemon = RunningDaemon::start(config_with(paths, None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+    let workspace_headers = [
+        ("x-od-workspace-id", "w-1"),
+        ("x-od-workspace-member-id", "m-1"),
+        ("x-od-workspace-type", "personal"),
+    ];
+    let (head, body) = http_request(
+        addr,
+        "POST",
+        "/api/projects",
+        &workspace_headers,
+        Some(r#"{"id":"p-1","name":"Shared"}"#),
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+
+    let (head, body) = http_request(
+        addr,
+        "POST",
+        "/api/workspaces/w-1/projects/p-1/move",
+        &workspace_headers,
+        Some(r#"{"visibility":"team"}"#),
+    )
+    .await;
+    assert!(head.contains("409"), "status: {head}");
+    assert!(
+        body.contains("WORKSPACE_TEAM_SHARE_REQUIRES_TEAM_WORKSPACE"),
+        "body: {body}"
+    );
+}
+
+/// The batch move moves every project it names, or none of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_batch_move_moves_every_project_or_none() {
+    let paths = temp_paths("workspace-batch-move");
+    let daemon = RunningDaemon::start(config_with(paths, None))
+        .await
+        .expect("start");
+    let addr = daemon.addr();
+    let workspace_headers = [
+        ("x-od-workspace-id", "w-1"),
+        ("x-od-workspace-member-id", "m-1"),
+    ];
+    for id in ["p-1", "p-2"] {
+        let (head, body) = http_request(
+            addr,
+            "POST",
+            "/api/projects",
+            &workspace_headers,
+            Some(&format!(r#"{{"id":"{id}","name":"{id}"}}"#)),
+        )
+        .await;
+        assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    }
+
+    // A batch without project ids is refused.
+    let (head, body) = http_request(
+        addr,
+        "POST",
+        "/api/workspaces/w-1/projects/batch-move",
+        &workspace_headers,
+        Some(r#"{"visibility":"team"}"#),
+    )
+    .await;
+    assert!(head.contains("400"), "status: {head}");
+    assert!(
+        body.contains("projectIds and visibility are required"),
+        "body: {body}"
+    );
+
+    // A batch that names a project the workspace does not hold is refused.
+    let (head, body) = http_request(
+        addr,
+        "POST",
+        "/api/workspaces/w-1/projects/batch-move",
+        &workspace_headers,
+        Some(r#"{"visibility":"team","projectIds":["p-1","p-missing"]}"#),
+    )
+    .await;
+    assert!(head.contains("404"), "status: {head}");
+    assert!(body.contains("PROJECT_NOT_FOUND"), "body: {body}");
+
+    // The whole batch moves.
+    let (head, body) = http_request(
+        addr,
+        "POST",
+        "/api/workspaces/w-1/projects/batch-move",
+        &workspace_headers,
+        Some(r#"{"visibility":"team","projectIds":["p-1","p-2"]}"#),
+    )
+    .await;
+    assert!(head.contains("200 OK"), "status: {head} body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(value["ok"], true);
+    let projects = value["projects"].as_array().expect("projects");
+    assert_eq!(projects.len(), 2, "body: {body}");
+    for project in projects {
+        assert_eq!(project["visibility"], "team");
+        assert_eq!(project["syncState"], "pending_upload");
+    }
+}
+
 /// The desktop import-token gate: once a desktop has registered a secret,
 /// the folder-import routes only accept a token bound to the picked folder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

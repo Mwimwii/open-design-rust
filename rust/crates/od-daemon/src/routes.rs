@@ -126,6 +126,14 @@ pub fn build_router(state: AppState) -> Router {
             "/api/workspaces/{workspaceId}/projects",
             get(list_workspace_projects),
         )
+        .route(
+            "/api/workspaces/{workspaceId}/projects/batch-move",
+            post(batch_move_workspace_projects),
+        )
+        .route(
+            "/api/workspaces/{workspaceId}/projects/{projectId}/move",
+            post(move_workspace_project),
+        )
         .route("/api/projects/{id}", get(get_project).patch(patch_project))
         .route(
             "/api/projects/{id}/working-dir",
@@ -365,23 +373,13 @@ async fn list_workspace_projects(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
-    let Some(mut context) =
-        crate::workspace_context::workspace_resource_context(&headers, &workspace_id)
-    else {
+    let Some(context) = workspace_route_context(&headers, &workspace_id) else {
         return api_error(
             StatusCode::UNAUTHORIZED,
             "WORKSPACE_CONTEXT_REQUIRED",
             "workspace context is required",
         );
     };
-    // The request's own capability flags are UI ceilings only: they may hide
-    // an action, but never elevate directory-backed authority.
-    if let crate::workspace_context::WorkspaceAssertion::Complete(asserted) =
-        crate::workspace_context::workspace_resource_context_from_request(&headers)
-    {
-        context.can_share_projects &= asserted.can_share_projects;
-        context.can_write_synced_files &= asserted.can_write_synced_files;
-    }
     if context.member_status == crate::workspace_context::WorkspaceMemberStatus::Removed {
         // A removed member keeps its identity but loses every project.
         return Json(json!({ "projects": [] })).into_response();
@@ -432,6 +430,321 @@ async fn list_workspace_projects(
         Ok(Err(err)) => store_error_response(&err),
         Err(err) => internal_error(&err.to_string()),
     }
+}
+
+/// The workspace a workspace-scoped route acts in (parity:
+/// `authoritativeWorkspaceProjectContext` without a verifier).
+///
+/// The daemon has no Vela authority verifier, so the header context *is* the
+/// authority — exactly the configuration the TypeScript daemon runs in when
+/// `verifyWorkspaceRequestAuthority` is not wired. The request's own
+/// capability flags are UI ceilings: they may hide an action, but never
+/// elevate the authority the context carries.
+fn workspace_route_context(
+    headers: &HeaderMap,
+    workspace_id: &str,
+) -> Option<crate::workspace_context::WorkspaceResourceContext> {
+    let mut context = crate::workspace_context::workspace_resource_context(headers, workspace_id)?;
+    if let crate::workspace_context::WorkspaceAssertion::Complete(asserted) =
+        crate::workspace_context::workspace_resource_context_from_request(headers)
+    {
+        context.can_share_projects &= asserted.can_share_projects;
+        context.can_write_synced_files &= asserted.can_write_synced_files;
+    }
+    Some(context)
+}
+
+/// Why a move could not be performed.
+enum MoveFailure {
+    /// The project does not exist, is not visible, or belongs to another
+    /// workspace.
+    NotFound,
+    /// The caller may not move the project.
+    Forbidden,
+    /// One project of a batch may not be moved.
+    BatchForbidden,
+    /// The remote team-project catalogue is needed to reconcile the move and
+    /// is not available.
+    Unavailable,
+    Store(StoreError),
+}
+
+impl From<StoreError> for MoveFailure {
+    fn from(err: StoreError) -> Self {
+        MoveFailure::Store(err)
+    }
+}
+
+/// The error envelope of a failed move (parity: the `sendApiError` calls of
+/// the move route).
+fn move_failure_response(failure: &MoveFailure) -> Response {
+    match failure {
+        MoveFailure::NotFound => api_error(StatusCode::NOT_FOUND, "PROJECT_NOT_FOUND", "not found"),
+        MoveFailure::Forbidden => api_error(
+            StatusCode::FORBIDDEN,
+            "PROJECT_DELETE_FORBIDDEN",
+            "project move forbidden",
+        ),
+        MoveFailure::BatchForbidden => api_error(
+            StatusCode::FORBIDDEN,
+            "PROJECT_BATCH_CONTAINS_FORBIDDEN_ITEMS",
+            "batch contains forbidden projects",
+        ),
+        MoveFailure::Unavailable => api_error_with(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UPSTREAM_UNAVAILABLE",
+            "team project catalog is temporarily unavailable",
+            serde_json::Map::from_iter([("retryable".to_string(), Value::Bool(true))]),
+        ),
+        MoveFailure::Store(err) => store_error_response(err),
+    }
+}
+
+/// The binding row a move acts on (parity: `ensureWorkspaceProjection` and
+/// the `listWorkspaceProjects` lookup of the move route).
+///
+/// `None` means the project is not part of this workspace: it does not exist,
+/// it is hidden, or it belongs to another workspace.
+fn workspace_move_row(
+    store: &Store,
+    project_id: &str,
+    context: &crate::workspace_context::WorkspaceResourceContext,
+    visibility: &str,
+) -> Result<Option<storage::WorkspaceProjectRow>, MoveFailure> {
+    let Some(project) = store.get_project(project_id)? else {
+        return Ok(None);
+    };
+    if !crate::workspace_projects::metadata_visible_for_locations(project.metadata_json.as_deref())
+    {
+        return Ok(None);
+    }
+    // A "move to personal" of a project no workspace has claimed would hand
+    // the project to the caller without knowing who owns it in the team
+    // catalogue. This daemon has no catalogue, so it refuses rather than
+    // guessing (parity: `reconcileUnboundProjectBeforeMove`).
+    if visibility == crate::workspace_move::PERSONAL
+        && context.workspace_type == crate::workspace_context::WorkspaceType::Team
+        && store.workspace_id_for_project(project_id)?.is_none()
+    {
+        return Err(MoveFailure::Unavailable);
+    }
+    let row = match store.workspace_project_row(project_id)? {
+        Some(row) => row,
+        None => {
+            // A project with no binding is projected into this workspace
+            // first, so a move has something to act on.
+            crate::workspace_projects::ensure_workspace_projection(store, &project, context)?;
+            match store.workspace_project_row(project_id)? {
+                Some(row) => row,
+                None => return Ok(None),
+            }
+        }
+    };
+    // The project must belong to the workspace the route acts in.
+    if row.workspace_id != context.workspace_id {
+        return Ok(None);
+    }
+    Ok(Some(row))
+}
+
+/// `POST /api/workspaces/:workspaceId/projects/:projectId/move` — move a
+/// project between personal and team visibility (parity:
+/// `apps/daemon/src/routes/project/index.ts`).
+///
+/// The remote team share is not ported (it is a Vela CLI call), so a team
+/// move leaves the binding in `pending_upload` — the state the TypeScript
+/// daemon writes before the remote call — and the summary reports the
+/// `project_team_share_requested` intent.
+async fn move_workspace_project(
+    State(state): State<AppState>,
+    Path((workspace_id, project_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(context) = workspace_route_context(&headers, &workspace_id) else {
+        return api_error(
+            StatusCode::UNAUTHORIZED,
+            "WORKSPACE_CONTEXT_REQUIRED",
+            "workspace context is required",
+        );
+    };
+    let visibility = body
+        .get("visibility")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !crate::workspace_move::is_valid_visibility(visibility) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "visibility must be personal or team",
+        );
+    }
+    if visibility == crate::workspace_move::TEAM {
+        if let Some(reason) = crate::workspace_move::team_share_refusal(&context) {
+            eprintln!(
+                "[od] refused a team share into workspace {workspace_id} ({reason}): a team share requires a team workspace"
+            );
+            return api_error(
+                StatusCode::CONFLICT,
+                "WORKSPACE_TEAM_SHARE_REQUIRES_TEAM_WORKSPACE",
+                "a project can only be shared to a team from a team workspace",
+            );
+        }
+    }
+    let store = state.store.clone();
+    let visibility = visibility.to_string();
+    let project_id_for_task = project_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let now = crate::conversations::now_ms();
+        let Some(row) = workspace_move_row(&store, &project_id_for_task, &context, &visibility)?
+        else {
+            return Err(MoveFailure::NotFound);
+        };
+        let summary = crate::workspace_projects::normalize_workspace_project_row(&row, &context);
+        if !crate::workspace_move::move_allowed(&summary, &visibility, &context) {
+            return Err(MoveFailure::Forbidden);
+        }
+        let patch = crate::workspace_move::move_patch(
+            &project_id_for_task,
+            &summary,
+            &context,
+            &visibility,
+            now,
+        );
+        store.update_workspace_project(&context.workspace_id, &project_id_for_task, &patch)?;
+        let updated = store
+            .workspace_project_row(&project_id_for_task)?
+            .ok_or(MoveFailure::NotFound)?;
+        Ok::<_, MoveFailure>(crate::workspace_projects::normalize_workspace_project_row(
+            &updated, &context,
+        ))
+    })
+    .await;
+    match result {
+        Ok(Ok(project)) => Json(json!({ "project": project })).into_response(),
+        Ok(Err(failure)) => move_failure_response(&failure),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// `POST /api/workspaces/:workspaceId/projects/batch-move` — move several
+/// projects at once (parity: the `batch-move` route of
+/// `apps/daemon/src/routes/project/index.ts`).
+async fn batch_move_workspace_projects(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(context) = workspace_route_context(&headers, &workspace_id) else {
+        return api_error(
+            StatusCode::UNAUTHORIZED,
+            "WORKSPACE_CONTEXT_REQUIRED",
+            "workspace context is required",
+        );
+    };
+    let visibility = body
+        .get("visibility")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let project_ids = parse_project_ids(body.get("projectIds"));
+    let Some(project_ids) = project_ids else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "projectIds and visibility are required",
+        );
+    };
+    if !crate::workspace_move::is_valid_visibility(visibility) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "projectIds and visibility are required",
+        );
+    }
+    if visibility == crate::workspace_move::TEAM {
+        if let Some(reason) = crate::workspace_move::team_share_refusal(&context) {
+            eprintln!(
+                "[od] refused a team share into workspace {workspace_id} ({reason}): a team share requires a team workspace"
+            );
+            return api_error(
+                StatusCode::CONFLICT,
+                "WORKSPACE_TEAM_SHARE_REQUIRES_TEAM_WORKSPACE",
+                "a project can only be shared to a team from a team workspace",
+            );
+        }
+    }
+    let store = state.store.clone();
+    let visibility = visibility.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let now = crate::conversations::now_ms();
+        let rows = store.list_workspace_projects(&context.workspace_id)?;
+        let mut summaries: Vec<Value> = Vec::new();
+        for project_id in &project_ids {
+            let Some(row) = rows.iter().find(|row| &row.id == project_id) else {
+                return Err(MoveFailure::NotFound);
+            };
+            if !crate::workspace_projects::row_belongs_to_current_workspace(row, &context) {
+                return Err(MoveFailure::NotFound);
+            }
+            if !crate::workspace_projects::row_visible_for_locations(row) {
+                return Err(MoveFailure::NotFound);
+            }
+            summaries.push(crate::workspace_projects::normalize_workspace_project_row(
+                row, &context,
+            ));
+        }
+        // One forbidden project refuses the whole batch: a partial move would
+        // leave the caller guessing which half happened.
+        if summaries
+            .iter()
+            .any(|summary| !crate::workspace_move::move_allowed(summary, &visibility, &context))
+        {
+            return Err(MoveFailure::BatchForbidden);
+        }
+        for (project_id, summary) in project_ids.iter().zip(summaries.iter()) {
+            let patch =
+                crate::workspace_move::move_patch(project_id, summary, &context, &visibility, now);
+            store.update_workspace_project(&context.workspace_id, project_id, &patch)?;
+        }
+        let updated = store.list_workspace_projects(&context.workspace_id)?;
+        let projects: Vec<Value> = project_ids
+            .iter()
+            .map(|project_id| {
+                updated
+                    .iter()
+                    .find(|row| &row.id == project_id)
+                    .map(|row| {
+                        crate::workspace_projects::normalize_workspace_project_row(row, &context)
+                    })
+                    .unwrap_or(Value::Null)
+            })
+            .collect();
+        Ok::<_, MoveFailure>(projects)
+    })
+    .await;
+    match result {
+        Ok(Ok(projects)) => Json(json!({ "ok": true, "projects": projects })).into_response(),
+        Ok(Err(failure)) => move_failure_response(&failure),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// The project ids of a batch request (parity: `parseProjectIds`).
+fn parse_project_ids(value: Option<&Value>) -> Option<Vec<String>> {
+    let items = value?.as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+    let mut ids = Vec::with_capacity(items.len());
+    for item in items {
+        let id = item.as_str()?;
+        if id.trim().is_empty() || !storage::is_safe_id(id) {
+            return None;
+        }
+        ids.push(id.to_string());
+    }
+    Some(ids)
 }
 
 /// `GET /api/projects/:id` — full project row + workspace binding + resolved
