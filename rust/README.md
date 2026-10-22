@@ -156,6 +156,13 @@ on: `bundle.resources` maps the staged export to `web`, the window's
 `frontendDist` stays a placeholder (the export is never embedded in the
 binary), and the shell looks for the export exactly where the bundler puts it.
 
+The bundler names the installed binary after the Cargo bin target, so that
+target is named `OpenDesign` — the product name, not the package name. A Linux
+deb therefore installs `/usr/bin/OpenDesign` and puts the resources in
+`/usr/lib/OpenDesign/web`; a Windows installer produces `OpenDesign.exe`. The
+packaging test pins the manifest's bin name against the product name in
+`tauri.conf.json`, so a rename cannot split the two.
+
 ## Data directory
 
 `OD_DATA_DIR` is the single data-root truth source. This README deliberately
