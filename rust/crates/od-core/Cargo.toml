@@ -7,4 +7,5 @@ repository.workspace = true
 description = "Shared config, paths, and error types for the OpenDesign Rust rewrite"
 
 [dependencies]
+regex.workspace = true
 thiserror.workspace = true
